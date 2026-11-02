@@ -8,7 +8,7 @@ import { SecurityPanel } from '@/src/components/SecurityPanel';
 import { useVault } from '@/src/hooks/useVault';
 import { t } from '@/src/i18n';
 
-/** Security (Face ID, auto-lock), Recently deleted and the manual Lock. */
+/** Security (Face ID, auto-lock), Tags, Recently deleted and the manual Lock. */
 export default function SettingsScreen() {
   const vault = useVault();
   const router = useRouter();
@@ -16,6 +16,16 @@ export default function SettingsScreen() {
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <SecurityPanel vault={vault} />
+      <Pressable
+        testID="tags-row"
+        accessibilityRole="button"
+        onPress={() => router.push('/tags')}
+        style={styles.row}
+      >
+        <SymbolView name="tag" tintColor={theme.colors.fgSecondary} size={20} />
+        <Text style={styles.rowLabel}>{t('nav:tags')}</Text>
+        <SymbolView name="chevron.right" tintColor={theme.colors.fgMuted} size={14} />
+      </Pressable>
       <Pressable
         testID="trash-row"
         accessibilityRole="button"

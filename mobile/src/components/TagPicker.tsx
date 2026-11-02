@@ -31,6 +31,8 @@ type Props = {
   selectedTagIds: readonly string[];
   onAdd: (tag: Tag) => void;
   onRemove: (tagId: string) => void;
+  /** Offers to create a missing tag (default true); a filter turns it off. */
+  allowCreate?: boolean;
 };
 
 /**
@@ -70,7 +72,9 @@ function TagPickerContent(props: Props) {
   // As on the desktop: only a case-blind exact name hides Create ("cafe" may
   // sit next to "café").
   const canCreate =
-    trimmed !== '' && !tags.some((tag) => tag.name.toLowerCase() === trimmed.toLowerCase());
+    props.allowCreate !== false &&
+    trimmed !== '' &&
+    !tags.some((tag) => tag.name.toLowerCase() === trimmed.toLowerCase());
   const selected = new Set(props.selectedTagIds);
 
   function toggle(tag: Tag) {

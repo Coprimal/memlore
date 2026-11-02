@@ -46,7 +46,8 @@ export default function EntriesScreen() {
   // '' (the picker's "All journals") and a missing param both mean no filter.
   const journalId = typeof params.journal === 'string' && params.journal ? params.journal : null;
   const list = useEntries(journalId);
-  const { journals } = useJournals();
+  const journalList = useJournals();
+  const { journals } = journalList;
   const [pickerOpen, setPickerOpen] = useState(false);
   // The new-entry button dims at once while `createEntry` runs.
   const [creating, setCreating] = useState(false);
@@ -60,6 +61,27 @@ export default function EntriesScreen() {
     // The flat index across sections, for `entry-row-<index>`.
     data: group.items.map((row) => ({ row, index: index++ })),
   }));
+
+  // The journal the list last started loading, so an older failure never counts.
+  const loadingFor = useRef<string | null | undefined>(undefined);
+  // A filter journal that is gone (deleted, or locked on the desktop) shows All
+  // journals: the list read for it failed and the journal list, read on the
+  // same focus, no longer has it. (useEntries reports a failure, not its code;
+  // its ERR_NOT_FOUND means the same: the journal is not listed.)
+  useEffect(() => {
+    if (list.loading) {
+      loadingFor.current = journalId;
+      return;
+    }
+    const gone =
+      journalId !== null &&
+      loadingFor.current === journalId &&
+      list.error &&
+      !journalList.loading &&
+      !journalList.error &&
+      !journals.some((journal) => journal.id === journalId);
+    if (gone) router.setParams({ journal: '' });
+  }, [journalId, list.loading, list.error, journalList.loading, journalList.error, journals]);
 
   // The filtered journal's name; "All journals" too until the list knows it.
   const filterLabel =
@@ -109,17 +131,28 @@ export default function EntriesScreen() {
             {list.total === null ? '…' : t('nav:entry_list.entry_count', { count: list.total })}
           </Text>
         </View>
-        <Pressable
-          testID="new-entry-button"
-          accessibilityRole="button"
-          accessibilityLabel={t('nav:new_entry')}
-          hitSlop={8}
-          disabled={creating}
-          onPress={() => void newEntry()}
-          style={creating ? styles.busy : undefined}
-        >
-          <NewEntryIcon />
-        </Pressable>
+        <View style={styles.headerEnd}>
+          <Pressable
+            testID="search-button"
+            accessibilityRole="button"
+            accessibilityLabel={t('mobile.search.title')}
+            hitSlop={8}
+            onPress={() => router.push('/search')}
+          >
+            <SearchIcon />
+          </Pressable>
+          <Pressable
+            testID="new-entry-button"
+            accessibilityRole="button"
+            accessibilityLabel={t('nav:new_entry')}
+            hitSlop={8}
+            disabled={creating}
+            onPress={() => void newEntry()}
+            style={creating ? styles.busy : undefined}
+          >
+            <NewEntryIcon />
+          </Pressable>
+        </View>
       </View>
       <ErrorText message={list.error ? t('mobile.error') : null} />
       <SectionList
@@ -158,6 +191,11 @@ export default function EntriesScreen() {
 function FilterChevron() {
   const { theme } = useUnistyles();
   return <SymbolView name="chevron.down" tintColor={theme.colors.fgSecondary} size={13} />;
+}
+
+function SearchIcon() {
+  const { theme } = useUnistyles();
+  return <SymbolView name="magnifyingglass" tintColor={theme.colors.accentText} size={22} />;
 }
 
 function NewEntryIcon() {
@@ -267,6 +305,11 @@ const styles = StyleSheet.create((theme) => ({
   headerStart: {
     flex: 1,
     gap: theme.space(0.5),
+  },
+  headerEnd: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.space(5),
   },
   filter: {
     flexDirection: 'row',
