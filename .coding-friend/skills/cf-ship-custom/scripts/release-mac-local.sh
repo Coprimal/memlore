@@ -219,10 +219,21 @@ main() {
 
   REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run this from inside the memlore repository"
   [[ -f "$REPO_ROOT/src-tauri/tauri.conf.json" ]] || die "src-tauri/tauri.conf.json not found under REPO_ROOT=$REPO_ROOT"
-  # Absolute: cargo resolves a relative CARGO_TARGET_DIR against its own cwd.
-  # Pinned so ~/.cargo/config.toml's shared target dir cannot move the bundle.
-  export CARGO_TARGET_DIR="$REPO_ROOT/src-tauri/target"
-  local bundle_dir="$CARGO_TARGET_DIR/universal-apple-darwin/release/bundle"
+  local target_dir
+  if [[ -f "$REPO_ROOT/.cargo/config.toml" ]]; then
+    # This checkout sets its own target-dir (e.g. the external SSD; see
+    # CONTRIBUTING.md "Cargo build cache"). Unset so an inherited value cannot
+    # beat it, and ask Cargo where that is.
+    unset CARGO_TARGET_DIR
+    target_dir="$(cd "$REPO_ROOT" && cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1 | jq -r .target_directory)" \
+      || die "could not resolve the Cargo target dir (is the SSD mounted?)"
+  else
+    # Absolute: cargo resolves a relative CARGO_TARGET_DIR against its own cwd.
+    # Pinned so ~/.cargo/config.toml's shared target dir cannot move the bundle.
+    export CARGO_TARGET_DIR="$REPO_ROOT/src-tauri/target"
+    target_dir="$CARGO_TARGET_DIR"
+  fi
+  local bundle_dir="$target_dir/universal-apple-darwin/release/bundle"
   local version="${TAG#v}"
 
   # shellcheck source=_release-materials.sh

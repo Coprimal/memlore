@@ -38,6 +38,8 @@ coverage/
 src-tauri/target/
 # rust-analyzer flycheck output when the IDE opens the repo root
 /target/
+# Machine-specific target-dir (external SSD); see .cargo/config.toml.example
+/.cargo/config.toml
 
 # Tauri build outputs
 *.deb

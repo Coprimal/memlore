@@ -40,10 +40,37 @@ incremental = false
 
 To share one cache across Rust projects, create `~/.cargo/config.toml` once per machine (outside git) with `target-dir = ".cargo/shared-target"` under `[build]` (relative to `$HOME`) and the **same** profile as above. Profiles that differ make Cargo build every dependency twice.
 
-- `pnpm tauri dev` and `cargo test` then use `~/.cargo/shared-target`; `pnpm tauri build` and `scripts/build-signed-app.sh` still pin `src-tauri/target` so bundles stay in the repo.
+- `pnpm tauri dev` and `cargo test` then use `~/.cargo/shared-target`; `pnpm tauri build` and `scripts/build-signed-app.sh` still pin `src-tauri/target` so bundles stay in the repo (unless the checkout builds on the external SSD, below).
 - Delete the old `src-tauri/target` after switching.
 - Build one project at a time (Cargo locks the directory).
 - Never run `cargo clean` / `pnpm cargo:clean`: it wipes the cache of every project.
+
+### Target on the external SSD (per checkout, opt-in)
+
+A checkout can build on an external SSD instead of `~/.cargo/shared-target`, to free space on the internal disk. It is opt-in per checkout: a repo-root `.cargo/config.toml` (gitignored) sets its `target-dir`. That covers `pnpm tauri dev`, `cargo test`, `cargo clippy`, rust-analyzer, `pnpm tauri build`, `scripts/build-signed-app.sh` and the release script. Use one folder per checkout (the main checkout and each worktree), never a shared one:
+
+```sh
+cp .cargo/config.toml.example .cargo/config.toml   # set the folder for this checkout
+mkdir -p /Volumes/Thi2TB/cargo-target/memlore-w-2
+```
+
+Cargo reads config files from the current directory upward, and `$HOME` has the lowest priority. This `target-dir` therefore wins over `~/.cargo/config.toml`, whether you run from the repo root or from `src-tauri/`. Check it in `src-tauri/`:
+
+```sh
+cargo metadata --no-deps --format-version 1 | jq -r .target_directory
+```
+
+An environment `CARGO_TARGET_DIR` still overrides both, so do not prefix commands with `CARGO_TARGET_DIR=src-tauri/target` in such a checkout. `scripts/tauri.sh` (`pnpm tauri build`), `scripts/build-signed-app.sh` and `release-mac-local.sh` unset it when `.cargo/config.toml` exists, and pin `src-tauri/target` otherwise. The bundle then lands at `<target-dir>/release/bundle/macos/Memlore.app` (`<target-dir>/universal-apple-darwin/release/bundle/` for a release).
+
+Unplug and replug: macOS mounts the volume at `/Volumes/Thi2TB` again. The path and Cargo's fingerprints stay valid, so the next build reuses the cache. While the SSD is out, builds fail: `/Volumes` is root-owned, so Cargo cannot create the path. Nothing falls back to the internal disk. Plug the SSD in and rerun.
+
+- **The SSD mounts as `Thi2TB 1`:** another volume with the same name is mounted. Eject that one (`diskutil list`, `diskutil unmount`), then remount the SSD so it gets `/Volumes/Thi2TB` back.
+- **The volume was renamed:** update `target-dir` in `.cargo/config.toml`.
+- **Builds still go to the shared target:** `CARGO_TARGET_DIR` is set in the environment (`echo $CARGO_TARGET_DIR`), or the config is not at the checkout root.
+- **Free space:** run `cargo sweep` in `src-tauri/`. It follows the same config. You can also delete the checkout's folder under `/Volumes/Thi2TB/cargo-target/`. `cargo clean` / `pnpm cargo:clean` in such a checkout only clears its SSD folder, but in a checkout without the config it wipes the whole shared target.
+- **Spotlight** indexes the SSD. If the SSD holds only caches, `sudo mdutil -i off /Volumes/Thi2TB` stops that (optional).
+
+`node_modules` stays on the internal disk. pnpm hardlinks it from its store, so a copy on another volume would take more space, not less. `~/.tauri` holds updater signing keys, not a cache.
 
 ## UI playground (`mockup/`)
 

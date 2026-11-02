@@ -77,7 +77,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-APP="${REPO_ROOT}/src-tauri/target/debug/bundle/macos/Memlore.app"
+# A checkout with a repo-root .cargo/config.toml builds into its own target-dir
+# (e.g. the external SSD; CONTRIBUTING.md "Cargo build cache"). Otherwise pin
+# src-tauri/target so ~/.cargo/config.toml cannot move this bundle.
+if [[ -f "${REPO_ROOT}/.cargo/config.toml" ]]; then
+  unset CARGO_TARGET_DIR
+  TARGET_DIR="$(cd "$REPO_ROOT" && cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1 | jq -r .target_directory)"
+else
+  # Leave this pin. pnpm tauri dev does not set it.
+  export CARGO_TARGET_DIR="${REPO_ROOT}/src-tauri/target"
+  TARGET_DIR="$CARGO_TARGET_DIR"
+fi
+APP="${TARGET_DIR}/debug/bundle/macos/Memlore.app"
 ENTITLEMENTS_TEMPLATE="${REPO_ROOT}/src-tauri/Entitlements.plist"
 BUNDLE_ID="app.memlore"
 
@@ -170,10 +181,7 @@ fi
 # ─── Build ────────────────────────────────────────────────────────────────────
 
 echo "Building the app bundle (this takes a few minutes)…"
-# Pin the Cargo target so ~/.cargo/config.toml cannot move this bundle.
-# The path below is src-tauri/target/debug/bundle/macos/Memlore.app.
-# Leave this pin. pnpm tauri dev does not set it.
-export CARGO_TARGET_DIR="${REPO_ROOT}/src-tauri/target"
+# CARGO_TARGET_DIR is set (or unset) at the top, next to APP.
 # --no-sign is required, not optional: tauri.conf.json sets
 # bundle.createUpdaterArtifacts, and the CLI hard-errors ("A public key has been
 # found, but no private key") whenever it produces an updater artifact without
