@@ -11,7 +11,9 @@ use memlore_core::envelope::{
     load_content_list, unwrap_master_with_recovery, verify_master_fingerprint,
 };
 use memlore_core::metadata::EntryMetadata;
-use memlore_mobile_ffi::{open_entry_frame, MemloreEngine, MemloreError, StartupModeFfi};
+use memlore_mobile_ffi::{
+    open_entry_frame, MemloreEngine, MemloreError, SearchFiltersFfi, StartupModeFfi,
+};
 use serde_json::Value;
 use yrs::updates::decoder::Decode;
 use yrs::{GetString, ReadTxn, Transact, Update, XmlFragment};
@@ -131,15 +133,19 @@ fn engine_data_calls_are_lock_gated() {
     let id = engine.create_entry("First".to_string(), None).unwrap();
     assert_eq!(engine.entry_count().unwrap(), 1);
 
-    // Every entry, journal, tag and trash call must return `Locked` too. Made
-    // with real ids, so a call that skipped the gate would succeed.
+    // Every entry, journal, tag, trash, search, version and template call
+    // must return `Locked` too. Made with real ids, so a call that skipped
+    // the gate would succeed.
     struct Ids {
         entry: String,
         journal: String,
+        spare_journal: String,
         tag: String,
+        version: String,
+        template: String,
     }
     type Call = fn(&MemloreEngine, &Ids) -> Result<(), MemloreError>;
-    let calls: [(&str, Call); 20] = [
+    let calls: [(&str, Call); 32] = [
         ("list_entries", |e, ids| {
             e.list_entries(Some(ids.journal.clone()), 0).map(drop)
         }),
@@ -188,11 +194,61 @@ fn engine_data_calls_are_lock_gated() {
         ("remove_tag_from_entry", |e, ids| {
             e.remove_tag_from_entry(ids.entry.clone(), ids.tag.clone())
         }),
+        ("rename_tag", |e, ids| {
+            e.rename_tag(ids.tag.clone(), "r".to_string()).map(drop)
+        }),
+        ("delete_tag", |e, ids| e.delete_tag(ids.tag.clone())),
+        ("journal_entry_count", |e, ids| {
+            e.journal_entry_count(ids.journal.clone()).map(drop)
+        }),
+        ("delete_journal", |e, ids| {
+            e.delete_journal(ids.spare_journal.clone())
+        }),
+        ("search_entries", |e, _| {
+            e.search_entries("First".to_string(), SearchFiltersFfi::default())
+                .map(drop)
+        }),
+        ("list_entry_versions", |e, ids| {
+            e.list_entry_versions(ids.entry.clone()).map(drop)
+        }),
+        ("get_entry_version_content", |e, ids| {
+            e.get_entry_version_content(ids.entry.clone(), ids.version.clone())
+                .map(drop)
+        }),
+        ("snapshot_entry_version", |e, ids| {
+            e.snapshot_entry_version(ids.entry.clone()).map(drop)
+        }),
+        ("list_templates", |e, _| e.list_templates().map(drop)),
+        ("create_template", |e, _| {
+            e.create_template("t".to_string(), None).map(drop)
+        }),
+        ("update_template", |e, ids| {
+            e.update_template(ids.template.clone(), "t".to_string(), None)
+                .map(drop)
+        }),
+        ("delete_template", |e, ids| {
+            e.delete_template(ids.template.clone())
+        }),
     ];
+    let base = engine.load_entry_yjs(id.clone()).unwrap();
+    engine
+        .save_entry_yjs(
+            id.clone(),
+            edit_and_encode(&base, 9, "gated"),
+            "gated".to_string(),
+            "gated".to_string(),
+        )
+        .unwrap();
     let ids = Ids {
         entry: id.clone(),
         journal: engine.get_entry(id.clone()).unwrap().journal_id,
+        spare_journal: engine.create_journal("Spare".to_string()).unwrap().id,
         tag: engine.create_tag("gated".to_string()).unwrap().id,
+        version: engine.snapshot_entry_version(id.clone()).unwrap().unwrap(),
+        template: engine
+            .create_template("gated".to_string(), None)
+            .unwrap()
+            .id,
     };
 
     engine.lock().unwrap();

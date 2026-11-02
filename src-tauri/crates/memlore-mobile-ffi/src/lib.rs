@@ -32,10 +32,16 @@ use crate::keystore::OsKeyStore;
 
 pub use entries::{EntryDetailFfi, EntryPageFfi, EntryRowFfi, TrashRowFfi};
 pub use organize::{JournalFfi, TagFfi};
+pub use search::{SearchFiltersFfi, SearchResultFfi};
+pub use templates::TemplateFfi;
+pub use versions::VersionFfi;
 
 mod entries;
 mod keystore;
 mod organize;
+mod search;
+mod templates;
+mod versions;
 
 uniffi::setup_scaffolding!();
 
@@ -87,6 +93,13 @@ pub enum MemloreError {
     /// (deleted, locked or invisible). Never says which.
     #[error("not found")]
     NotFound,
+    /// A tag rename to a name another tag holds, a deleted one included
+    /// (no merge, as on desktop).
+    #[error("a tag with that name already exists")]
+    NameTaken,
+    /// The journal is the last one mobile lists; it cannot be deleted.
+    #[error("cannot delete the last journal")]
+    LastJournal,
 }
 
 fn io(msg: String) -> MemloreError {
@@ -580,13 +593,26 @@ mod tests {
 
     /// A valid full state that differs from `base` (an editor typed into it).
     fn edited(base: &[u8]) -> Vec<u8> {
+        typed(base, "must not land")
+    }
+
+    /// `base` plus a paragraph holding `text`, as an editor would save it.
+    fn typed(base: &[u8], text: &str) -> Vec<u8> {
         let doc = yrs::Doc::with_client_id(7);
         let fragment = doc.get_or_insert_xml_fragment("default");
         let mut txn = doc.transact_mut();
         txn.apply_update(Update::decode_v1(base).unwrap()).unwrap();
         let paragraph = fragment.push_back(&mut txn, XmlElementPrelim::new("paragraph", []));
-        paragraph.push_back(&mut txn, XmlTextPrelim::new("must not land"));
+        paragraph.push_back(&mut txn, XmlTextPrelim::new(text));
         txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    }
+
+    /// Save `text` into a listed entry through the mobile save.
+    fn write_text(engine: &MemloreEngine, id: &str, text: &str) {
+        let base = engine.load_entry_yjs(id.to_string()).unwrap();
+        engine
+            .save_entry_yjs(id.to_string(), typed(&base, text), text.into(), text.into())
+            .unwrap();
     }
 
     /// A created (so unlocked) vault whose os_kek lives in memory.
@@ -622,6 +648,7 @@ mod tests {
         is_deleted: bool,
         tag_ids: Vec<String>,
         yjs: Option<Vec<u8>>,
+        versions: i64,
     }
 
     fn stored_entry(engine: &MemloreEngine, id: &str) -> StoredEntry {
@@ -636,6 +663,13 @@ mod tests {
             is_deleted: e.is_deleted,
             tag_ids: db::get_tag_ids_for_entry(&conn, id).unwrap(),
             yjs: db::get_entry_content(&conn, id).unwrap(),
+            versions: conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entry_versions WHERE entry_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap(),
         }
     }
 
@@ -648,11 +682,14 @@ mod tests {
         kept_tag: String,
         other_tag: String,
         base: Vec<u8>,
+        version: String,
     }
 
     /// `require_listed_entry`: a locked entry, an entry of an invisible
     /// journal and a deleted entry are "not found" for every entry call, and
-    /// no refused call changes the stored row, its tags or its document.
+    /// no refused call changes the stored row, its tags, its document or its
+    /// versions. The entry has text, so a snapshot that skipped the gate
+    /// would write a version.
     #[test]
     fn entry_calls_refuse_unlisted_entries() {
         type Hide = fn(&rusqlite::Connection, &str);
@@ -674,7 +711,7 @@ mod tests {
             }),
         ];
         type Call = fn(&MemloreEngine, &Unlisted) -> Result<(), MemloreError>;
-        let calls: [(&str, Call); 11] = [
+        let calls: [(&str, Call); 14] = [
             ("get_entry", |e, u| e.get_entry(u.entry.clone()).map(drop)),
             ("set_entry_title", |e, u| {
                 e.set_entry_title(u.entry.clone(), "Changed".into())
@@ -704,10 +741,25 @@ mod tests {
                 e.save_entry_yjs(u.entry.clone(), edited(&u.base), "x".into(), "x".into())
             }),
             ("trash_entry", |e, u| e.trash_entry(u.entry.clone())),
+            ("list_entry_versions", |e, u| {
+                e.list_entry_versions(u.entry.clone()).map(drop)
+            }),
+            ("get_entry_version_content", |e, u| {
+                e.get_entry_version_content(u.entry.clone(), u.version.clone())
+                    .map(drop)
+            }),
+            ("snapshot_entry_version", |e, u| {
+                e.snapshot_entry_version(u.entry.clone()).map(drop)
+            }),
         ];
         for (case, hide) in cases {
             let (_dir, engine) = unlocked_engine();
             let entry = engine.create_entry("Hidden".to_string(), None).unwrap();
+            write_text(&engine, &entry, "secret words");
+            let version = engine
+                .snapshot_entry_version(entry.clone())
+                .unwrap()
+                .unwrap();
             let base = engine.load_entry_yjs(entry.clone()).unwrap();
             let (elsewhere, kept_tag, other_tag) = {
                 let conn = engine.state.lock().unwrap();
@@ -724,6 +776,7 @@ mod tests {
                 kept_tag,
                 other_tag,
                 base,
+                version,
             };
             let before = stored_entry(&engine, &unlisted.entry);
 
@@ -740,8 +793,10 @@ mod tests {
 
     /// `require_listed_journal`: a locked or invisible journal is "not found"
     /// as a target. Moving an entry into it would hide the entry, creating
-    /// one would write an entry nobody can list, and listing or renaming it
-    /// would read or touch a hidden journal.
+    /// one would write an entry nobody can list, listing, counting or
+    /// renaming it would read or touch a hidden journal, and deleting it
+    /// would delete what mobile cannot see. A spare listed journal keeps the
+    /// last-journal rule out of the way, so only the gate can refuse.
     #[test]
     fn hidden_journals_are_refused_as_targets() {
         type Hide = fn(&rusqlite::Connection, &str);
@@ -757,12 +812,18 @@ mod tests {
         for (case, hide) in cases {
             let (_dir, engine) = unlocked_engine();
             let id = engine.create_entry("Listed".to_string(), None).unwrap();
-            let (home, hidden) = {
+            let (home, hidden, hidden_entry) = {
                 let conn = engine.state.lock().unwrap();
                 let home = db::get_entry(&conn, &id).unwrap().unwrap().journal_id;
+                db::create_journal(&conn, "Spare", None).unwrap();
                 let hidden = db::create_journal(&conn, "Hidden", None).unwrap().id;
+                let hidden_entry = memlore_engine::ops::entries::create_entry_impl(
+                    &conn, &hidden, None, None, None, 1,
+                )
+                .unwrap()
+                .id;
                 hide(&conn, &hidden);
-                (home, hidden)
+                (home, hidden, hidden_entry)
             };
             // Every row, hidden ones included: `list_entries` cannot see an
             // entry written into a hidden journal.
@@ -808,13 +869,91 @@ mod tests {
                 .unwrap()
                 .name;
             assert_eq!(name, "Hidden", "{case}: rename_journal renamed it");
+
+            expect_not_found(
+                engine.journal_entry_count(hidden.clone()),
+                &format!("{case}: journal_entry_count"),
+            );
+            expect_not_found(
+                engine.delete_journal(hidden.clone()),
+                &format!("{case}: delete_journal"),
+            );
+            let conn = engine.state.lock().unwrap();
+            assert!(
+                !db::get_journal(&conn, &hidden).unwrap().unwrap().is_deleted,
+                "{case}: delete_journal deleted the journal"
+            );
+            assert!(
+                !db::get_entry_raw(&conn, &hidden_entry)
+                    .unwrap()
+                    .unwrap()
+                    .is_deleted,
+                "{case}: delete_journal deleted its entry"
+            );
         }
     }
 
-    /// Mobile has no reveal session (until M3c): the listings leave out a
-    /// locked journal, a tag used only on a locked entry and a trashed
-    /// locked entry, and the trash calls cannot purge what they do not list.
-    /// What stays visible is listed, so an empty answer cannot pass.
+    /// The last LISTED journal cannot be deleted, even though a locked one
+    /// exists (the engine's own check counts it). Otherwise the delete is
+    /// desktop parity: the confirmation count and the cascade include the
+    /// journal's locked entries.
+    #[test]
+    fn delete_journal_keeps_the_last_listed_journal() {
+        let (_dir, engine) = unlocked_engine();
+        let journals = engine.list_journals().unwrap();
+        assert_eq!(journals.len(), 1, "a new vault has one journal");
+        let home = journals[0].id.clone();
+        let locked_journal = {
+            let conn = engine.state.lock().unwrap();
+            let id = db::create_journal(&conn, "Locked", None).unwrap().id;
+            db::set_journal_locked(&conn, &id, true).unwrap();
+            id
+        };
+
+        assert!(
+            matches!(
+                engine.delete_journal(home.clone()),
+                Err(MemloreError::LastJournal)
+            ),
+            "the last listed journal was not refused"
+        );
+        {
+            let conn = engine.state.lock().unwrap();
+            assert!(!db::get_journal(&conn, &home).unwrap().unwrap().is_deleted);
+            assert!(
+                !db::get_journal(&conn, &locked_journal)
+                    .unwrap()
+                    .unwrap()
+                    .is_deleted
+            );
+        }
+
+        let second = engine.create_journal("Second".to_string()).unwrap().id;
+        let listed = engine
+            .create_entry("Listed".to_string(), Some(second.clone()))
+            .unwrap();
+        let locked = engine
+            .create_entry("Locked".to_string(), Some(second.clone()))
+            .unwrap();
+        db::set_entry_locked(&engine.state.lock().unwrap(), &locked, true).unwrap();
+
+        assert_eq!(engine.journal_entry_count(second.clone()).unwrap(), 2);
+        engine.delete_journal(second.clone()).unwrap();
+        let conn = engine.state.lock().unwrap();
+        assert!(db::get_journal(&conn, &second).unwrap().unwrap().is_deleted);
+        for id in [&listed, &locked] {
+            assert!(
+                db::get_entry_raw(&conn, id).unwrap().unwrap().is_deleted,
+                "an entry of the deleted journal survived"
+            );
+        }
+    }
+
+    /// Mobile has no reveal session (until M3c): the listings and search
+    /// leave out a locked journal, a tag used only on a locked entry, a
+    /// locked, invisible or trashed entry and an entry of a locked journal;
+    /// the trash and tag calls cannot touch what they do not list. What stays
+    /// visible is listed, so an empty answer cannot pass.
     #[test]
     fn listings_hide_locked_journals_and_locked_only_tags() {
         let (_dir, engine) = unlocked_engine();
@@ -824,13 +963,27 @@ mod tests {
         let trashed_locked = engine
             .create_entry("Trashed locked".to_string(), None)
             .unwrap();
-        let (home, locked_journal, unused, on_listed, locked_only) = {
+        let locked_journal = engine
+            .create_journal("Locked journal".to_string())
+            .unwrap()
+            .id;
+        let in_locked_journal = engine
+            .create_entry(
+                "In locked journal".to_string(),
+                Some(locked_journal.clone()),
+            )
+            .unwrap();
+        let invisible = engine.create_entry("Invisible".to_string(), None).unwrap();
+        // Written while every entry is still listed.
+        for id in [&listed, &locked, &trashed, &in_locked_journal, &invisible] {
+            write_text(&engine, id, "Một thử thách được vượt qua");
+        }
+        let (home, unused, on_listed, locked_only) = {
             let conn = engine.state.lock().unwrap();
             let home = db::get_entry(&conn, &listed).unwrap().unwrap().journal_id;
-            let locked_journal = db::create_journal(&conn, "Locked journal", None)
-                .unwrap()
-                .id;
             db::set_journal_locked(&conn, &locked_journal, true).unwrap();
+            let vault = db::insert_invisible_vault(&conn, "verifier").unwrap();
+            db::set_entry_invisible(&conn, &invisible, true, Some(&vault.id)).unwrap();
             let tag = |name: &str| db::create_tag(&conn, name, None).unwrap().id;
             let (unused, on_listed, locked_only) =
                 (tag("unused"), tag("on-listed"), tag("locked-only"));
@@ -844,7 +997,7 @@ mod tests {
             db::trash_entry(&conn, &trashed, now).unwrap();
             db::trash_entry(&conn, &trashed_locked, now).unwrap();
             db::set_entry_locked(&conn, &trashed_locked, true).unwrap();
-            (home, locked_journal, unused, on_listed, locked_only)
+            (home, unused, on_listed, locked_only)
         };
 
         let journals: Vec<String> = engine
@@ -890,6 +1043,116 @@ mod tests {
         assert!(
             row.is_deleted && row.trashed_at.is_some(),
             "the locked entry left Trash"
+        );
+
+        // Tags: a locked-only tag cannot be renamed or deleted, and a name
+        // held by a deleted tag is taken (no merge).
+        expect_not_found(
+            engine.rename_tag(locked_only.clone(), "renamed".to_string()),
+            "rename_tag",
+        );
+        expect_not_found(engine.delete_tag(locked_only.clone()), "delete_tag");
+        let tag = db::get_tag_for_import(&engine.state.lock().unwrap(), &locked_only)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag.name, "locked-only", "a refused call renamed the tag");
+        assert!(!tag.is_deleted, "a refused call deleted the tag");
+        let gone = engine.create_tag("gone".to_string()).unwrap().id;
+        engine.delete_tag(gone).unwrap();
+        assert!(
+            matches!(
+                engine.rename_tag(unused.clone(), "gone".to_string()),
+                Err(MemloreError::NameTaken)
+            ),
+            "renaming to a deleted tag's name was not NameTaken"
+        );
+
+        // Search: an unaccented token finds the listed entry only.
+        let found: Vec<String> = engine
+            .search_entries("thu thach".to_string(), SearchFiltersFfi::default())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(found, vec![listed.clone()], "search leaked or missed");
+        assert!(
+            engine
+                .search_entries(" ".to_string(), SearchFiltersFfi::default())
+                .unwrap()
+                .is_empty(),
+            "a blank query without filters listed entries"
+        );
+        let browsed: Vec<String> = engine
+            .search_entries(
+                String::new(),
+                SearchFiltersFfi {
+                    journal_ids: vec![home.clone()],
+                    ..SearchFiltersFfi::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(browsed.contains(&listed), "blank query with a filter");
+        assert!(!browsed.contains(&locked), "browse listed a locked entry");
+        assert!(
+            matches!(
+                engine.search_entries(
+                    "x".to_string(),
+                    SearchFiltersFfi {
+                        emotions: vec!["happy".to_string()],
+                        ..SearchFiltersFfi::default()
+                    },
+                ),
+                Err(MemloreError::Format { .. })
+            ),
+            "an unknown emotion was accepted"
+        );
+
+        // Templates: the seeds run on the FFI vault path and come first.
+        let names: Vec<String> = engine
+            .list_templates()
+            .unwrap()
+            .into_iter()
+            .take(3)
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, ["blank", "daily-reflection", "morning-pages"]);
+    }
+
+    /// A version is only taken of a doc with text (the birth doc is blank),
+    /// is listed with the stored bytes, and is read only through its own
+    /// entry.
+    #[test]
+    fn snapshot_skips_blank_docs_and_versions_stay_scoped() {
+        let (_dir, engine) = unlocked_engine();
+        let id = engine.create_entry("Versioned".to_string(), None).unwrap();
+        let other = engine.create_entry("Other".to_string(), None).unwrap();
+        assert_eq!(engine.snapshot_entry_version(id.clone()).unwrap(), None);
+        assert!(engine.list_entry_versions(id.clone()).unwrap().is_empty());
+
+        write_text(&engine, &id, "First draft");
+        let version = engine
+            .snapshot_entry_version(id.clone())
+            .unwrap()
+            .expect("a doc with text is snapshotted");
+        let listed = engine.list_entry_versions(id.clone()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, version);
+        assert_eq!(listed[0].preview_text, "First draft");
+        let stored = db::get_entry_content(&engine.state.lock().unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            engine
+                .get_entry_version_content(id.clone(), version.clone())
+                .unwrap(),
+            stored
+        );
+        expect_not_found(
+            engine.get_entry_version_content(other, version),
+            "another entry's version",
         );
     }
 

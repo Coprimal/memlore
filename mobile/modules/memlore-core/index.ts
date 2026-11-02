@@ -8,8 +8,12 @@ export type StartupMode = 'first_launch' | 'password_locked' | 'boot_file_corrup
  * ERR_BIOMETRIC_DISABLED: Face ID/Touch ID cannot be used now (not enrolled,
  * locked out, or the unlock found it broken and turned it off); use the
  * password. ERR_BIOMETRIC_CANCELLED: the user dismissed or failed the
- * prompt; nothing changed. ERR_NOT_FOUND: the entry, journal or tag does
- * not exist or is not listed on mobile (deleted, locked or invisible).
+ * prompt; nothing changed. ERR_NOT_FOUND: the entry, journal, tag or
+ * template does not exist or is not listed on mobile (deleted, locked or
+ * invisible; a predefined template for `updateTemplate`/`deleteTemplate`).
+ * ERR_NAME_TAKEN: a tag rename onto a name another tag holds, a deleted one
+ * included (no merge). ERR_LAST_JOURNAL: the last journal mobile lists
+ * cannot be deleted, even when locked journals remain.
  */
 export type MemloreErrorCode =
   | 'ERR_LOCKED'
@@ -18,7 +22,9 @@ export type MemloreErrorCode =
   | 'ERR_FORMAT'
   | 'ERR_BIOMETRIC_DISABLED'
   | 'ERR_BIOMETRIC_CANCELLED'
-  | 'ERR_NOT_FOUND';
+  | 'ERR_NOT_FOUND'
+  | 'ERR_NAME_TAKEN'
+  | 'ERR_LAST_JOURNAL';
 
 /** The device's biometric hardware. */
 export type BiometricKind = 'faceID' | 'touchID' | 'none';
@@ -81,6 +87,45 @@ export interface TrashRow {
   previewText: string | null;
   /** Unix seconds. */
   trashedAt: number;
+}
+
+/** Search filters; an empty list means no restriction. */
+export interface SearchFilters {
+  /** Unix seconds, inclusive; applied only together with `toExclusive`. */
+  from?: number | null;
+  /** Unix seconds, exclusive; applied only together with `from`. */
+  toExclusive?: number | null;
+  journalIds: string[];
+  tagIds: string[];
+  emotions: Emotion[];
+}
+
+/** One search hit (locked, invisible and trashed entries never match). */
+export interface SearchResult {
+  id: string;
+  journalId: string;
+  title: string | null;
+  previewText: string | null;
+  /** Unix seconds. */
+  entryDate: number;
+}
+
+/** One saved version of an entry, without its document. */
+export interface Version {
+  id: string;
+  /** Unix seconds. */
+  createdAt: number;
+  previewText: string;
+}
+
+export interface Template {
+  id: string;
+  name: string;
+  description: string | null;
+  contentHtml: string | null;
+  /** Seeded by the app; cannot be edited or deleted. */
+  isPredefined: boolean;
+  sortOrder: number;
 }
 
 /** Spike 17.1: one file of the picked `MemloreSpike` folder. */
@@ -242,8 +287,22 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
   listJournals(): Promise<Journal[]>;
   createJournal(name: string): Promise<Journal>;
   renameJournal(id: string, name: string): Promise<Journal>;
+  /**
+   * The delete confirmation's count (desktop's): live entries, locked ones
+   * included. Trashed and invisible entries also go but are not counted.
+   */
+  journalEntryCount(id: string): Promise<number>;
+  /**
+   * Deletes the journal and every entry in it, locked ones included
+   * (irreversible). Rejects with ERR_LAST_JOURNAL for the last listed one.
+   */
+  deleteJournal(id: string): Promise<void>;
   listTags(): Promise<Tag[]>;
   createTag(name: string): Promise<Tag>;
+  /** Keeps the colour; '' is ERR_FORMAT, another tag's name ERR_NAME_TAKEN. */
+  renameTag(id: string, name: string): Promise<Tag>;
+  /** Also takes the tag off locked entries (desktop parity). */
+  deleteTag(id: string): Promise<void>;
   addTagToEntry(entryId: string, tagId: string): Promise<void>;
   removeTagFromEntry(entryId: string, tagId: string): Promise<void>;
   /**
@@ -262,6 +321,36 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
     contentText: string,
     previewText: string,
   ): Promise<void>;
+  /**
+   * At most 50 listed entries: a query ranks full-text matches; a blank query
+   * with a filter lists the newest matching entries; a blank query without a
+   * filter resolves with []. ERR_FORMAT for an unknown emotion or a
+   * non-finite date (a fraction is dropped).
+   */
+  searchEntries(query: string, filters: SearchFilters): Promise<SearchResult[]>;
+  /** Newest first; ERR_NOT_FOUND for an entry the list does not show. */
+  listEntryVersions(entryId: string): Promise<Version[]>;
+  /**
+   * One version's Yjs document (full state) as base64; ERR_NOT_FOUND for a
+   * version of another entry.
+   */
+  getEntryVersionContent(entryId: string, versionId: string): Promise<string>;
+  /**
+   * Keeps the entry's STORED document as a new version and prunes old ones
+   * like the desktop; resolves with its id, or null when the text is blank.
+   */
+  snapshotEntryVersion(entryId: string): Promise<string | null>;
+  /** Predefined templates first, then user templates. */
+  listTemplates(): Promise<Template[]>;
+  /** Creates an empty user template; '' is ERR_FORMAT. */
+  createTemplate(name: string, description?: string | null): Promise<Template>;
+  /**
+   * Renames and redescribes a user template and clears its content (desktop
+   * parity). ERR_NOT_FOUND for a predefined template.
+   */
+  updateTemplate(id: string, name: string, description?: string | null): Promise<Template>;
+  /** ERR_NOT_FOUND for a predefined template. */
+  deleteTemplate(id: string): Promise<void>;
 
   // Spike 17.1 (dev route `app/(dev)/spike-icloud.tsx` only, read-only; see
   // ios/ICloudSpike.swift). Reject with code ERR_SPIKE.
