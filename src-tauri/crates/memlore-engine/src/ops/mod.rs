@@ -6,6 +6,8 @@ pub mod app_info;
 pub mod backup;
 pub mod entries;
 pub mod guards;
+pub mod invisible_lock;
 pub mod journals;
 pub mod media;
+pub mod second_lock;
 pub mod tags;
