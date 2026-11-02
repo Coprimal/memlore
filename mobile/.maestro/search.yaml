@@ -1,0 +1,86 @@
+# Search (M3b task 2.7): an accented word is found by its unaccented form,
+# the result opens the entry, and an emotion filter the entry does not have
+# hides it.
+#
+# Runs against the Release simulator build (see vault-create-unlock.yaml):
+#   pnpm mobile:ios:release
+#   pnpm mobile:e2e
+# clearState wipes the app's container, so the flow creates its own vault.
+appId: app.memlore.mobile
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible:
+      id: backup-notice
+    timeout: 15000
+- tapOn:
+    id: password-input
+- inputText: "12345678"
+- tapOn:
+    id: confirm-password-input
+- inputText: "12345678"
+- tapOn:
+    id: create-vault-button
+- extendedWaitUntil:
+    visible:
+      id: recovery-phrase
+    timeout: 30000
+- tapOn:
+    id: phrase-saved-button
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+    timeout: 15000
+
+# An entry whose title carries an accented word.
+- tapOn:
+    id: new-entry-button
+- extendedWaitUntil:
+    notVisible:
+      id: entry-placeholder
+    timeout: 15000
+- tapOn:
+    id: entry-title-input
+- inputText: "Chim phượng hoàng"
+- tapOn:
+    point: "10%,7%"
+- extendedWaitUntil:
+    visible:
+      text: ".*phượng.*"
+    timeout: 10000
+
+# The unaccented word finds it; the result opens the entry.
+- tapOn:
+    id: search-button
+- extendedWaitUntil:
+    visible:
+      id: search-input
+    timeout: 5000
+- inputText: "phuong"
+- extendedWaitUntil:
+    visible:
+      id: search-result-0
+    timeout: 10000
+- tapOn:
+    id: search-result-0
+- extendedWaitUntil:
+    visible:
+      id: entry-title-input
+    timeout: 15000
+- tapOn:
+    point: "10%,7%"
+- extendedWaitUntil:
+    visible:
+      id: search-result-0
+    timeout: 10000
+
+# The entry has no emotion: filtering by "good" hides it.
+- tapOn:
+    id: search-emotion-good
+- extendedWaitUntil:
+    visible:
+      id: search-empty
+    timeout: 10000
+- assertNotVisible:
+    id: search-result-0

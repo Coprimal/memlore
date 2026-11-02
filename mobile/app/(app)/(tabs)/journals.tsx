@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
-import type { Journal } from '@/modules/memlore-core';
+import type { Journal, MemloreErrorCode } from '@/modules/memlore-core';
 import { ErrorText } from '@/src/components/ErrorText';
 import { useJournals } from '@/src/hooks/useOrganize';
 import { t } from '@/src/i18n';
@@ -22,7 +22,7 @@ const SPINNER_DELAY_MS = 150;
 
 /**
  * The listed journals. A tap shows the Entries tab filtered by that journal;
- * a long press renames it; the header button creates one.
+ * a long press renames or deletes it; the header button creates one.
  */
 export default function JournalsScreen() {
   const router = useRouter();
@@ -62,15 +62,62 @@ export default function JournalsScreen() {
     );
   }
 
+  /**
+   * Asks first, with desktop's copy and count (live entries, locked ones
+   * included), then deletes the journal and every entry in it.
+   */
+  async function confirmDelete(journal: Journal) {
+    const count = await list.entryCount(journal.id);
+    if (typeof count !== 'number') {
+      showFailure(count);
+      return;
+    }
+    let body = `${journal.name} ${t('settings:journals_section.delete_removed')}`;
+    if (count > 0) {
+      const noun = t('settings:journals_section.entry', { count });
+      body += ` ${t('settings:journals_section.delete_with_entries', { count, noun })}`;
+    }
+    body += `\n\n${t('settings:journals_section.delete_sync_warning')}`;
+    Alert.alert(t('settings:journals_section.delete_title'), body, [
+      { text: t('settings:journals_section.form.cancel'), style: 'cancel' },
+      {
+        text: t('settings:journals_section.delete'),
+        style: 'destructive',
+        onPress: () => void remove(journal.id),
+      },
+    ]);
+  }
+
+  async function remove(id: string) {
+    const code = await list.deleteJournal(id);
+    if (code !== null) showFailure(code);
+  }
+
+  function showFailure(code: MemloreErrorCode) {
+    // A lock shows the unlock screen instead.
+    if (code === 'ERR_LOCKED') return;
+    Alert.alert(
+      code === 'ERR_LAST_JOURNAL'
+        ? t('settings:journals_section.errors.last_journal')
+        : t('settings:journals_section.delete_failed'),
+    );
+  }
+
   function openMenu(journal: Journal) {
     ActionSheetIOS.showActionSheetWithOptions(
       {
         title: journal.name,
-        options: [t('mobile.journal.rename'), t('settings:journals_section.form.cancel')],
-        cancelButtonIndex: 1,
+        options: [
+          t('mobile.journal.rename'),
+          t('settings:journals_section.delete'),
+          t('settings:journals_section.form.cancel'),
+        ],
+        destructiveButtonIndex: 1,
+        cancelButtonIndex: 2,
       },
       (index) => {
         if (index === 0) rename(journal);
+        else if (index === 1) void confirmDelete(journal);
       },
     );
   }
@@ -96,9 +143,13 @@ export default function JournalsScreen() {
           <Pressable
             testID={`journal-row-${index}`}
             accessibilityRole="button"
-            accessibilityActions={[{ name: 'rename', label: t('mobile.journal.rename') }]}
+            accessibilityActions={[
+              { name: 'rename', label: t('mobile.journal.rename') },
+              { name: 'delete', label: t('settings:journals_section.delete') },
+            ]}
             onAccessibilityAction={(event) => {
               if (event.nativeEvent.actionName === 'rename') rename(item);
+              else if (event.nativeEvent.actionName === 'delete') void confirmDelete(item);
             }}
             onPress={() => router.navigate({ pathname: '/', params: { journal: item.id } })}
             onLongPress={() => openMenu(item)}

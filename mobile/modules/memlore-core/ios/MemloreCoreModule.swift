@@ -100,6 +100,13 @@ private func toException(_ error: Error) -> Exception {
     return biometricCancelled()
   case MemloreError.NotFound:
     return Exception(name: "MemloreNotFound", description: "Not found", code: "ERR_NOT_FOUND")
+  case MemloreError.NameTaken:
+    return Exception(
+      name: "MemloreNameTaken", description: "Another tag has this name", code: "ERR_NAME_TAKEN")
+  case MemloreError.LastJournal:
+    return Exception(
+      name: "MemloreLastJournal", description: "The last journal cannot be deleted",
+      code: "ERR_LAST_JOURNAL")
   default:
     return Exception(name: "MemloreIo", description: error.localizedDescription, code: "ERR_IO")
   }
@@ -341,6 +348,87 @@ struct TrashRowRecord: Record {
   }
 }
 
+/// `SearchFilters` in `index.ts` (JS to native only).
+struct SearchFiltersRecord: Record {
+  /// Unix seconds, inclusive; applied only together with `toExclusive`.
+  @Field var from: Double? = nil
+  /// Unix seconds, exclusive; applied only together with `from`.
+  @Field var toExclusive: Double? = nil
+  @Field var journalIds: [String] = []
+  @Field var tagIds: [String] = []
+  @Field var emotions: [String] = []
+
+  init() {}
+}
+
+/// A JS date bound as whole Unix seconds (a fraction is dropped), like
+/// `setEntryDate`; a non-finite or out-of-range value is ERR_FORMAT.
+private func searchBound(_ value: Double?) throws -> Int64? {
+  guard let value else { return nil }
+  guard value.isFinite, let seconds = Int64(exactly: value.rounded(.towardZero)) else {
+    throw Exception(
+      name: "MemloreFormat", description: "search date out of range", code: "ERR_FORMAT")
+  }
+  return seconds
+}
+
+/// `SearchResult` in `index.ts`.
+struct SearchResultRecord: Record {
+  @Field var id: String = ""
+  @Field var journalId: String = ""
+  @Field var title: String? = nil
+  @Field var previewText: String? = nil
+  /// Unix seconds.
+  @Field var entryDate: Double = 0
+
+  init() {}
+
+  init(_ result: SearchResultFfi) {
+    id = result.id
+    journalId = result.journalId
+    title = result.title
+    previewText = result.previewText
+    entryDate = Double(result.entryDate)
+  }
+}
+
+/// `Version` in `index.ts`.
+struct VersionRecord: Record {
+  @Field var id: String = ""
+  /// Unix seconds.
+  @Field var createdAt: Double = 0
+  @Field var previewText: String = ""
+
+  init() {}
+
+  init(_ version: VersionFfi) {
+    id = version.id
+    createdAt = Double(version.createdAt)
+    previewText = version.previewText
+  }
+}
+
+/// `Template` in `index.ts`.
+struct TemplateRecord: Record {
+  @Field var id: String = ""
+  @Field var name: String = ""
+  @Field var description: String? = nil
+  @Field var contentHtml: String? = nil
+  @Field var isPredefined: Bool = false
+  @Field var sortOrder: Int = 0
+
+  init() {}
+
+  init(_ template: TemplateFfi) {
+    id = template.id
+    name = template.name
+    description = template.description
+    contentHtml = template.contentHtml
+    isPredefined = template.isPredefined
+    sortOrder = Int(clamping: template.sortOrder)
+  }
+}
+
 public class MemloreCoreModule: Module {
   /// Main thread only.
   private var deviceSecurity: DeviceSecurity?
@@ -568,12 +656,28 @@ public class MemloreCoreModule: Module {
       try withEngine { engine in try JournalRecord(engine.renameJournal(id: id, name: name)) }
     }.runOnQueue(engineQueue)
 
+    AsyncFunction("journalEntryCount") { (id: String) throws -> Int in
+      try withEngine { engine in try Int(clamping: engine.journalEntryCount(id: id)) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("deleteJournal") { (id: String) throws in
+      try withEngine { engine in try engine.deleteJournal(id: id) }
+    }.runOnQueue(engineQueue)
+
     AsyncFunction("listTags") { () throws -> [TagRecord] in
       try withEngine { engine in try engine.listTags().map { TagRecord($0) } }
     }.runOnQueue(engineQueue)
 
     AsyncFunction("createTag") { (name: String) throws -> TagRecord in
       try withEngine { engine in try TagRecord(engine.createTag(name: name)) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("renameTag") { (id: String, name: String) throws -> TagRecord in
+      try withEngine { engine in try TagRecord(engine.renameTag(id: id, name: name)) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("deleteTag") { (id: String) throws in
+      try withEngine { engine in try engine.deleteTag(id: id) }
     }.runOnQueue(engineQueue)
 
     AsyncFunction("addTagToEntry") { (entryId: String, tagId: String) throws in
@@ -600,6 +704,57 @@ public class MemloreCoreModule: Module {
         try engine.saveEntryYjs(
           id: id, fullState: fullState, contentText: contentText, previewText: previewText)
       }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("searchEntries") {
+      (query: String, filters: SearchFiltersRecord) throws -> [SearchResultRecord] in
+      let ffiFilters = SearchFiltersFfi(
+        from: try searchBound(filters.from), toExclusive: try searchBound(filters.toExclusive),
+        journalIds: filters.journalIds, tagIds: filters.tagIds, emotions: filters.emotions)
+      return try withEngine { engine in
+        try engine.searchEntries(query: query, filters: ffiFilters).map { SearchResultRecord($0) }
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("listEntryVersions") { (entryId: String) throws -> [VersionRecord] in
+      try withEngine { engine in
+        try engine.listEntryVersions(entryId: entryId).map { VersionRecord($0) }
+      }
+    }.runOnQueue(engineQueue)
+
+    // Base64, like `loadEntryYjs`.
+    AsyncFunction("getEntryVersionContent") {
+      (entryId: String, versionId: String) throws -> String in
+      try withEngine { engine in
+        try engine.getEntryVersionContent(entryId: entryId, versionId: versionId)
+          .base64EncodedString()
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("snapshotEntryVersion") { (entryId: String) throws -> String? in
+      try withEngine { engine in try engine.snapshotEntryVersion(entryId: entryId) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("listTemplates") { () throws -> [TemplateRecord] in
+      try withEngine { engine in try engine.listTemplates().map { TemplateRecord($0) } }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("createTemplate") {
+      (name: String, description: String?) throws -> TemplateRecord in
+      try withEngine { engine in
+        try TemplateRecord(engine.createTemplate(name: name, description: description))
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("updateTemplate") {
+      (id: String, name: String, description: String?) throws -> TemplateRecord in
+      try withEngine { engine in
+        try TemplateRecord(engine.updateTemplate(id: id, name: name, description: description))
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("deleteTemplate") { (id: String) throws in
+      try withEngine { engine in try engine.deleteTemplate(id: id) }
     }.runOnQueue(engineQueue)
 
     // Spike 17.1, dev route only (`app/(dev)/spike-icloud.tsx`); read-only,

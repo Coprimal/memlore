@@ -8,7 +8,12 @@ import {
   useState,
 } from 'react';
 
-import MemloreCore, { type Journal, type Tag, type TrashRow } from '@/modules/memlore-core';
+import MemloreCore, {
+  type Journal,
+  type MemloreErrorCode,
+  type Tag,
+  type TrashRow,
+} from '@/modules/memlore-core';
 import { errorCode, useVault } from '@/src/hooks/useVault';
 import { removeCachedRow } from '@/src/lib/rowCache';
 
@@ -18,7 +23,7 @@ export { TRASH_RETENTION_DAYS, trashDaysLeft } from '@/src/lib/trashRetention';
  * A list read with `load` on every focus of the screen (and by `refresh`).
  * `error` is a failed read; ERR_LOCKED shows the lock screen instead.
  */
-function useFocusList<T>(load: () => Promise<T[]>) {
+export function useFocusList<T>(load: () => Promise<T[]>) {
   const vault = useVault();
   const [items, setItems] = useState<T[]>([]);
   const [loading, setLoading] = useState(true);
@@ -68,6 +73,18 @@ function useChangeFailure(refresh: () => Promise<void>) {
     const code = errorCode(e);
     if (code === 'ERR_LOCKED') vault.markLocked();
     else if (reload || code === 'ERR_NOT_FOUND') void refresh();
+  };
+}
+
+/**
+ * `useChangeFailure`, then the refusal's code for the screen to show
+ * (ERR_IO for an error without a known code).
+ */
+export function useCodedFailure(refresh: () => Promise<void>) {
+  const onFail = useChangeFailure(refresh);
+  return (e: unknown): MemloreErrorCode => {
+    onFail(e);
+    return errorCode(e) ?? 'ERR_IO';
   };
 }
 
@@ -191,7 +208,52 @@ export function useJournals() {
     [refresh],
   );
 
-  return { journals, loading, error, refresh, createJournal, renameJournal };
+  const failed = useCodedFailure(refresh);
+
+  /**
+   * The delete confirmation's count (desktop's): live entries, locked ones
+   * included; trashed and invisible entries also go but are not counted.
+   * Resolves the refusal's code when it could not be read.
+   */
+  const entryCount = useCallback(
+    async (id: string): Promise<number | MemloreErrorCode> => {
+      try {
+        return await MemloreCore.journalEntryCount(id);
+      } catch (e) {
+        return failed(e);
+      }
+    },
+    [refresh],
+  );
+
+  /**
+   * Deletes the journal and every entry in it, locked ones included
+   * (irreversible; confirm first). Resolves null once deleted, else the
+   * refusal's code: ERR_LAST_JOURNAL for the last listed journal.
+   */
+  const deleteJournal = useCallback(
+    async (id: string): Promise<MemloreErrorCode | null> => {
+      try {
+        await MemloreCore.deleteJournal(id);
+        without(setItems, [id]);
+        return null;
+      } catch (e) {
+        return failed(e);
+      }
+    },
+    [refresh],
+  );
+
+  return {
+    journals,
+    loading,
+    error,
+    refresh,
+    createJournal,
+    renameJournal,
+    entryCount,
+    deleteJournal,
+  };
 }
 
 /**
@@ -225,5 +287,44 @@ export function useTags() {
     [refresh],
   );
 
-  return { tags, loading, error, refresh, createTag };
+  const failed = useCodedFailure(refresh);
+
+  /**
+   * Renames the tag to `name` (trimmed) and keeps its colour. Resolves the
+   * stored tag, else the refusal's code: ERR_FORMAT for an empty name (no
+   * call), ERR_NAME_TAKEN for another tag's name, a deleted one included.
+   */
+  const renameTag = useCallback(
+    async (id: string, name: string): Promise<Tag | MemloreErrorCode> => {
+      const trimmed = name.trim();
+      if (!trimmed) return 'ERR_FORMAT';
+      try {
+        const tag = await MemloreCore.renameTag(id, trimmed);
+        setItems((prev) => prev.map((t) => (t.id === tag.id ? tag : t)));
+        return tag;
+      } catch (e) {
+        return failed(e);
+      }
+    },
+    [refresh],
+  );
+
+  /**
+   * Deletes the tag and takes it off every entry, locked ones included
+   * (confirm first). Resolves null once deleted, else the refusal's code.
+   */
+  const deleteTag = useCallback(
+    async (id: string): Promise<MemloreErrorCode | null> => {
+      try {
+        await MemloreCore.deleteTag(id);
+        without(setItems, [id]);
+        return null;
+      } catch (e) {
+        return failed(e);
+      }
+    },
+    [refresh],
+  );
+
+  return { tags, loading, error, refresh, createTag, renameTag, deleteTag };
 }

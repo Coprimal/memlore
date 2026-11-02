@@ -7,6 +7,7 @@ import MemloreCore, {
   type MemloreErrorCode,
 } from '@/modules/memlore-core';
 import { flushAll } from '@/src/lib/flushRegistry';
+import { clearPendingRestore } from '@/src/lib/pendingRestore';
 import { clearRowCache, enableRowCache } from '@/src/lib/rowCache';
 
 export type VaultStatus =
@@ -35,15 +36,21 @@ export interface VaultBiometric {
 
 const NO_BIOMETRIC: VaultBiometric = { available: false, kind: 'none', enabled: false };
 
-const ERROR_CODES: readonly MemloreErrorCode[] = [
-  'ERR_LOCKED',
-  'ERR_WRONG_PASSWORD',
-  'ERR_IO',
-  'ERR_FORMAT',
-  'ERR_BIOMETRIC_DISABLED',
-  'ERR_BIOMETRIC_CANCELLED',
-  'ERR_NOT_FOUND',
-];
+// Every code the module can reject with: a Record, so a code added to
+// `MemloreErrorCode` and missing here fails the typecheck instead of reading
+// as a generic error.
+const KNOWN_CODES: Record<MemloreErrorCode, true> = {
+  ERR_LOCKED: true,
+  ERR_WRONG_PASSWORD: true,
+  ERR_IO: true,
+  ERR_FORMAT: true,
+  ERR_BIOMETRIC_DISABLED: true,
+  ERR_BIOMETRIC_CANCELLED: true,
+  ERR_NOT_FOUND: true,
+  ERR_NAME_TAKEN: true,
+  ERR_LAST_JOURNAL: true,
+};
+const ERROR_CODES = Object.keys(KNOWN_CODES) as MemloreErrorCode[];
 
 /**
  * How long JS waits for the lock screen after an auto-lock before it stops
@@ -215,6 +222,7 @@ function useVaultState() {
   /** Drops everything read from the vault and shows the lock screen. */
   function showLocked() {
     clearRowCache();
+    clearPendingRestore();
     setError(null);
     setAutoLockValue(null);
     setStatus('locked');

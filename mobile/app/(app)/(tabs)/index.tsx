@@ -4,9 +4,10 @@ import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, Pressable, SectionList, Text, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
-import type { EntryRow } from '@/modules/memlore-core';
+import type { EntryRow, Template } from '@/modules/memlore-core';
 import { ErrorText } from '@/src/components/ErrorText';
 import { JournalPicker } from '@/src/components/JournalPicker';
+import { TemplatePicker } from '@/src/components/TemplatePicker';
 import { useEntries } from '@/src/hooks/useEntries';
 import { useJournals } from '@/src/hooks/useOrganize';
 import { activeLocale, t } from '@/src/i18n';
@@ -46,9 +47,11 @@ export default function EntriesScreen() {
   // '' (the picker's "All journals") and a missing param both mean no filter.
   const journalId = typeof params.journal === 'string' && params.journal ? params.journal : null;
   const list = useEntries(journalId);
-  const { journals } = useJournals();
+  const journalList = useJournals();
+  const { journals } = journalList;
   const [pickerOpen, setPickerOpen] = useState(false);
-  // The new-entry button dims at once while `createEntry` runs.
+  const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  // Both new-entry buttons dim at once while `createEntry` runs.
   const [creating, setCreating] = useState(false);
   const showSpinner = useDelayed(list.loading && list.rows.length === 0, SPINNER_DELAY_MS);
 
@@ -60,6 +63,27 @@ export default function EntriesScreen() {
     // The flat index across sections, for `entry-row-<index>`.
     data: group.items.map((row) => ({ row, index: index++ })),
   }));
+
+  // The journal the list last started loading, so an older failure never counts.
+  const loadingFor = useRef<string | null | undefined>(undefined);
+  // A filter journal that is gone (deleted, or locked on the desktop) shows All
+  // journals: the list read for it failed and the journal list, read on the
+  // same focus, no longer has it. (useEntries reports a failure, not its code;
+  // its ERR_NOT_FOUND means the same: the journal is not listed.)
+  useEffect(() => {
+    if (list.loading) {
+      loadingFor.current = journalId;
+      return;
+    }
+    const gone =
+      journalId !== null &&
+      loadingFor.current === journalId &&
+      list.error &&
+      !journalList.loading &&
+      !journalList.error &&
+      !journals.some((journal) => journal.id === journalId);
+    if (gone) router.setParams({ journal: '' });
+  }, [journalId, list.loading, list.error, journalList.loading, journalList.error, journals]);
 
   // The filtered journal's name; "All journals" too until the list knows it.
   const filterLabel =
@@ -87,6 +111,21 @@ export default function EntriesScreen() {
     }
   }
 
+  /** A blank entry in the filtered journal; the entry screen applies the template. */
+  async function newEntryFromTemplate(template: Template) {
+    setTemplatePickerOpen(false);
+    if (creating) return;
+    setCreating(true);
+    try {
+      const id = await list.createEntry();
+      if (id !== null) {
+        router.push({ pathname: '/entry/[id]', params: { id, template: template.id } });
+      }
+    } finally {
+      setCreating(false);
+    }
+  }
+
   return (
     <View style={styles.screen}>
       <View style={styles.header}>
@@ -109,17 +148,39 @@ export default function EntriesScreen() {
             {list.total === null ? '…' : t('nav:entry_list.entry_count', { count: list.total })}
           </Text>
         </View>
-        <Pressable
-          testID="new-entry-button"
-          accessibilityRole="button"
-          accessibilityLabel={t('nav:new_entry')}
-          hitSlop={8}
-          disabled={creating}
-          onPress={() => void newEntry()}
-          style={creating ? styles.busy : undefined}
-        >
-          <NewEntryIcon />
-        </Pressable>
+        <View style={styles.headerEnd}>
+          <Pressable
+            testID="search-button"
+            accessibilityRole="button"
+            accessibilityLabel={t('mobile.search.title')}
+            hitSlop={8}
+            onPress={() => router.push('/search')}
+          >
+            <SearchIcon />
+          </Pressable>
+          <Pressable
+            testID="new-from-template-button"
+            accessibilityRole="button"
+            accessibilityLabel={t('editor:templates.modal_title')}
+            hitSlop={8}
+            disabled={creating}
+            onPress={() => setTemplatePickerOpen(true)}
+            style={creating ? styles.busy : undefined}
+          >
+            <NewFromTemplateIcon />
+          </Pressable>
+          <Pressable
+            testID="new-entry-button"
+            accessibilityRole="button"
+            accessibilityLabel={t('nav:new_entry')}
+            hitSlop={8}
+            disabled={creating}
+            onPress={() => void newEntry()}
+            style={creating ? styles.busy : undefined}
+          >
+            <NewEntryIcon />
+          </Pressable>
+        </View>
       </View>
       <ErrorText message={list.error ? t('mobile.error') : null} />
       <SectionList
@@ -151,6 +212,11 @@ export default function EntriesScreen() {
         onSelect={selectJournal}
         onClose={() => setPickerOpen(false)}
       />
+      <TemplatePicker
+        visible={templatePickerOpen}
+        onSelect={(template) => void newEntryFromTemplate(template)}
+        onClose={() => setTemplatePickerOpen(false)}
+      />
     </View>
   );
 }
@@ -158,6 +224,16 @@ export default function EntriesScreen() {
 function FilterChevron() {
   const { theme } = useUnistyles();
   return <SymbolView name="chevron.down" tintColor={theme.colors.fgSecondary} size={13} />;
+}
+
+function SearchIcon() {
+  const { theme } = useUnistyles();
+  return <SymbolView name="magnifyingglass" tintColor={theme.colors.accentText} size={22} />;
+}
+
+function NewFromTemplateIcon() {
+  const { theme } = useUnistyles();
+  return <SymbolView name="doc.badge.plus" tintColor={theme.colors.accentText} size={22} />;
 }
 
 function NewEntryIcon() {
@@ -267,6 +343,11 @@ const styles = StyleSheet.create((theme) => ({
   headerStart: {
     flex: 1,
     gap: theme.space(0.5),
+  },
+  headerEnd: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.space(5),
   },
   filter: {
     flexDirection: 'row',
