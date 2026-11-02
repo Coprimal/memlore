@@ -348,7 +348,7 @@ public class MemloreCoreModule: Module {
   public func definition() -> ModuleDefinition {
     Name("MemloreCore")
 
-    Events("onAutoLock", "onScreenCaptureChange")
+    Events("onAutoLock", "onScreenCaptureChange", "onFlushRequest")
 
     // Both hop to main in order, so a reload's destroy never runs before its
     // create. Destroy holds the module until the observers are gone.
@@ -375,6 +375,11 @@ public class MemloreCoreModule: Module {
 
     AsyncFunction("releasePrivacyShield") {
       MainActor.assumeIsolated { self.deviceSecurity?.releasePrivacyShield() }
+    }.runOnQueue(.main)
+
+    // Save before lock: JS's answer to `onFlushRequest`.
+    AsyncFunction("flushDone") { (id: Int) in
+      MainActor.assumeIsolated { self.deviceSecurity?.flushDone(id) }
     }.runOnQueue(.main)
 
     AsyncFunction("isScreenCaptured") { () -> Bool in

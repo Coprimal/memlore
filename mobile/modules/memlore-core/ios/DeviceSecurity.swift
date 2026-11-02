@@ -1,10 +1,11 @@
 import Darwin
 import UIKit
 
-/// The app-switcher privacy shield, the background auto-lock clock and
-/// screen-capture detection (decisions 5 and 6). Main thread only. It never
-/// calls the engine itself: `lockVault` queues `lock()` on the one serial
-/// engine queue in `MemloreCoreModule.swift`, like every other engine call.
+/// The app-switcher privacy shield, the background auto-lock clock, save
+/// before lock and screen-capture detection (decisions 5 and 6). Main thread
+/// only. It never calls the engine itself: `lockVault` queues `lock()` on the
+/// one serial engine queue in `MemloreCoreModule.swift`, like every other
+/// engine call.
 @MainActor
 final class DeviceSecurity {
   /// Whether the engine holds the keys, as seen from the main thread.
@@ -17,6 +18,16 @@ final class DeviceSecurity {
   /// `releasePrivacyShield()` (no listener yet, a reload), so the app is never
   /// stuck behind it.
   private static let shieldSafetyTimeout: TimeInterval = 2
+  /// How long `didEnterBackground` holds the lock for JS's `flushDone` ack.
+  /// No ack by then locks anyway (fail closed).
+  private static let flushAckTimeout: TimeInterval = 2
+
+  /// The `onFlushRequest` of the current inactive spell (sent at
+  /// willResignActive); nil when the vault was locked then.
+  private struct FlushRequest {
+    let id: Int
+    var acked = false
+  }
 
   private let sendEvent: (String, [String: Any?]) -> Void
   /// Queues the engine's `lock()`; `done` runs on the main thread after it.
@@ -26,13 +37,19 @@ final class DeviceSecurity {
   private var shields: [UIView] = []
   /// `CLOCK_MONOTONIC` nanoseconds at the last `didEnterBackground`.
   private var backgroundedAt: UInt64?
-  /// Locked at `didEnterBackground` (interval "immediate"); JS hears about it
-  /// at the next `willEnterForeground`.
+  /// Locked in the background (interval "immediate", after the flush wait);
+  /// JS hears about it at the next `willEnterForeground`.
   private var lockedInBackground = false
   /// An auto-lock JS has not answered yet: the shield stays up until
   /// `releasePrivacyShield()` or the safety timeout.
   private var autoLockPending = false
   private var shieldTimeout: DispatchWorkItem?
+  private var lastFlushId = 0
+  private var flushRequest: FlushRequest?
+  /// Ends the background task held while `didEnterBackground` waits for the
+  /// ack; nil when no wait runs.
+  private var endFlushWait: (() -> Void)?
+  private var flushTimeout: DispatchWorkItem?
 
   init(
     sendEvent: @escaping (String, [String: Any?]) -> Void,
@@ -53,6 +70,8 @@ final class DeviceSecurity {
   func stop() {
     observers.forEach(NotificationCenter.default.removeObserver)
     observers = []
+    // A reload during the wait: lock now if it was due (fail closed).
+    finishFlushWait()
     shieldTimeout?.cancel()
     shieldTimeout = nil
     hideShield()
@@ -69,6 +88,13 @@ final class DeviceSecurity {
     if UIApplication.shared.applicationState == .active {
       hideShield()
     }
+  }
+
+  /// JS saved every pending edit for request `id`; an older id is ignored.
+  func flushDone(_ id: Int) {
+    guard flushRequest?.id == id else { return }
+    flushRequest?.acked = true
+    finishFlushWait()
   }
 
   /// Recording, mirroring or AirPlay of any of the app's screens.
@@ -97,8 +123,12 @@ final class DeviceSecurity {
   /// Before the app-switcher snapshot: iOS takes it after didEnterBackground,
   /// from whatever is on screen. The Face ID sheet and Control Center also
   /// resign active; the shield covering the app then is accepted.
+  /// Then, with the shield already up, JS is asked to save while the
+  /// WebView still runs; `didEnterBackground` waits for the answer.
   private func willResignActive() {
     showShield()
+    flushRequest = nil
+    if Self.vaultUnlocked { requestFlush() }
   }
 
   private func didEnterBackground() {
@@ -109,16 +139,16 @@ final class DeviceSecurity {
     // CLOCK_UPTIME_RAW, mach_absolute_time and systemUptime stop, so a phone
     // that slept in a pocket would come back unlocked (fail open).
     backgroundedAt = clock_gettime_nsec_np(CLOCK_MONOTONIC)
-    // A suspended app runs no timer, and a background task gets ~30 s, so a
-    // 1/5/15-minute interval is measured at willEnterForeground. Only
-    // "immediate" locks here.
-    guard Self.vaultUnlocked, AutoLockCache.seconds == 0 else { return }
-    Self.vaultUnlocked = false
-    lockedInBackground = true
-    lockInBackgroundTask()
+    // Every interval waits for the saves before the process is suspended; an
+    // ack earlier in this spell counts (nothing can be typed since).
+    guard Self.vaultUnlocked else { return }
+    if flushRequest == nil { requestFlush() }
+    waitForFlush()
   }
 
   private func willEnterForeground() {
+    // Back during the wait: an immediate lock runs now, before onAutoLock.
+    finishFlushWait()
     let stamp = backgroundedAt
     backgroundedAt = nil
     if lockedInBackground {
@@ -157,11 +187,18 @@ final class DeviceSecurity {
     sendEvent("onScreenCaptureChange", ["captured": captured])
   }
 
-  // MARK: - Auto-lock
+  // MARK: - Save before lock
 
-  /// The engine lock runs on its queue; the background task keeps the
-  /// process from being suspended before it has.
-  private func lockInBackgroundTask() {
+  private func requestFlush() {
+    lastFlushId += 1
+    flushRequest = FlushRequest(id: lastFlushId)
+    sendEvent("onFlushRequest", ["id": lastFlushId])
+  }
+
+  /// Holds a background task until the spell's request is acked or
+  /// `flushAckTimeout` passed, then `finishFlushWait` locks if due.
+  private func waitForFlush() {
+    guard endFlushWait == nil else { return }
     let app = UIApplication.shared
     var task = UIBackgroundTaskIdentifier.invalid
     let end = {
@@ -169,7 +206,39 @@ final class DeviceSecurity {
       app.endBackgroundTask(task)
       task = .invalid
     }
-    task = app.beginBackgroundTask(withName: "memlore-auto-lock") { end() }
+    task = app.beginBackgroundTask(withName: "memlore-save-before-lock") { [weak self] in
+      MainActor.assumeIsolated { self?.finishFlushWait() }
+      end()
+    }
+    endFlushWait = end
+    if flushRequest?.acked == true {
+      finishFlushWait()
+      return
+    }
+    let timeout = DispatchWorkItem { [weak self] in
+      MainActor.assumeIsolated { self?.finishFlushWait() }
+    }
+    flushTimeout = timeout
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.flushAckTimeout, execute: timeout)
+  }
+
+  /// Ends the wait (ack, timeout, foreground return, expiry or reload). Only
+  /// "immediate" locks here: a suspended app runs no timer, so a 1/5/15-minute
+  /// interval is measured at willEnterForeground. The lock is queued on the
+  /// engine queue after the ack, so it runs after every save JS awaited; the
+  /// task ends once it has. Reads the live state: a manual lock that ran
+  /// during the wait is not locked again nor reported as an auto-lock.
+  private func finishFlushWait() {
+    guard let end = endFlushWait else { return }
+    endFlushWait = nil
+    flushTimeout?.cancel()
+    flushTimeout = nil
+    guard Self.vaultUnlocked, AutoLockCache.seconds == 0 else {
+      end()
+      return
+    }
+    Self.vaultUnlocked = false
+    lockedInBackground = true
     lockVault { end() }
   }
 

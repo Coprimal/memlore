@@ -112,7 +112,7 @@ appId: app.memlore.mobile
     id: new-entry-button
 - extendedWaitUntil:
     visible:
-      id: entry-placeholder
+      id: entry-title-input
     timeout: 15000
 
 # Background and return: the vault locked itself.
@@ -126,7 +126,7 @@ appId: app.memlore.mobile
 - assertNotVisible:
     id: entry-count
 - assertNotVisible:
-    id: entry-placeholder
+    id: entry-title-input
 - tapOn:
     id: password-input
 - inputText: "12345678"
@@ -138,7 +138,7 @@ appId: app.memlore.mobile
     timeout: 30000
 # The lock removed the entry screen: the unlock lands on the list.
 - assertNotVisible:
-    id: entry-placeholder
+    id: entry-title-input
 
 # Leave the vault on the 1-minute default.
 - tapOn:

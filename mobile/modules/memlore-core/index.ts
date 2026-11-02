@@ -145,6 +145,11 @@ export interface ScreenCaptureChangeEvent {
   captured: boolean;
 }
 
+/** Save before lock: answer with `flushDone(id)` once the edits are saved. */
+export interface FlushRequestEvent {
+  id: number;
+}
+
 export type MemloreCoreEvents = {
   /**
    * The vault was locked after the auto-lock interval in the background.
@@ -154,6 +159,13 @@ export type MemloreCoreEvents = {
    */
   onAutoLock: () => void;
   onScreenCaptureChange: (event: ScreenCaptureChangeEvent) => void;
+  /**
+   * The app is leaving the foreground while the vault is unlocked: save every
+   * pending edit, then call `flushDone(id)`. Native holds its background
+   * lock for the matching ack, at most ~2 s; it never waits to show the
+   * privacy shield.
+   */
+  onFlushRequest: (event: FlushRequestEvent) => void;
 };
 
 declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
@@ -186,6 +198,8 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
   setAutoLockSeconds(seconds: AutoLockSeconds): Promise<void>;
   /** Takes the privacy shield off after handling `onAutoLock`. */
   releasePrivacyShield(): Promise<void>;
+  /** Answers `onFlushRequest`; an id other than the latest request is ignored. */
+  flushDone(id: number): Promise<void>;
   /** Whether the screen is being recorded, mirrored or AirPlayed now. */
   isScreenCaptured(): Promise<boolean>;
   /** Rejects with ERR_LOCKED while the vault is locked. */

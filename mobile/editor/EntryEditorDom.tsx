@@ -8,6 +8,7 @@ import { useEffect, useRef, useState, type Ref } from 'react'
 import * as Y from 'yjs'
 
 import desktopSchema from './__fixtures__/desktop-schema.json'
+import { installContentPolicy, safeExternalUrl, setLinkHandler } from './contentPolicy'
 import { buildMobileExtensions } from './extensions'
 import { schemaDifferences, snapshotSchema } from './schemaSnapshot'
 
@@ -15,51 +16,61 @@ import { schemaDifferences, snapshotSchema } from './schemaSnapshot'
 const SAVE_DEBOUNCE_MS = 1500
 /** Desktop `previewText = contentText.slice(0, 150)` (EditorPanel.tsx). */
 const PREVIEW_LENGTH = 150
+/** At most one `onFormatState` per this interval while typing or moving the caret. */
+const FORMAT_STATE_THROTTLE_MS = 100
 
-/**
- * Entry content is untrusted (synced from other devices, imported): nothing
- * in it may load from the network (an `<img src="https://…">` would leak the
- * IP and the open time) or navigate the WebView. Installed when this module
- * evaluates, so before the editor mounts and renders any media node.
- * Scripts, styles and fonts are left alone: the DOM runtime and KaTeX need them.
- */
-const CONTENT_SECURITY_POLICY = [
-  "img-src 'self' data: blob:",
-  "media-src 'self' data: blob:",
-  // Nothing in the editor embeds, posts or rebases; keep a future node from doing so.
-  "object-src 'none'",
-  "base-uri 'none'",
-  "form-action 'none'",
-  "frame-src 'none'",
-  // Dev: Metro's Fast Refresh socket is ws://, which WebKit may not count as 'self'.
-  __DEV__ ? "connect-src 'self' ws://localhost:*" : "connect-src 'self'",
-].join('; ')
-
-function installContentPolicy() {
-  if (typeof document === 'undefined' || document.querySelector('meta[data-memlore-csp]')) return
-  const meta = document.createElement('meta')
-  meta.httpEquiv = 'Content-Security-Policy'
-  meta.content = CONTENT_SECURITY_POLICY
-  meta.setAttribute('data-memlore-csp', '')
-  document.head.prepend(meta)
-  // No long-press "Open link" preview either.
-  const style = document.createElement('style')
-  style.textContent = 'a { -webkit-touch-callout: none; }'
-  document.head.append(style)
-  // A tap on a link never navigates, editable or read-only.
-  // TODO(later): see docs/LATER.md (open links natively, after a confirmation).
-  document.addEventListener(
-    'click',
-    (event) => {
-      if (event.target instanceof Element && event.target.closest('a')) event.preventDefault()
-    },
-    true,
-  )
-}
+// Before the editor mounts and renders any media node (see contentPolicy.ts).
 installContentPolicy()
 
-/** Native calls `flush()`; the DOM side answers with `onFlushed` once the save is done. */
-export type EntryEditorHandle = { flush: () => void }
+/**
+ * The WebView has no CSS reset: without this, the body's 8 px margin and the
+ * first paragraph's top margin put the first line below the native
+ * placeholder's (padding 12, then 17 px / 1.5 text).
+ */
+const EDITOR_CSS = 'body { margin: 0 } .ProseMirror > :first-child { margin-top: 0 }'
+
+/** What the native toolbar shows as active. */
+export type Format =
+  | 'bold'
+  | 'italic'
+  | 'strike'
+  | 'highlight'
+  | 'heading'
+  | 'bulletList'
+  | 'orderedList'
+  | 'taskList'
+  | 'blockquote'
+  | 'link'
+
+export type FormatState = {
+  /** `heading` is level 2 only, the level the toolbar toggles. */
+  active: Record<Format, boolean>
+  focused: boolean
+  /** The link under the caret, to prefill the link prompt; `null` when none. */
+  linkHref: string | null
+}
+
+export type EditorCommand = Exclude<Format, 'link'> | 'setLink' | 'focusEnd' | 'blur'
+
+/**
+ * Native calls `flush()`; the DOM side answers with `onFlushed` once the save
+ * is done. `exec` runs a toolbar command (a no-op unless editable); `arg` is
+ * the URL for `setLink`, where '' removes the link.
+ */
+export type EntryEditorHandle = {
+  flush: () => void
+  exec(cmd: EditorCommand, arg?: string): void
+}
+
+/**
+ * The same handle as the DOM side receives it: any JSON value from native,
+ * checked before use. Both `exec`s use method syntax (bivariant parameters),
+ * so the screen's `Ref<EntryEditorHandle>` still fits.
+ */
+type BridgeHandle = {
+  flush: () => void
+  exec(cmd?: unknown, arg?: unknown): void
+}
 
 interface Props {
   /** The entry's Yjs full state (base64); '' for an entry with no body yet. */
@@ -72,13 +83,17 @@ interface Props {
   onUpdate: (fullStateB64: string, contentText: string, previewText: string) => Promise<void>
   /** Called after each `flush()`: any pending save has completed (or failed). */
   onFlushed: () => Promise<void>
-  readOnly: boolean
   /**
-   * Dev-only spike instrumentation (plan 15.4): first-paint timing, focus and
-   * caret positions, as `event` + JSON `detail`. Never passed in production.
-   * TODO(later): see docs/LATER.md (remove with the spike screen).
+   * Once, when the document is in the DOM: native can drop its placeholder.
+   * `editable` is false when the entry opened read-only (asked for, or the
+   * unsafe fallback), so native can lock its own fields too.
    */
-  onDebug?: (event: string, detail: string) => Promise<void>
+  onReady: (editable: boolean) => Promise<void>
+  /** Throttled, and only when it changed; editable mode only. */
+  onFormatState: (state: FormatState) => Promise<void>
+  /** A tap on a link, only for an absolute http(s) or mailto URL; nothing navigates here. */
+  onLinkPress: (url: string) => Promise<void>
+  readOnly: boolean
   ref?: Ref<EntryEditorHandle>
   dom?: DOMProps
 }
@@ -101,37 +116,60 @@ export default function EntryEditorDom({
   initialStateB64,
   onUpdate,
   onFlushed,
+  onReady,
+  onFormatState,
+  onLinkPress,
   readOnly,
-  onDebug,
   ref,
 }: Props) {
-  const mountedAt = useRef(performance.now())
   const mountRef = useRef<HTMLDivElement>(null)
   const onUpdateRef = useRef(onUpdate)
   onUpdateRef.current = onUpdate
   const onFlushedRef = useRef(onFlushed)
   onFlushedRef.current = onFlushed
+  const onReadyRef = useRef(onReady)
+  onReadyRef.current = onReady
+  const onFormatStateRef = useRef(onFormatState)
+  onFormatStateRef.current = onFormatState
+  const onLinkPressRef = useRef(onLinkPress)
+  onLinkPressRef.current = onLinkPress
   /** Saves now what the debounce would save later; a no-op when read-only. */
   const flushRef = useRef<() => Promise<void>>(() => Promise.resolve())
+  /** Runs a toolbar command; a no-op until the editable editor exists. */
+  const execRef = useRef<(cmd: EditorCommand, arg: string) => void>(() => {})
   const [mode, setMode] = useState<Mode | null>(null)
 
   // Expo's DOM root never unmounts: when native removes this component (Back,
   // another entry) the page is just torn down and no React cleanup runs. So
   // the screen calls `flush()` and waits for `onFlushed` before leaving.
-  useDOMImperativeHandle(
+  useDOMImperativeHandle<BridgeHandle>(
     ref ?? null,
     () => ({
       flush: () => {
         void flushRef.current().finally(() => void onFlushedRef.current())
       },
+      exec: (cmd, arg) => {
+        if (isEditorCommand(cmd)) execRef.current(cmd, typeof arg === 'string' ? arg : '')
+      },
     }),
     [],
   )
+
+  // Links are tappable in every mode, the read-only fallback included.
+  useEffect(() => {
+    setLinkHandler((url) => void onLinkPressRef.current(url))
+    return () => setLinkHandler(null)
+  }, [])
 
   // Mounted once per entry: the screen keys this component by entry id.
   useEffect(() => {
     const element = mountRef.current
     if (!element) return
+    // Tiptap emits `create` from a timer after it builds the view, and y-tiptap
+    // renders the document synchronously while the view is built: so this runs
+    // once, with the text in the DOM (never if the editor is destroyed first).
+    // Not `requestAnimationFrame`: WebKit stalls it ~10 s in an empty entry.
+    const onCreate = (editable: boolean) => () => void onReadyRef.current(editable)
     const doc = new Y.Doc()
     let safe = schemaDifferences(desktopSchemaSnapshot(), mobileSchemaSnapshot()).length === 0
     try {
@@ -148,6 +186,7 @@ export default function EntryEditorDom({
         editorProps: EDITOR_PROPS,
         extensions: buildMobileExtensions(),
         content: readOnlyContent(doc),
+        onCreate: onCreate(false),
       })
       return () => {
         editor.destroy()
@@ -164,8 +203,8 @@ export default function EntryEditorDom({
         ...buildMobileExtensions(),
         Collaboration.configure({ document: doc, field: 'default' }),
       ],
+      onCreate: onCreate(!readOnly),
     })
-    if (onDebug) instrument(editor, mountedAt.current, initialStateB64 !== '', onDebug)
     if (readOnly) {
       return () => {
         editor.destroy()
@@ -213,11 +252,36 @@ export default function EntryEditorDom({
     doc.on('update', onDocUpdate)
     document.addEventListener('visibilitychange', onHidden)
     window.addEventListener('pagehide', save)
+
+    // Trailing throttle; an unchanged state does not cross the bridge again.
+    let formatTimer: ReturnType<typeof setTimeout> | null = null
+    let lastFormat = ''
+    const sendFormatState = () => {
+      formatTimer = null
+      if (editor.isDestroyed) return
+      const state = formatState(editor)
+      const json = JSON.stringify(state)
+      if (json === lastFormat) return
+      lastFormat = json
+      void onFormatStateRef.current(state)
+    }
+    const onFormatChange = () => {
+      formatTimer ??= setTimeout(sendFormatState, FORMAT_STATE_THROTTLE_MS)
+    }
+    editor.on('transaction', onFormatChange)
+    editor.on('focus', onFormatChange)
+    editor.on('blur', onFormatChange)
+    execRef.current = (cmd, arg) => {
+      if (!editor.isDestroyed) COMMANDS[cmd](editor, arg)
+    }
+
     return () => {
       // Only runs on an in-page unmount, never on native teardown (see flush).
       doc.off('update', onDocUpdate)
       document.removeEventListener('visibilitychange', onHidden)
       window.removeEventListener('pagehide', save)
+      if (formatTimer) clearTimeout(formatTimer)
+      execRef.current = () => {}
       flushRef.current = () => Promise.resolve()
       save()
       editor.destroy()
@@ -238,6 +302,7 @@ export default function EntryEditorDom({
         padding: 12,
       }}
     >
+      <style>{EDITOR_CSS}</style>
       {mode === 'unsafe' ? (
         <p data-testid="editor-read-only-fallback">
           This entry opens read-only on mobile.
@@ -248,54 +313,61 @@ export default function EntryEditorDom({
   )
 }
 
-/**
- * Spike 15.4: reports the first painted frame that shows the document
- * (`performance.now()` since the WebView navigation started and since this
- * component mounted, plus `Date.now()` for the native side's own clock),
- * then focus, blur and every caret move with its on-screen position.
- * TODO(later): see docs/LATER.md (dev instrumentation in a shippable file).
- */
-function instrument(
-  editor: Editor,
-  mountedAt: number,
-  hasContent: boolean,
-  onDebug: (event: string, detail: string) => Promise<void>,
-) {
-  const report = (event: string, detail: object) => void onDebug(event, JSON.stringify(detail))
-  const waitForContent = (frames: number) => {
-    if (editor.isDestroyed) return
-    if (hasContent && editor.view.dom.textContent === '' && frames < 600) {
-      requestAnimationFrame(() => waitForContent(frames + 1))
-      return
-    }
-    // The frame after the content is in the DOM is the first one painted with it.
-    requestAnimationFrame(() => {
-      const now = performance.now()
-      report('firstPaint', {
-        sinceNavigationMs: Math.round(now),
-        sinceMountMs: Math.round(now - mountedAt),
-        wallClock: Date.now(),
-        words: editor.getText().split(/\s+/).filter(Boolean).length,
-      })
-    })
+function formatState(editor: Editor): FormatState {
+  const href: unknown = editor.getAttributes('link').href
+  return {
+    active: {
+      bold: editor.isActive('bold'),
+      italic: editor.isActive('italic'),
+      strike: editor.isActive('strike'),
+      highlight: editor.isActive('highlight'),
+      heading: editor.isActive('heading', { level: 2 }),
+      bulletList: editor.isActive('bulletList'),
+      orderedList: editor.isActive('orderedList'),
+      taskList: editor.isActive('taskList'),
+      blockquote: editor.isActive('blockquote'),
+      link: editor.isActive('link'),
+    },
+    focused: editor.isFocused,
+    linkHref: typeof href === 'string' && href !== '' ? href : null,
   }
-  waitForContent(0)
-  const caret = () => {
-    const { from } = editor.state.selection
-    const viewport = window.visualViewport
-    return {
-      from,
-      caretTop: Math.round(editor.view.coordsAtPos(from).top),
-      viewportHeight: Math.round(viewport?.height ?? window.innerHeight),
-      scrollY: Math.round(window.scrollY),
+}
+
+/** The toolbar's commands, run as the desktop bubble menu runs them. */
+const COMMANDS: Record<EditorCommand, (editor: Editor, arg: string) => void> = {
+  bold: (editor) => editor.chain().focus().toggleBold().run(),
+  italic: (editor) => editor.chain().focus().toggleItalic().run(),
+  strike: (editor) => editor.chain().focus().toggleStrike().run(),
+  highlight: (editor) => editor.chain().focus().toggleHighlight().run(),
+  heading: (editor) => editor.chain().focus().toggleHeading({ level: 2 }).run(),
+  bulletList: (editor) => editor.chain().focus().toggleBulletList().run(),
+  orderedList: (editor) => editor.chain().focus().toggleOrderedList().run(),
+  taskList: (editor) => editor.chain().focus().toggleTaskList().run(),
+  blockquote: (editor) => editor.chain().focus().toggleBlockquote().run(),
+  setLink: (editor, arg) => {
+    const url = arg.trim()
+    const chain = editor.chain().focus().extendMarkRange('link')
+    // `unsetLink`, not desktop's `setLink({ href: '' })`, which keeps an empty link mark.
+    if (url === '') chain.unsetLink().run()
+    // Only a URL a tap can open (desktop's rule without `tel:`); anything else is ignored.
+    else {
+      const href = safeExternalUrl(url)
+      if (href) chain.setLink({ href }).run()
     }
-  }
-  editor.on('focus', () => report('focus', caret()))
-  editor.on('blur', () => report('blur', caret()))
-  editor.on('selectionUpdate', () => report('selection', caret()))
-  window.visualViewport?.addEventListener('resize', () => {
-    if (!editor.isDestroyed) report('viewportResize', caret())
-  })
+  },
+  // Tiptap's `focus` and `blur` finish in a `requestAnimationFrame`, which
+  // WebKit stalls ~10 s in an empty entry: that part runs here, synchronously.
+  focusEnd: (editor) => {
+    editor.commands.focus('end')
+    editor.view.focus()
+  },
+  // Not `commands.blur()`: it also clears the selection, which Done keeps.
+  blur: (editor) => editor.view.dom.blur(),
+}
+
+/** Native may send anything across the bridge; unknown commands do nothing. */
+function isEditorCommand(cmd: unknown): cmd is EditorCommand {
+  return typeof cmd === 'string' && Object.hasOwn(COMMANDS, cmd)
 }
 
 let desktopSnapshotCache: unknown

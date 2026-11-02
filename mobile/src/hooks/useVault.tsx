@@ -6,6 +6,7 @@ import MemloreCore, {
   type BiometricKind,
   type MemloreErrorCode,
 } from '@/modules/memlore-core';
+import { flushAll } from '@/src/lib/flushRegistry';
 import { clearRowCache, enableRowCache } from '@/src/lib/rowCache';
 
 export type VaultStatus =
@@ -52,6 +53,13 @@ const ERROR_CODES: readonly MemloreErrorCode[] = [
  * `lockScreenShown()`.
  */
 const SHIELD_FALLBACK_MS = 2500;
+
+/**
+ * Save before lock: how long a lock waits for the open editor's saves. The
+ * native wait is 2 s, so the ack for `onFlushRequest` leaves before it.
+ */
+const FLUSH_REQUEST_MS = 1800;
+const MANUAL_LOCK_FLUSH_MS = 2000;
 
 /** The module's error code of a rejected call, or null for anything else. */
 export function errorCode(e: unknown): MemloreErrorCode | null {
@@ -143,9 +151,22 @@ function useVaultState() {
       markLocked();
       setShieldHeld(true);
     });
+    // Save before lock: native holds its background lock until this ack (or
+    // ~2 s), so every edit reaches the engine queue before the lock does.
+    const flushRequest = MemloreCore.addListener('onFlushRequest', ({ id }) => {
+      const started = Date.now();
+      void flushAll(FLUSH_REQUEST_MS)
+        .then(() => {
+          if (__DEV__) console.log(`[useVault] flush ${id} acked in ${Date.now() - started} ms`);
+          return MemloreCore.flushDone(id);
+        })
+        // No ack: native locks at its timeout anyway (fail closed).
+        .catch(() => {});
+    });
     return () => {
       appState.remove();
       autoLock.remove();
+      flushRequest.remove();
     };
   }, []);
 
@@ -333,9 +354,13 @@ function useVaultState() {
       enterUnlocked();
     }, setBiometricPrompting);
 
-  /** A manual lock: the lock screen without a prompt (the button prompts). */
+  /**
+   * A manual lock: the open editor's saves first (bounded), then the lock
+   * screen without a prompt (the button prompts).
+   */
   const lock = () =>
     run(async () => {
+      await flushAll(MANUAL_LOCK_FLUSH_MS);
       await MemloreCore.lock();
       showLocked();
       void refreshBiometric();

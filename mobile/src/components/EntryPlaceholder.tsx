@@ -1,4 +1,4 @@
-import { type StyleProp, Text, View, type ViewStyle } from 'react-native';
+import { Pressable, type StyleProp, Text, View, type ViewStyle } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 
 import { t } from '@/src/i18n';
@@ -23,23 +23,33 @@ export function placeholderBody(text: string): string {
  * The native stand-in for an entry: its title and plain text with the editor's
  * metrics (EntryEditorDom: padding 12, 17 px, line height 1.5, system font), so
  * the editor can replace it without a jump. Not scrollable: the text is clipped.
- * `style` lets a screen lay it over the editor (`StyleSheet.absoluteFill`).
+ * `style` lets a screen lay it over the editor (`StyleSheet.absoluteFill`);
+ * `onPress` gets a tap on it (the screen focuses the editor once it is ready).
+ * The title is one line, like the screen's single-line title field.
  */
 export function EntryPlaceholder(props: {
   title: string | null;
   body: string | null;
   style?: StyleProp<ViewStyle>;
+  onPress?: () => void;
 }) {
   const title = props.title?.trim();
   return (
-    <View testID="entry-placeholder" style={[styles.root, props.style]}>
-      <Text style={[styles.title, !title && styles.untitled]} numberOfLines={2}>
+    // Not one accessibility element: its texts stay readable on their own.
+    <Pressable
+      testID="entry-placeholder"
+      accessible={false}
+      disabled={!props.onPress}
+      onPress={props.onPress}
+      style={[styles.root, props.style]}
+    >
+      <Text style={[styles.title, !title && styles.untitled]} numberOfLines={1}>
         {title || t('nav:media_gallery.untitled')}
       </Text>
       <View style={styles.body}>
         {props.body ? <Text style={styles.text}>{props.body}</Text> : null}
       </View>
-    </View>
+    </Pressable>
   );
 }
 

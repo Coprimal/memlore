@@ -40,8 +40,7 @@ function RootStack() {
           undeclared one outside both, where it stays reachable while locked. */}
       <Stack.Protected guard={unlocked} redirectTo="/vault">
         <Stack.Screen name="(app)" options={{ animation: 'none' }} />
-        {/* Dev-only spikes; the editor spike reads entries, so it needs the vault. */}
-        <Stack.Screen name="(dev)/editor-spike" />
+        {/* Dev-only spikes (iCloud, OAuth) stay behind the vault until M2. */}
         <Stack.Screen name="(dev)/spike-icloud" />
         <Stack.Screen name="(dev)/spike-oauth" />
       </Stack.Protected>
