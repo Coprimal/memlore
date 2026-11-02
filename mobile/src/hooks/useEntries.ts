@@ -174,6 +174,8 @@ export function useEntryDetail(id: string) {
           emotion: entry.emotion,
           isFavorite: entry.isFavorite,
           journalId: entry.journalId,
+          isLocked: entry.isLocked,
+          isInvisible: entry.isInvisible,
         });
         setDetail(entry);
         setLoading(false);

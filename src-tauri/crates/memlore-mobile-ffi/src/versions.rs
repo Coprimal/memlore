@@ -1,7 +1,8 @@
-//! Version history calls of [`MemloreEngine`]. Only listed entries have a
-//! history on mobile: every call goes through `require_listed_entry`, so a
-//! locked, invisible or trashed entry is `NotFound` (desktop lists a locked
-//! entry's versions; mobile has no reveal session).
+//! Version history calls of [`MemloreEngine`]. Only entries the list shows
+//! readably have a history on mobile: every call goes through
+//! `require_listed_entry`, so a trashed entry, or an invisible one outside
+//! its open vault, is `NotFound`, and a locked one needs the reveal
+//! (`SecondLockRequired` under Covered, `NotFound` under Hidden).
 
 use memlore_core::outbox::MAX_YJS_DOC_BYTES;
 use memlore_engine::db;
@@ -32,8 +33,8 @@ impl From<db::VersionMeta> for VersionFfi {
 impl MemloreEngine {
     /// The versions of a listed entry, newest first.
     pub fn list_entry_versions(&self, entry_id: String) -> Result<Vec<VersionFfi>, MemloreError> {
-        self.with_unlocked(|conn| {
-            require_listed_entry(conn, &entry_id)?;
+        self.with_scope(|conn, scope| {
+            require_listed_entry(conn, scope, &entry_id)?;
             Ok(db::list_entry_versions(conn, &entry_id)
                 .map_err(|e| io(e.to_string()))?
                 .into_iter()
@@ -49,8 +50,8 @@ impl MemloreEngine {
         entry_id: String,
         version_id: String,
     ) -> Result<Vec<u8>, MemloreError> {
-        self.with_unlocked(|conn| {
-            require_listed_entry(conn, &entry_id)?;
+        self.with_scope(|conn, scope| {
+            require_listed_entry(conn, scope, &entry_id)?;
             db::get_entry_version_blob_for_entry(conn, &version_id, &entry_id).map_err(
                 |e| match e {
                     rusqlite::Error::QueryReturnedNoRows => MemloreError::NotFound,
@@ -65,8 +66,8 @@ impl MemloreEngine {
     /// desktop does. Returns the version id, or `None` when the stored text
     /// is blank (the birth doc is non-empty bytes but has no text).
     pub fn snapshot_entry_version(&self, entry_id: String) -> Result<Option<String>, MemloreError> {
-        self.with_unlocked(|conn| {
-            let entry = require_listed_entry(conn, &entry_id)?;
+        self.with_scope(|conn, scope| {
+            let entry = require_listed_entry(conn, scope, &entry_id)?;
             let preview = entry.preview_text.unwrap_or_default();
             let yjs = db::get_entry_content(conn, &entry_id)
                 .map_err(|e| io(e.to_string()))?

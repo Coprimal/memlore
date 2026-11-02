@@ -2,10 +2,13 @@
 //!
 //! FFI surface rule: every data method of [`MemloreEngine`] runs behind the
 //! lock gate ([`MemloreEngine::with_unlocked`]) and returns
-//! [`MemloreError::Locked`] while the vault is locked; listing uses the same
-//! locked/invisible-aware query as the desktop list command. Raw `ops::*_impl`,
-//! `db::*`, the AI credential readers and the `*_inner` vault helpers are only
-//! called from here, never exported. Error messages carry no key material.
+//! [`MemloreError::Locked`] while the vault is locked; calls that read or
+//! write journal data take the second-lock view and the open invisible vault
+//! from the Rust-held lock session ([`MemloreEngine::with_scope`]), and
+//! listing uses the same locked/invisible-aware query as the desktop list
+//! command. Raw `ops::*_impl`, `db::*`, the AI credential readers and the
+//! `*_inner` vault helpers are only called from here, never exported. Error
+//! messages carry no key material.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -31,6 +34,7 @@ use zeroize::Zeroizing;
 use crate::keystore::OsKeyStore;
 
 pub use entries::{EntryDetailFfi, EntryPageFfi, EntryRowFfi, TrashRowFfi};
+pub use locks::LockStateFfi;
 pub use organize::{JournalFfi, TagFfi};
 pub use search::{SearchFiltersFfi, SearchResultFfi};
 pub use templates::TemplateFfi;
@@ -38,6 +42,7 @@ pub use versions::VersionFfi;
 
 mod entries;
 mod keystore;
+mod locks;
 mod organize;
 mod search;
 mod templates;
@@ -72,6 +77,10 @@ const AUTO_LOCK_CHOICES: [u32; 4] = [0, 60, 300, 900];
 /// The default, and what any missing or unexpected stored value reads as.
 const AUTO_LOCK_DEFAULT: u32 = 60;
 
+/// The synced setting desktop writes as `"true"` when locked items are shown
+/// redacted (`LockedView::Covered`) instead of left out.
+const SHOW_EXISTENCE_SETTING: &str = "second_lock_show_existence";
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MemloreError {
     #[error("the vault is locked")]
@@ -100,6 +109,10 @@ pub enum MemloreError {
     /// The journal is the last one mobile lists; it cannot be deleted.
     #[error("cannot delete the last journal")]
     LastJournal,
+    /// The entry or journal is locked behind the second lock, shown redacted
+    /// (Covered); the user reveals it with the second-lock password.
+    #[error("the second lock is locked")]
+    SecondLockRequired,
 }
 
 fn io(msg: String) -> MemloreError {
@@ -202,6 +215,22 @@ impl VaultPlatformHooks for MobileVaultHooks {
     }
 }
 
+/// The second-lock reveal and the open invisible vault. Memory only: every
+/// vault lock and unlock starts it empty, so nothing survives a restart.
+#[derive(Default)]
+struct LockSession {
+    revealed: bool,
+    vault_id: Option<String>,
+}
+
+/// What one gated call may see, snapshotted by [`MemloreEngine::with_scope`].
+struct Scope {
+    /// A second-lock verifier exists.
+    enabled: bool,
+    view: LockedView,
+    vault: Option<String>,
+}
+
 #[derive(uniffi::Object)]
 pub struct MemloreEngine {
     db_path: PathBuf,
@@ -215,6 +244,7 @@ pub struct MemloreEngine {
     // TODO(later): see docs/LATER.md (nothing drains the embedding-dirty rows
     // this queues once settings sync brings an embed provider).
     indexer: EntryIndexer,
+    lock_session: Mutex<LockSession>,
 }
 
 #[uniffi::export]
@@ -235,6 +265,7 @@ impl MemloreEngine {
     /// 24-word recovery phrase. The vault is unlocked afterwards, and
     /// `startup_mode` reports `PasswordLocked` (what a restart would find).
     pub fn create_vault(&self, password: String) -> Result<String, MemloreError> {
+        self.end_lock_session();
         let password = Zeroizing::new(password);
         vault::validate_password_length(&password).map_err(format_err)?;
         let handle = {
@@ -269,6 +300,7 @@ impl MemloreEngine {
     }
 
     pub fn unlock(&self, password: String) -> Result<(), MemloreError> {
+        self.end_lock_session();
         let password = Zeroizing::new(password);
         vault::unlock::unlock_with_password(
             &self.db_path,
@@ -293,11 +325,16 @@ impl MemloreEngine {
     /// in password mode): before setup the live connection is the one
     /// `create_vault` rekeys, and it holds no user data.
     ///
-    /// Never fails open: the keys go first, and if the placeholder cannot
-    /// replace the connection it stays open behind the lock gate. That is
-    /// logged, but no logger is installed on mobile yet.
+    /// The lock session (reveal, invisible vault) ends first, before the
+    /// keys and the connection swap, so neither a failed key clear nor a
+    /// failed swap can keep it.
+    ///
+    /// Never fails open: the session and the keys go first, and if the
+    /// placeholder cannot replace the connection it stays open behind the
+    /// lock gate. That is logged, but no logger is installed on mobile yet.
     // TODO(later): see docs/LATER.md ("Mobile M1 notes", Phase 2 review suggestions).
     pub fn lock(&self) -> Result<(), MemloreError> {
+        self.end_lock_session();
         self.key_state.clear_key().map_err(io)?;
         let closed = boot_file::load(&boot_file::boot_path(&self.db_path)).and_then(|boot| {
             if boot.mode != db::EncryptionMode::Password {
@@ -356,6 +393,7 @@ impl MemloreEngine {
         if self.key_state.is_initialized().map_err(io)? {
             return Err(io("The vault is already unlocked".to_string()));
         }
+        self.end_lock_session();
         vault::biometric::unlock_with_os_kek(
             &self.db_path,
             &self.state,
@@ -395,15 +433,16 @@ impl MemloreEngine {
     /// Entries the list shows (same filters as [`Self::list_entries`]
     /// without a journal).
     pub fn entry_count(&self) -> Result<u64, MemloreError> {
-        self.with_unlocked(|conn| Ok(u64::from(list_page(conn, 1)?.total)))
+        self.with_scope(|conn, scope| Ok(u64::from(list_page(conn, scope, 1)?.total)))
     }
 
     /// The entry's Yjs document (full state), empty when it has no body yet.
-    /// Only entries the list shows open: a locked or invisible entry is
-    /// "not found" (mobile has no reveal session and no invisible vault).
+    /// Only entries the list shows readably open (see
+    /// [`require_listed_entry`]): a locked entry needs the reveal, an
+    /// invisible one its open vault.
     pub fn load_entry_yjs(&self, id: String) -> Result<Vec<u8>, MemloreError> {
-        self.with_unlocked(|conn| {
-            require_listed_entry(conn, &id)?;
+        self.with_scope(|conn, scope| {
+            require_listed_entry(conn, scope, &id)?;
             Ok(db::get_entry_content(conn, &id)
                 .map_err(|e| io(e.to_string()))?
                 .unwrap_or_default())
@@ -428,8 +467,8 @@ impl MemloreEngine {
                 "Yjs document exceeds maximum allowed size (10 MiB)",
             ));
         }
-        self.with_unlocked(|conn| {
-            require_listed_entry(conn, &id)?;
+        self.with_scope(|conn, scope| {
+            require_listed_entry(conn, scope, &id)?;
             save_entry_content_merged_impl(conn, &id, &full_state, &content_text, &preview_text)
                 .map_err(io)
         })?;
@@ -474,6 +513,7 @@ impl MemloreEngine {
             startup_mode: Mutex::new(mode),
             hooks,
             indexer: EntryIndexer::with_stub(),
+            lock_session: Mutex::new(LockSession::default()),
         }))
     }
 
@@ -487,6 +527,62 @@ impl MemloreEngine {
         self.key_state
             .with_key(|_key| Ok(self.state.lock().map_err(io).and_then(|conn| f(&conn))))
             .map_err(|_| MemloreError::Locked)?
+    }
+
+    /// [`Self::with_unlocked`] plus the [`Scope`] of the call: `Revealed`
+    /// only while the session is revealed AND the second lock is enabled (a
+    /// verifier exists; disabled with locked rows left fails closed), else
+    /// `Covered` when show-existence is on (read per call), else `Hidden`.
+    /// A disabled second lock also ends the session's reveal, so a verifier
+    /// restored later (sync, or a new desktop password) finds it closed.
+    fn with_scope<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection, &Scope) -> Result<T, MemloreError>,
+    ) -> Result<T, MemloreError> {
+        self.with_unlocked(|conn| {
+            let enabled = db::get_second_lock_verifier(conn)
+                .map_err(|e| io(e.to_string()))?
+                .is_some();
+            let show_existence = db::get_setting(conn, SHOW_EXISTENCE_SETTING)
+                .map_err(|e| io(e.to_string()))?
+                .is_some_and(|v| v == "true");
+            // Taken last and released at once; a poisoned session reads as
+            // empty (fail closed).
+            let (revealed, vault) = match self.lock_session.lock() {
+                Ok(mut s) => {
+                    if !enabled {
+                        s.revealed = false;
+                    }
+                    (s.revealed, s.vault_id.clone())
+                }
+                Err(_) => (false, None),
+            };
+            let view = if revealed && enabled {
+                LockedView::Revealed
+            } else if show_existence {
+                LockedView::Covered
+            } else {
+                LockedView::Hidden
+            };
+            f(
+                conn,
+                &Scope {
+                    enabled,
+                    view,
+                    vault,
+                },
+            )
+        })
+    }
+
+    /// Forget the reveal and the open invisible vault.
+    fn end_lock_session(&self) {
+        *self.lock_session.lock().unwrap_or_else(|p| p.into_inner()) = LockSession::default();
+    }
+
+    /// Run `f` on the lock session. Take no other lock inside `f`.
+    fn update_lock_session(&self, f: impl FnOnce(&mut LockSession)) {
+        f(&mut self.lock_session.lock().unwrap_or_else(|p| p.into_inner()));
     }
 
     /// The desktop post-save hooks (language, embedding), minus its
@@ -503,40 +599,74 @@ impl MemloreEngine {
     }
 }
 
-/// The per-entry gate of every entry call: the same entries [`list_page`]
-/// shows (live, not effectively locked, not invisible), anything else is
-/// [`MemloreError::NotFound`].
-fn require_listed_entry(conn: &rusqlite::Connection, id: &str) -> Result<db::Entry, MemloreError> {
+/// The per-entry gate of every entry call: a live entry visible for
+/// `scope.vault`, else [`MemloreError::NotFound`] in every view. An
+/// effectively locked one (its own flag or its journal's) passes only when
+/// revealed; Covered gives [`MemloreError::SecondLockRequired`], Hidden
+/// `NotFound`.
+fn require_listed_entry(
+    conn: &rusqlite::Connection,
+    scope: &Scope,
+    id: &str,
+) -> Result<db::Entry, MemloreError> {
     let entry = db::get_entry(conn, id).map_err(|e| io(e.to_string()))?;
-    let visible =
-        db::is_entry_visible_for_active_vault(conn, id, None).map_err(|e| io(e.to_string()))?;
+    let visible = db::is_entry_visible_for_active_vault(conn, id, scope.vault.as_deref())
+        .map_err(|e| io(e.to_string()))?;
     match entry {
-        Some(e) if visible && !e.is_deleted && !e.is_locked => Ok(e),
+        Some(e) if visible && !e.is_deleted => require_unlocked(scope, e.is_locked).map(|()| e),
+        _ => Err(MemloreError::NotFound),
+    }
+}
+
+/// [`require_listed_entry`] that lets a trashed entry through, for the lock
+/// and invisible flag setters: the engine then refuses it with its own text
+/// ("entry is in Trash; restore it to edit", desktop parity).
+fn require_visible_entry(
+    conn: &rusqlite::Connection,
+    scope: &Scope,
+    id: &str,
+) -> Result<(), MemloreError> {
+    let entry = db::get_entry(conn, id).map_err(|e| io(e.to_string()))?;
+    let visible = db::is_entry_visible_for_active_vault(conn, id, scope.vault.as_deref())
+        .map_err(|e| io(e.to_string()))?;
+    match entry {
+        Some(e) if visible => require_unlocked(scope, e.is_locked),
         _ => Err(MemloreError::NotFound),
     }
 }
 
 /// The per-journal gate of every call that reads a journal or writes into
-/// it: live, visible without an invisible vault, and not locked. Anything
-/// else is [`MemloreError::NotFound`]: moving an entry into a hidden journal
-/// would hide the entry.
+/// it, with the rules of [`require_listed_entry`]: moving an entry into a
+/// hidden journal would hide the entry.
 fn require_listed_journal(
     conn: &rusqlite::Connection,
+    scope: &Scope,
     id: &str,
 ) -> Result<db::Journal, MemloreError> {
     let journal = db::get_journal(conn, id).map_err(|e| io(e.to_string()))?;
-    let visible =
-        db::is_journal_visible_for_active_vault(conn, id, None).map_err(|e| io(e.to_string()))?;
+    let visible = db::is_journal_visible_for_active_vault(conn, id, scope.vault.as_deref())
+        .map_err(|e| io(e.to_string()))?;
     match journal {
-        Some(j) if visible && !j.is_deleted && !j.is_locked => Ok(j),
+        Some(j) if visible && !j.is_deleted => require_unlocked(scope, j.is_locked).map(|()| j),
         _ => Err(MemloreError::NotFound),
     }
 }
 
-/// One page of the desktop "all entries" list query, with the filters a
-/// session without a revealed lock or an open invisible vault gets.
+/// The second-lock half of the gates, for a target that exists and is
+/// visible.
+fn require_unlocked(scope: &Scope, is_locked: bool) -> Result<(), MemloreError> {
+    match (is_locked, scope.view) {
+        (false, _) | (true, LockedView::Revealed) => Ok(()),
+        (true, LockedView::Covered) => Err(MemloreError::SecondLockRequired),
+        (true, LockedView::Hidden) => Err(MemloreError::NotFound),
+    }
+}
+
+/// One page of the desktop "all entries" list query, for the view and the
+/// open vault of `scope` (Covered rows come back redacted by the engine).
 fn list_page(
     conn: &rusqlite::Connection,
+    scope: &Scope,
     page: u32,
 ) -> Result<db::PagedResult<db::Entry>, MemloreError> {
     db::list_all_entries_paged_with_locked_view(
@@ -546,8 +676,8 @@ fn list_page(
         None,
         1,
         page,
-        LockedView::Hidden,
-        None,
+        scope.view,
+        scope.vault.as_deref(),
         LockFilter::All,
     )
     .map_err(|e| io(e.to_string()))
@@ -1119,6 +1249,665 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, ["blank", "daily-reflection", "morning-pages"]);
+    }
+
+    /// The vault password of [`unlocked_engine`].
+    const VAULT_PASSWORD: &str = "password12";
+    const SECOND_LOCK_PASSWORD: &str = "second-lock-pw";
+    const WRONG_SECOND_LOCK_PASSWORD: &str = "wrong-lock-pw";
+    const VAULT_A_PASSWORD: &str = "vault-a-pw";
+    const VAULT_B_PASSWORD: &str = "vault-b-pw";
+
+    /// Ids of every row `list_entries` shows (first page, all journals).
+    fn listed_ids(engine: &MemloreEngine) -> Vec<String> {
+        engine
+            .list_entries(None, 0)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// Ids of the search hits for `query`, without filters.
+    fn search_ids(engine: &MemloreEngine, query: &str) -> Vec<String> {
+        engine
+            .search_entries(query.to_string(), SearchFiltersFfi::default())
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect()
+    }
+
+    /// A gated call refused for a locked target: `NotFound` under Hidden
+    /// (its existence is not shown), `SecondLockRequired` under Covered.
+    fn expect_refused<T>(result: Result<T, MemloreError>, view: db::LockedView, what: &str) {
+        match (view, result) {
+            (db::LockedView::Hidden, Err(MemloreError::NotFound))
+            | (db::LockedView::Covered, Err(MemloreError::SecondLockRequired)) => {}
+            (_, Err(e)) => panic!("{what} ({view:?}): refused with {e:?}"),
+            (_, Ok(_)) => panic!("{what} ({view:?}): not refused"),
+        }
+    }
+
+    /// What `second_lock_gate_fails_closed` reads: an ordinary entry, journal
+    /// and tag, a locked entry with text, a version and a tag only it
+    /// carries, a locked journal holding an entry, and a locked entry in
+    /// Trash. The second lock is enabled and the session is not revealed.
+    struct LockedFixture {
+        home: String,
+        ordinary: String,
+        on_ordinary: String,
+        locked: String,
+        version: String,
+        locked_only: String,
+        locked_journal: String,
+        in_locked_journal: String,
+        trashed_locked: String,
+    }
+
+    fn locked_fixture(engine: &MemloreEngine) -> LockedFixture {
+        // Written through the gate while every row is still listed.
+        let ordinary = engine.create_entry("Ordinary".to_string(), None).unwrap();
+        write_text(engine, &ordinary, "ordinary walk");
+        let locked = engine.create_entry("Locked".to_string(), None).unwrap();
+        write_text(engine, &locked, "secret thicket");
+        let version = engine
+            .snapshot_entry_version(locked.clone())
+            .unwrap()
+            .unwrap();
+        let locked_journal = engine
+            .create_journal("Locked journal".to_string())
+            .unwrap()
+            .id;
+        let in_locked_journal = engine
+            .create_entry(
+                "In locked journal".to_string(),
+                Some(locked_journal.clone()),
+            )
+            .unwrap();
+        write_text(engine, &in_locked_journal, "secret meadow");
+        let trashed_locked = engine
+            .create_entry("Trashed secret".to_string(), None)
+            .unwrap();
+
+        // The verifier is written directly: the FFI setter would reveal.
+        let conn = engine.state.lock().unwrap();
+        memlore_engine::ops::second_lock::set_second_lock_password_impl(
+            &conn,
+            SECOND_LOCK_PASSWORD,
+        )
+        .unwrap();
+        let home = db::get_entry(&conn, &ordinary).unwrap().unwrap().journal_id;
+        let on_ordinary = db::create_tag(&conn, "on-ordinary", None).unwrap().id;
+        let locked_only = db::create_tag(&conn, "locked-only", None).unwrap().id;
+        db::add_tag_to_entry(&conn, &ordinary, &on_ordinary).unwrap();
+        db::add_tag_to_entry(&conn, &locked, &locked_only).unwrap();
+        db::set_entry_locked(&conn, &locked, true).unwrap();
+        db::set_journal_locked(&conn, &locked_journal, true).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        db::trash_entry(&conn, &trashed_locked, now).unwrap();
+        db::set_entry_locked(&conn, &trashed_locked, true).unwrap();
+        LockedFixture {
+            home,
+            ordinary,
+            on_ordinary,
+            locked,
+            version,
+            locked_only,
+            locked_journal,
+            in_locked_journal,
+            trashed_locked,
+        }
+    }
+
+    /// The second-lock gate across the three views. Hidden (default): a
+    /// locked entry, a locked journal and a locked-only tag are not listed,
+    /// counted or searchable, and every entry call is `NotFound`. Covered
+    /// (`second_lock_show_existence` = "true", as desktop writes it): locked
+    /// rows are listed redacted with `is_locked` and counted, entry calls are
+    /// `SecondLockRequired`, search and the locked-only tag still leave them
+    /// out, the locked journal is listed by name, Trash redacts. Revealed:
+    /// content, versions, search and the tag, and the entry can be unlocked.
+    /// Hidden and Covered, with an invisible vault open, refuse unlocking a
+    /// locked entry or journal and moving it into the vault (which would
+    /// clear its lock flag). In every view the last unlocked journal cannot
+    /// be deleted, and no refused call changes the entry. Show-existence can
+    /// only be turned on revealed (off always), and the re-lock minutes only
+    /// shortened unless revealed.
+    /// Then: a wrong password reveals nothing, and a second lock disabled
+    /// while locked rows remain fails closed and ends the reveal, so a
+    /// verifier restored later does not reopen locked content.
+    #[test]
+    fn second_lock_gate_fails_closed() {
+        use memlore_engine::db::LockedView::{Covered, Hidden, Revealed};
+        for view in [Hidden, Covered, Revealed] {
+            let (_dir, engine) = unlocked_engine();
+            let f = locked_fixture(&engine);
+            match view {
+                Hidden => {}
+                Covered => db::set_setting(
+                    &engine.state.lock().unwrap(),
+                    "second_lock_show_existence",
+                    "true",
+                )
+                .unwrap(),
+                Revealed => assert!(
+                    engine
+                        .unlock_second_lock(SECOND_LOCK_PASSWORD.to_string())
+                        .unwrap(),
+                    "the right password did not reveal"
+                ),
+            }
+
+            let listed = engine.list_entries(None, 0).unwrap();
+            let row = |id: &str| listed.items.iter().find(|r| r.id == id).cloned();
+            let total = engine.entry_count().unwrap();
+            let ordinary = row(&f.ordinary).expect("the ordinary entry is not listed");
+            assert!(
+                !ordinary.is_locked && !ordinary.is_invisible,
+                "{view:?}: the ordinary row is flagged"
+            );
+            let journals = engine.list_journals().unwrap();
+            let journal = |id: &str| journals.iter().find(|j| j.id == id).cloned();
+            assert!(
+                journal(&f.home).is_some_and(|j| !j.is_locked && !j.is_invisible),
+                "{view:?}: the home journal"
+            );
+            let tags: Vec<String> = engine
+                .list_tags()
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            assert!(tags.contains(&f.on_ordinary), "{view:?}: ordinary tag");
+            let trash = engine.list_trash().unwrap();
+            let trashed = trash.iter().find(|r| r.id == f.trashed_locked).cloned();
+            assert_eq!(
+                search_ids(&engine, "ordinary"),
+                vec![f.ordinary.clone()],
+                "{view:?}: search missed the ordinary entry"
+            );
+            let hits = search_ids(&engine, "thicket");
+            // The guard counts unlocked journals in every view: a user is
+            // never left with only journals that need a reveal.
+            assert!(
+                matches!(
+                    engine.delete_journal(f.home.clone()),
+                    Err(MemloreError::LastJournal)
+                ),
+                "{view:?}: the last unlocked journal was not refused"
+            );
+
+            match view {
+                Hidden => {
+                    assert_eq!(total, 1, "Hidden: the total counts locked entries");
+                    assert_eq!(listed.total, 1, "Hidden: the list total");
+                    assert!(row(&f.locked).is_none(), "Hidden: locked entry listed");
+                    assert!(
+                        row(&f.in_locked_journal).is_none(),
+                        "Hidden: entry of a locked journal listed"
+                    );
+                    assert!(
+                        journal(&f.locked_journal).is_none(),
+                        "Hidden: locked journal listed"
+                    );
+                    assert!(trashed.is_none(), "Hidden: locked Trash row listed");
+                    assert!(
+                        matches!(
+                            engine.set_second_lock_show_existence(true),
+                            Err(MemloreError::SecondLockRequired)
+                        ),
+                        "Hidden: show-existence turned on without the reveal"
+                    );
+                    assert!(
+                        !engine.lock_state().unwrap().show_existence,
+                        "Hidden: a refused show-existence changed the setting"
+                    );
+                }
+                Covered => {
+                    assert_eq!(total, 3, "Covered: the total skips locked entries");
+                    assert_eq!(listed.total, 3, "Covered: the list total");
+                    for id in [&f.locked, &f.in_locked_journal] {
+                        let r = row(id).expect("Covered: a locked entry is not listed");
+                        assert!(r.is_locked, "Covered: row without is_locked");
+                        assert_eq!(
+                            (r.title, r.preview_text),
+                            (None, None),
+                            "Covered: a locked row is not redacted"
+                        );
+                    }
+                    let j = journal(&f.locked_journal).expect("Covered: locked journal missing");
+                    assert_eq!(j.name, "Locked journal");
+                    assert!(j.is_locked, "Covered: journal without is_locked");
+                    let t = trashed.expect("Covered: locked Trash row missing");
+                    assert!(t.is_locked, "Covered: Trash row without is_locked");
+                    assert_eq!(
+                        (t.title, t.preview_text),
+                        (None, None),
+                        "Covered: the Trash row is not redacted"
+                    );
+                }
+                Revealed => {
+                    assert_eq!(total, 3, "Revealed: the total");
+                    let r = row(&f.locked).expect("Revealed: locked entry missing");
+                    assert!(r.is_locked, "Revealed: row without is_locked");
+                    assert_eq!(r.title.as_deref(), Some("Locked"));
+                    assert!(
+                        row(&f.in_locked_journal).is_some(),
+                        "Revealed: entry of a locked journal missing"
+                    );
+                    assert!(
+                        journal(&f.locked_journal).is_some_and(|j| j.is_locked),
+                        "Revealed: locked journal"
+                    );
+                    assert_eq!(
+                        trashed.and_then(|t| t.title).as_deref(),
+                        Some("Trashed secret"),
+                        "Revealed: Trash row"
+                    );
+                }
+            }
+
+            if view == Revealed {
+                let detail = engine.get_entry(f.locked.clone()).unwrap();
+                assert!(
+                    detail
+                        .content_text
+                        .as_deref()
+                        .is_some_and(|t| t.contains("thicket")),
+                    "Revealed: get_entry without content"
+                );
+                let loaded = engine.load_entry_yjs(f.locked.clone()).unwrap();
+                let stored = db::get_entry_content(&engine.state.lock().unwrap(), &f.locked)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(loaded, stored, "Revealed: load_entry_yjs");
+                let versions: Vec<String> = engine
+                    .list_entry_versions(f.locked.clone())
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.id)
+                    .collect();
+                assert_eq!(versions, vec![f.version.clone()], "Revealed: versions");
+                engine
+                    .get_entry_version_content(f.locked.clone(), f.version.clone())
+                    .unwrap();
+                assert_eq!(hits, vec![f.locked.clone()], "Revealed: search");
+                assert!(tags.contains(&f.locked_only), "Revealed: tag missing");
+                engine.set_entry_locked(f.locked.clone(), false).unwrap();
+                assert!(
+                    !db::get_entry_raw(&engine.state.lock().unwrap(), &f.locked)
+                        .unwrap()
+                        .unwrap()
+                        .is_locked,
+                    "Revealed: set_entry_locked(false) kept the flag"
+                );
+                engine.set_second_lock_show_existence(true).unwrap();
+                assert!(engine.lock_state().unwrap().show_existence);
+                engine.set_second_lock_auto_lock_minutes(0).unwrap();
+                assert_eq!(engine.lock_state().unwrap().auto_lock_minutes, 0);
+                // Unrevealed, any interval is shorter than never.
+                engine.lock_second_lock();
+                engine.set_second_lock_auto_lock_minutes(30).unwrap();
+                assert_eq!(engine.lock_state().unwrap().auto_lock_minutes, 30);
+            } else {
+                let base = db::get_entry_content(&engine.state.lock().unwrap(), &f.locked)
+                    .unwrap()
+                    .unwrap();
+                let before = stored_entry(&engine, &f.locked);
+                // With a vault open, making a locked entry or journal
+                // invisible would clear its lock flag (engine semantics):
+                // only the gate stops an unrevealed caller.
+                engine
+                    .open_invisible_vault(VAULT_A_PASSWORD.to_string())
+                    .unwrap();
+                expect_refused(
+                    engine.set_entry_locked(f.locked.clone(), false),
+                    view,
+                    "set_entry_locked(false)",
+                );
+                expect_refused(
+                    engine.set_entry_invisible(f.locked.clone(), true),
+                    view,
+                    "set_entry_invisible(true)",
+                );
+                expect_refused(
+                    engine.set_journal_locked(f.locked_journal.clone(), false),
+                    view,
+                    "set_journal_locked(false)",
+                );
+                expect_refused(
+                    engine.set_journal_invisible(f.locked_journal.clone(), true),
+                    view,
+                    "set_journal_invisible(true)",
+                );
+                {
+                    let conn = engine.state.lock().unwrap();
+                    let e = db::get_entry_raw(&conn, &f.locked).unwrap().unwrap();
+                    assert!(
+                        e.is_locked && !e.is_invisible,
+                        "{view:?}: a refused setter changed the entry's flags"
+                    );
+                    let j = db::get_journal(&conn, &f.locked_journal).unwrap().unwrap();
+                    assert!(
+                        j.is_locked && !j.is_invisible,
+                        "{view:?}: a refused setter changed the journal's flags"
+                    );
+                }
+                expect_refused(engine.get_entry(f.locked.clone()), view, "get_entry");
+                expect_refused(
+                    engine.get_entry(f.in_locked_journal.clone()),
+                    view,
+                    "get_entry of a locked journal's entry",
+                );
+                expect_refused(
+                    engine.load_entry_yjs(f.locked.clone()),
+                    view,
+                    "load_entry_yjs",
+                );
+                expect_refused(
+                    engine.save_entry_yjs(f.locked.clone(), edited(&base), "x".into(), "x".into()),
+                    view,
+                    "save_entry_yjs",
+                );
+                expect_refused(
+                    engine.list_entry_versions(f.locked.clone()),
+                    view,
+                    "list_entry_versions",
+                );
+                expect_refused(
+                    engine.get_entry_version_content(f.locked.clone(), f.version.clone()),
+                    view,
+                    "get_entry_version_content",
+                );
+                expect_refused(
+                    engine.snapshot_entry_version(f.locked.clone()),
+                    view,
+                    "snapshot_entry_version",
+                );
+                assert_eq!(
+                    stored_entry(&engine, &f.locked),
+                    before,
+                    "{view:?}: a refused call changed the entry"
+                );
+                assert!(hits.is_empty(), "{view:?}: search found a locked entry");
+                assert!(
+                    !tags.contains(&f.locked_only),
+                    "{view:?}: locked-only tag listed"
+                );
+                // Unrevealed, the re-lock may only get shorter (from 5).
+                for longer in [0, 15] {
+                    assert!(
+                        matches!(
+                            engine.set_second_lock_auto_lock_minutes(longer),
+                            Err(MemloreError::SecondLockRequired)
+                        ),
+                        "{view:?}: re-lock lengthened to {longer}"
+                    );
+                }
+                assert_eq!(engine.lock_state().unwrap().auto_lock_minutes, 5);
+                engine.set_second_lock_auto_lock_minutes(1).unwrap();
+                assert_eq!(engine.lock_state().unwrap().auto_lock_minutes, 1);
+                // Turning show-existence off only hides: always allowed.
+                engine.set_second_lock_show_existence(false).unwrap();
+                assert!(!engine.lock_state().unwrap().show_existence);
+            }
+        }
+
+        // A wrong password returns false and reveals nothing.
+        let (_dir, engine) = unlocked_engine();
+        let f = locked_fixture(&engine);
+        let before = stored_entry(&engine, &f.locked);
+        assert!(
+            !engine
+                .unlock_second_lock(WRONG_SECOND_LOCK_PASSWORD.to_string())
+                .unwrap(),
+            "a wrong password revealed"
+        );
+        assert!(!engine.lock_state().unwrap().revealed);
+        expect_not_found(
+            engine.get_entry(f.locked.clone()),
+            "get_entry after a wrong password",
+        );
+        assert!(!listed_ids(&engine).contains(&f.locked));
+        assert_eq!(stored_entry(&engine, &f.locked), before);
+
+        // The second lock disabled while locked rows exist (a verifier gone,
+        // the lock flags left; reachable after sync): fail closed, even for
+        // a session revealed before, and the reveal ends, so a verifier
+        // restored later (a new desktop password) finds the session closed.
+        // Once through a scoped call, once through `lock_state`.
+        let restore_verifier = |password: &str| {
+            let conn = engine.state.lock().unwrap();
+            memlore_engine::ops::second_lock::set_second_lock_password_impl(&conn, password)
+                .unwrap();
+            db::set_entry_locked(&conn, &f.locked, true).unwrap();
+        };
+        assert!(engine
+            .unlock_second_lock(SECOND_LOCK_PASSWORD.to_string())
+            .unwrap());
+        db::clear_second_lock_verifier(&engine.state.lock().unwrap()).unwrap();
+        expect_not_found(
+            engine.get_entry(f.locked.clone()),
+            "get_entry with the second lock disabled",
+        );
+        assert!(!listed_ids(&engine).contains(&f.locked));
+        restore_verifier("new-second-lock-pw");
+        assert!(
+            !engine.lock_state().unwrap().revealed,
+            "a scoped call kept the reveal"
+        );
+        expect_not_found(
+            engine.get_entry(f.locked.clone()),
+            "get_entry after the verifier came back",
+        );
+
+        assert!(engine
+            .unlock_second_lock("new-second-lock-pw".to_string())
+            .unwrap());
+        db::clear_second_lock_verifier(&engine.state.lock().unwrap()).unwrap();
+        let state = engine.lock_state().unwrap();
+        // `revealed` is the effective view (session AND enabled), not the
+        // raw session flag.
+        assert!(!state.enabled, "disabled second lock reported enabled");
+        assert!(!state.revealed, "disabled second lock reported revealed");
+        restore_verifier(SECOND_LOCK_PASSWORD);
+        assert!(
+            !engine.lock_state().unwrap().revealed,
+            "lock_state kept the reveal"
+        );
+        expect_not_found(
+            engine.get_entry(f.locked.clone()),
+            "get_entry after the verifier came back",
+        );
+    }
+
+    /// The reveal session ends on a vault lock (the unlock starts Hidden),
+    /// on a second-lock re-lock, and on disable, which also clears every lock
+    /// flag; a verifier that comes back later finds the session closed. The
+    /// auto re-lock minutes fail closed: missing or garbage reads as 5.
+    #[test]
+    fn lock_session_ends_on_vault_lock_relock_and_disable() {
+        let (_dir, engine) = unlocked_engine();
+        let entry = engine.create_entry("Private".to_string(), None).unwrap();
+        let journal = engine
+            .create_journal("Private journal".to_string())
+            .unwrap()
+            .id;
+        engine
+            .set_second_lock_password(SECOND_LOCK_PASSWORD.to_string())
+            .unwrap();
+        engine.set_entry_locked(entry.clone(), true).unwrap();
+        engine.set_journal_locked(journal.clone(), true).unwrap();
+        let revealed = || engine.lock_state().unwrap().revealed;
+        let reveal = || {
+            assert!(engine
+                .unlock_second_lock(SECOND_LOCK_PASSWORD.to_string())
+                .unwrap());
+            engine.get_entry(entry.clone()).unwrap();
+        };
+
+        reveal();
+        engine.lock().unwrap();
+        engine.unlock(VAULT_PASSWORD.to_string()).unwrap();
+        assert!(!revealed(), "the vault lock kept the reveal");
+        expect_not_found(engine.get_entry(entry.clone()), "after a vault lock");
+
+        reveal();
+        engine.lock_second_lock();
+        assert!(!revealed(), "the re-lock kept the reveal");
+        expect_not_found(engine.get_entry(entry.clone()), "after a re-lock");
+
+        reveal();
+        engine
+            .disable_second_lock(SECOND_LOCK_PASSWORD.to_string())
+            .unwrap();
+        let state = engine.lock_state().unwrap();
+        assert!(
+            !state.enabled && !state.revealed,
+            "disable left the lock on"
+        );
+        {
+            let conn = engine.state.lock().unwrap();
+            assert!(!db::get_entry_raw(&conn, &entry).unwrap().unwrap().is_locked);
+            assert!(!db::get_journal(&conn, &journal).unwrap().unwrap().is_locked);
+            // A verifier and a lock that come back (sync) find no session.
+            memlore_engine::ops::second_lock::set_second_lock_password_impl(
+                &conn,
+                SECOND_LOCK_PASSWORD,
+            )
+            .unwrap();
+            db::set_entry_locked(&conn, &entry, true).unwrap();
+        }
+        assert!(!revealed(), "disable kept the session");
+        expect_not_found(engine.get_entry(entry.clone()), "after disable");
+
+        assert_eq!(engine.lock_state().unwrap().auto_lock_minutes, 5, "missing");
+        engine.set_second_lock_auto_lock_minutes(1).unwrap();
+        assert_eq!(engine.lock_state().unwrap().auto_lock_minutes, 1);
+        for raw in ["garbage", "7", "-1", ""] {
+            {
+                let conn = engine.state.lock().unwrap();
+                db::set_setting(&conn, "second_lock_auto_lock_minutes", raw).unwrap();
+                db::set_setting(&conn, "invisible_lock_auto_lock_minutes", raw).unwrap();
+            }
+            let state = engine.lock_state().unwrap();
+            assert_eq!(state.auto_lock_minutes, 5, "stored {raw:?}");
+            assert_eq!(state.invisible_auto_lock_minutes, 5, "stored {raw:?}");
+        }
+    }
+
+    /// The invisible vault lives in the session: nothing can be made
+    /// invisible without an open vault (the generic error, nothing changed),
+    /// an unknown password silently opens an empty vault with the same shape
+    /// as the right one, the right one lists its entries, closing or a vault
+    /// lock hides them, a password change that merges into another vault
+    /// keeps them listed, and removing the empty active vault closes it.
+    #[test]
+    fn invisible_vault_session_scopes_lists_and_is_cleared_on_lock() {
+        use memlore_engine::ops::invisible_lock::UNABLE_TO_UPDATE;
+        let (_dir, engine) = unlocked_engine();
+        let plain = engine.create_entry("Plain".to_string(), None).unwrap();
+        let secret = engine.create_entry("Secret".to_string(), None).unwrap();
+        let vault_open = || engine.lock_state().unwrap().vault_open;
+        let lists_secret = || listed_ids(&engine).contains(&secret);
+
+        let before = stored_entry(&engine, &plain);
+        let refused = engine.set_entry_invisible(plain.clone(), true);
+        assert!(
+            matches!(&refused, Err(MemloreError::Io { msg }) if msg == UNABLE_TO_UPDATE),
+            "no vault open: {refused:?}"
+        );
+        assert!(
+            !db::get_entry_raw(&engine.state.lock().unwrap(), &plain)
+                .unwrap()
+                .unwrap()
+                .is_invisible,
+            "no vault open: the entry was made invisible"
+        );
+        assert_eq!(stored_entry(&engine, &plain), before);
+        // With no vault open the re-lock may only get shorter (from 5).
+        for longer in [0, 15] {
+            let refused = engine.set_invisible_auto_lock_minutes(longer);
+            assert!(
+                matches!(&refused, Err(MemloreError::Io { msg }) if msg == UNABLE_TO_UPDATE),
+                "no vault open, {longer}: {refused:?}"
+            );
+        }
+        engine.set_invisible_auto_lock_minutes(1).unwrap();
+        assert_eq!(engine.lock_state().unwrap().invisible_auto_lock_minutes, 1);
+
+        let _: () = engine
+            .open_invisible_vault(VAULT_A_PASSWORD.to_string())
+            .unwrap();
+        assert!(vault_open());
+        engine.set_invisible_auto_lock_minutes(0).unwrap();
+        assert_eq!(engine.lock_state().unwrap().invisible_auto_lock_minutes, 0);
+        engine.set_entry_invisible(secret.clone(), true).unwrap();
+        let row = engine
+            .list_entries(None, 0)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|r| r.id == secret)
+            .expect("the open vault does not list its entry");
+        assert!(row.is_invisible && !row.is_locked, "vault row flags");
+        engine.close_invisible_vault();
+        assert!(!vault_open());
+        assert!(!lists_secret(), "a closed vault lists its entry");
+
+        // Deniability: an unknown password opens a new empty vault, with the
+        // same return shape as an existing one.
+        let _: () = engine
+            .open_invisible_vault(VAULT_B_PASSWORD.to_string())
+            .unwrap();
+        assert!(vault_open());
+        assert_eq!(listed_ids(&engine), vec![plain.clone()]);
+
+        engine
+            .open_invisible_vault(VAULT_A_PASSWORD.to_string())
+            .unwrap();
+        assert!(lists_secret(), "the right password lists nothing");
+
+        engine.lock().unwrap();
+        engine.unlock(VAULT_PASSWORD.to_string()).unwrap();
+        assert!(!vault_open(), "the vault lock kept the vault open");
+        assert!(!lists_secret(), "the vault lock kept the vault open");
+
+        // Changing A's password to B's merges A into B; the session follows.
+        engine
+            .open_invisible_vault(VAULT_A_PASSWORD.to_string())
+            .unwrap();
+        engine
+            .change_invisible_vault_password(
+                VAULT_A_PASSWORD.to_string(),
+                VAULT_B_PASSWORD.to_string(),
+            )
+            .unwrap();
+        assert!(vault_open(), "the merge closed the vault");
+        assert!(lists_secret(), "the merge lost the active vault");
+        engine.close_invisible_vault();
+        engine
+            .open_invisible_vault(VAULT_B_PASSWORD.to_string())
+            .unwrap();
+        assert!(lists_secret(), "the merged vault lost the entry");
+
+        // A's old password now opens a new empty vault; removing empty
+        // vaults removes it, closes it, and keeps B.
+        engine
+            .open_invisible_vault(VAULT_A_PASSWORD.to_string())
+            .unwrap();
+        assert!(!lists_secret());
+        engine.remove_empty_invisible_vaults().unwrap();
+        assert!(!vault_open(), "the removed vault stayed open");
+        engine
+            .open_invisible_vault(VAULT_B_PASSWORD.to_string())
+            .unwrap();
+        assert!(lists_secret(), "removing empty vaults removed a full one");
     }
 
     /// A version is only taken of a doc with text (the birth doc is blank),

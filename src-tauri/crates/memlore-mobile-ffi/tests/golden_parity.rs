@@ -145,7 +145,9 @@ fn engine_data_calls_are_lock_gated() {
         template: String,
     }
     type Call = fn(&MemloreEngine, &Ids) -> Result<(), MemloreError>;
-    let calls: [(&str, Call); 32] = [
+    // `lock_second_lock` and `close_invisible_vault` are not listed: they are
+    // infallible and data-free (they only end the in-memory lock session).
+    let calls: [(&str, Call); 47] = [
         ("list_entries", |e, ids| {
             e.list_entries(Some(ids.journal.clone()), 0).map(drop)
         }),
@@ -228,6 +230,52 @@ fn engine_data_calls_are_lock_gated() {
         }),
         ("delete_template", |e, ids| {
             e.delete_template(ids.template.clone())
+        }),
+        ("lock_state", |e, _| e.lock_state().map(drop)),
+        ("set_second_lock_password", |e, _| {
+            e.set_second_lock_password("lock-pw-1".to_string())
+                .map(drop)
+        }),
+        ("unlock_second_lock", |e, _| {
+            e.unlock_second_lock("lock-pw-1".to_string()).map(drop)
+        }),
+        ("change_second_lock_password", |e, _| {
+            e.change_second_lock_password("lock-pw-1".to_string(), "lock-pw-2".to_string())
+                .map(drop)
+        }),
+        ("disable_second_lock", |e, _| {
+            e.disable_second_lock("lock-pw-1".to_string()).map(drop)
+        }),
+        ("set_second_lock_show_existence", |e, _| {
+            e.set_second_lock_show_existence(true).map(drop)
+        }),
+        ("set_second_lock_auto_lock_minutes", |e, _| {
+            e.set_second_lock_auto_lock_minutes(15).map(drop)
+        }),
+        ("set_invisible_auto_lock_minutes", |e, _| {
+            e.set_invisible_auto_lock_minutes(15).map(drop)
+        }),
+        ("set_entry_locked", |e, ids| {
+            e.set_entry_locked(ids.entry.clone(), true).map(drop)
+        }),
+        ("set_journal_locked", |e, ids| {
+            e.set_journal_locked(ids.journal.clone(), true).map(drop)
+        }),
+        ("open_invisible_vault", |e, _| {
+            e.open_invisible_vault("vault-pw-1".to_string()).map(drop)
+        }),
+        ("change_invisible_vault_password", |e, _| {
+            e.change_invisible_vault_password("vault-pw-1".to_string(), "vault-pw-2".to_string())
+                .map(drop)
+        }),
+        ("remove_empty_invisible_vaults", |e, _| {
+            e.remove_empty_invisible_vaults().map(drop)
+        }),
+        ("set_entry_invisible", |e, ids| {
+            e.set_entry_invisible(ids.entry.clone(), true).map(drop)
+        }),
+        ("set_journal_invisible", |e, ids| {
+            e.set_journal_invisible(ids.journal.clone(), true).map(drop)
         }),
     ];
     let base = engine.load_entry_yjs(id.clone()).unwrap();
