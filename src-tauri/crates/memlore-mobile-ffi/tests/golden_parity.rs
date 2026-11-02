@@ -115,11 +115,11 @@ fn engine_data_calls_are_lock_gated() {
     assert_eq!(engine.startup_mode(), StartupModeFfi::FirstLaunch);
     assert!(matches!(engine.entry_count(), Err(MemloreError::Locked)));
     assert!(matches!(
-        engine.create_entry("t".to_string()),
+        engine.create_entry("t".to_string(), None),
         Err(MemloreError::Locked)
     ));
     assert!(matches!(
-        engine.list_entry_titles(10),
+        engine.list_entries(None, 0),
         Err(MemloreError::Locked)
     ));
     // A lock before setup (auto-lock on the onboarding screen) must leave the
@@ -128,13 +128,77 @@ fn engine_data_calls_are_lock_gated() {
 
     let phrase = engine.create_vault(PASSWORD.to_string()).unwrap();
     assert_eq!(phrase.split_whitespace().count(), 24);
-    let id = engine.create_entry("First".to_string()).unwrap();
+    let id = engine.create_entry("First".to_string(), None).unwrap();
     assert_eq!(engine.entry_count().unwrap(), 1);
+
+    // Every entry, journal, tag and trash call must return `Locked` too. Made
+    // with real ids, so a call that skipped the gate would succeed.
+    struct Ids {
+        entry: String,
+        journal: String,
+        tag: String,
+    }
+    type Call = fn(&MemloreEngine, &Ids) -> Result<(), MemloreError>;
+    let calls: [(&str, Call); 20] = [
+        ("list_entries", |e, ids| {
+            e.list_entries(Some(ids.journal.clone()), 0).map(drop)
+        }),
+        ("get_entry", |e, ids| {
+            e.get_entry(ids.entry.clone()).map(drop)
+        }),
+        ("create_entry", |e, ids| {
+            e.create_entry("t".to_string(), Some(ids.journal.clone()))
+                .map(drop)
+        }),
+        ("set_entry_title", |e, ids| {
+            e.set_entry_title(ids.entry.clone(), "t".to_string())
+        }),
+        ("set_entry_emotion", |e, ids| {
+            e.set_entry_emotion(ids.entry.clone(), Some("good".to_string()))
+        }),
+        ("toggle_entry_favorite", |e, ids| {
+            e.toggle_entry_favorite(ids.entry.clone()).map(drop)
+        }),
+        ("set_entry_date", |e, ids| {
+            e.set_entry_date(ids.entry.clone(), 86_400)
+        }),
+        ("move_entry", |e, ids| {
+            e.move_entry(ids.entry.clone(), ids.journal.clone())
+        }),
+        ("trash_entry", |e, ids| e.trash_entry(ids.entry.clone())),
+        ("list_trash", |e, _| e.list_trash().map(drop)),
+        ("restore_entry", |e, ids| e.restore_entry(ids.entry.clone())),
+        ("purge_entry", |e, ids| e.purge_entry(ids.entry.clone())),
+        ("empty_trash", |e, ids| {
+            e.empty_trash(vec![ids.entry.clone()]).map(drop)
+        }),
+        ("list_journals", |e, _| e.list_journals().map(drop)),
+        ("create_journal", |e, _| {
+            e.create_journal("j".to_string()).map(drop)
+        }),
+        ("rename_journal", |e, ids| {
+            e.rename_journal(ids.journal.clone(), "j".to_string())
+                .map(drop)
+        }),
+        ("list_tags", |e, _| e.list_tags().map(drop)),
+        ("create_tag", |e, _| e.create_tag("t".to_string()).map(drop)),
+        ("add_tag_to_entry", |e, ids| {
+            e.add_tag_to_entry(ids.entry.clone(), ids.tag.clone())
+        }),
+        ("remove_tag_from_entry", |e, ids| {
+            e.remove_tag_from_entry(ids.entry.clone(), ids.tag.clone())
+        }),
+    ];
+    let ids = Ids {
+        entry: id.clone(),
+        journal: engine.get_entry(id.clone()).unwrap().journal_id,
+        tag: engine.create_tag("gated".to_string()).unwrap().id,
+    };
 
     engine.lock().unwrap();
     assert!(matches!(engine.entry_count(), Err(MemloreError::Locked)));
     assert!(matches!(
-        engine.list_entry_titles(10),
+        engine.list_entries(None, 0),
         Err(MemloreError::Locked)
     ));
     assert!(matches!(
@@ -145,6 +209,13 @@ fn engine_data_calls_are_lock_gated() {
         engine.save_entry_yjs(id.clone(), Vec::new(), String::new(), String::new()),
         Err(MemloreError::Locked)
     ));
+    for (name, call) in calls {
+        let result = call(&engine, &ids);
+        assert!(
+            matches!(result, Err(MemloreError::Locked)),
+            "{name}: {result:?}"
+        );
+    }
     // The lock closed the database; the password opens it again in place.
     engine.unlock(PASSWORD.to_string()).unwrap();
     assert_eq!(engine.entry_count().unwrap(), 1);
@@ -162,10 +233,10 @@ fn engine_data_calls_are_lock_gated() {
     assert!(matches!(engine.entry_count(), Err(MemloreError::Locked)));
 
     engine.unlock(PASSWORD.to_string()).unwrap();
-    let titles = engine.list_entry_titles(10).unwrap();
-    assert_eq!(titles.len(), 1);
-    assert_eq!(titles[0].id, id);
-    assert_eq!(titles[0].title.as_deref(), Some("First"));
+    let rows = engine.list_entries(None, 0).unwrap().items;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].title.as_deref(), Some("First"));
 }
 
 /// Paragraph texts of a TipTap entry doc (fragment `default`).
@@ -209,7 +280,7 @@ fn save_entry_yjs_merges_into_the_stored_doc() {
     )
     .unwrap();
     engine.create_vault("password12".to_string()).unwrap();
-    let id = engine.create_entry("Merge".to_string()).unwrap();
+    let id = engine.create_entry("Merge".to_string(), None).unwrap();
     let base = engine.load_entry_yjs(id.clone()).unwrap();
     assert!(!base.is_empty());
 
@@ -234,7 +305,7 @@ fn save_entry_yjs_merges_into_the_stored_doc() {
 
     assert!(matches!(
         engine.load_entry_yjs("no-such-entry".to_string()),
-        Err(MemloreError::Io { .. })
+        Err(MemloreError::NotFound)
     ));
     assert!(matches!(
         engine.save_entry_yjs(
@@ -243,7 +314,7 @@ fn save_entry_yjs_merges_into_the_stored_doc() {
             String::new(),
             String::new()
         ),
-        Err(MemloreError::Io { .. })
+        Err(MemloreError::NotFound)
     ));
 }
 

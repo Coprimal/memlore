@@ -30,7 +30,12 @@ use zeroize::Zeroizing;
 
 use crate::keystore::OsKeyStore;
 
+pub use entries::{EntryDetailFfi, EntryPageFfi, EntryRowFfi, TrashRowFfi};
+pub use organize::{JournalFfi, TagFfi};
+
+mod entries;
 mod keystore;
+mod organize;
 
 uniffi::setup_scaffolding!();
 
@@ -78,6 +83,10 @@ pub enum MemloreError {
     /// The user dismissed the Face ID prompt. Nothing changed.
     #[error("biometric unlock was cancelled")]
     BiometricCancelled,
+    /// The entry, journal or tag does not exist or is not listed on mobile
+    /// (deleted, locked or invisible). Never says which.
+    #[error("not found")]
+    NotFound,
 }
 
 fn io(msg: String) -> MemloreError {
@@ -111,13 +120,6 @@ impl From<StartupMode> for StartupModeFfi {
             StartupMode::BootFileCorrupt => Self::BootFileCorrupt,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct EntryTitleFfi {
-    pub id: String,
-    pub title: Option<String>,
-    pub entry_date: i64,
 }
 
 /// One opened `<device>/entries/<id>.bin` sync file.
@@ -377,71 +379,10 @@ impl MemloreEngine {
         })
     }
 
-    /// Entries the list shows (same filters as [`Self::list_entry_titles`]).
+    /// Entries the list shows (same filters as [`Self::list_entries`]
+    /// without a journal).
     pub fn entry_count(&self) -> Result<u64, MemloreError> {
         self.with_unlocked(|conn| Ok(u64::from(list_page(conn, 1)?.total)))
-    }
-
-    /// Create an entry with `title` and an empty body in the first visible,
-    /// unlocked journal. Returns its id.
-    pub fn create_entry(&self, title: String) -> Result<String, MemloreError> {
-        self.with_unlocked(|conn| {
-            let journal_id = db::list_journals(conn, None)
-                .map_err(|e| io(e.to_string()))?
-                .into_iter()
-                .find(|j| !j.is_locked)
-                .map(|j| j.id)
-                .ok_or_else(|| io("No journal to create the entry in".to_string()))?;
-            let title = Some(title.as_str()).filter(|t| !t.trim().is_empty());
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let entry = memlore_engine::ops::entries::create_entry_impl(
-                conn,
-                &journal_id,
-                title,
-                None,
-                None,
-                now,
-            )
-            .map_err(io)?;
-            let (yjs, content_text, preview_text) =
-                memlore_engine::yjs_doc::build_entry_yjs(&[""], &[]);
-            memlore_engine::ops::entries::save_entry_content_impl(
-                conn,
-                &entry.id,
-                &yjs,
-                &content_text,
-                &preview_text,
-            )
-            .map_err(io)?;
-            Ok(entry.id)
-        })
-    }
-
-    /// Newest first, at most `limit`. Locked entries are hidden and
-    /// invisible-vault entries are excluded (no vault session on mobile).
-    pub fn list_entry_titles(&self, limit: u32) -> Result<Vec<EntryTitleFfi>, MemloreError> {
-        self.with_unlocked(|conn| {
-            let limit = limit as usize;
-            let mut out = Vec::new();
-            let mut page = 1;
-            while out.len() < limit {
-                let items = list_page(conn, page)?.items;
-                if items.is_empty() {
-                    break;
-                }
-                out.extend(items.into_iter().map(|e| EntryTitleFfi {
-                    id: e.id,
-                    title: e.title,
-                    entry_date: e.entry_date,
-                }));
-                page += 1;
-            }
-            out.truncate(limit);
-            Ok(out)
-        })
     }
 
     /// The entry's Yjs document (full state), empty when it has no body yet.
@@ -479,14 +420,7 @@ impl MemloreEngine {
             save_entry_content_merged_impl(conn, &id, &full_state, &content_text, &preview_text)
                 .map_err(io)
         })?;
-        // Outside the lock gate and after the connection guard is released:
-        // the embedding hook takes the connection itself.
-        {
-            let conn = self.state.lock().map_err(io)?;
-            maybe_detect_language_after_save(&conn, &id);
-        }
-        maybe_mark_entry_embedding_dirty_after_save(&self.state, &self.indexer, &id);
-        Ok(())
+        self.after_entry_save(&id)
     }
 }
 
@@ -541,18 +475,48 @@ impl MemloreEngine {
             .with_key(|_key| Ok(self.state.lock().map_err(io).and_then(|conn| f(&conn))))
             .map_err(|_| MemloreError::Locked)?
     }
+
+    /// The desktop post-save hooks (language, embedding), minus its
+    /// `last_edit` debounce clock. Call it outside the lock gate, after the
+    /// connection guard is released: the embedding hook takes the connection
+    /// itself.
+    fn after_entry_save(&self, id: &str) -> Result<(), MemloreError> {
+        {
+            let conn = self.state.lock().map_err(io)?;
+            maybe_detect_language_after_save(&conn, id);
+        }
+        maybe_mark_entry_embedding_dirty_after_save(&self.state, &self.indexer, id);
+        Ok(())
+    }
 }
 
-/// The per-entry gate of [`MemloreEngine::load_entry_yjs`] and
-/// [`MemloreEngine::save_entry_yjs`]: the same entries [`list_page`] shows
-/// (live, not effectively locked, not invisible), anything else is not found.
-fn require_listed_entry(conn: &rusqlite::Connection, id: &str) -> Result<(), MemloreError> {
+/// The per-entry gate of every entry call: the same entries [`list_page`]
+/// shows (live, not effectively locked, not invisible), anything else is
+/// [`MemloreError::NotFound`].
+fn require_listed_entry(conn: &rusqlite::Connection, id: &str) -> Result<db::Entry, MemloreError> {
     let entry = db::get_entry(conn, id).map_err(|e| io(e.to_string()))?;
     let visible =
         db::is_entry_visible_for_active_vault(conn, id, None).map_err(|e| io(e.to_string()))?;
     match entry {
-        Some(e) if visible && !e.is_deleted && !e.is_locked => Ok(()),
-        _ => Err(io("Entry not found".to_string())),
+        Some(e) if visible && !e.is_deleted && !e.is_locked => Ok(e),
+        _ => Err(MemloreError::NotFound),
+    }
+}
+
+/// The per-journal gate of every call that reads a journal or writes into
+/// it: live, visible without an invisible vault, and not locked. Anything
+/// else is [`MemloreError::NotFound`]: moving an entry into a hidden journal
+/// would hide the entry.
+fn require_listed_journal(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<db::Journal, MemloreError> {
+    let journal = db::get_journal(conn, id).map_err(|e| io(e.to_string()))?;
+    let visible =
+        db::is_journal_visible_for_active_vault(conn, id, None).map_err(|e| io(e.to_string()))?;
+    match journal {
+        Some(j) if visible && !j.is_deleted && !j.is_locked => Ok(j),
+        _ => Err(MemloreError::NotFound),
     }
 }
 
@@ -625,15 +589,80 @@ mod tests {
         txn.encode_state_as_update_v1(&yrs::StateVector::default())
     }
 
+    /// A created (so unlocked) vault whose os_kek lives in memory.
+    fn unlocked_engine() -> (tempfile::TempDir, Arc<MemloreEngine>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = MemloreEngine::with_keystore(
+            dir.path().to_string_lossy().into_owned(),
+            "0.0.0-test".into(),
+            Arc::new(MemoryKeyStore::default()),
+        )
+        .unwrap();
+        engine.create_vault("password12".to_string()).unwrap();
+        (dir, engine)
+    }
+
+    /// Generic over the success type, so the records need no `Debug`.
+    fn expect_not_found<T>(result: Result<T, MemloreError>, what: &str) {
+        match result {
+            Err(MemloreError::NotFound) => {}
+            Err(e) => panic!("{what}: expected NotFound, got {e:?}"),
+            Ok(_) => panic!("{what}: expected NotFound, got Ok"),
+        }
+    }
+
+    /// Every stored field a refused entry call could have changed.
+    #[derive(Debug, PartialEq)]
+    struct StoredEntry {
+        title: Option<String>,
+        emotion: Option<String>,
+        is_favorite: bool,
+        entry_date: i64,
+        journal_id: String,
+        is_deleted: bool,
+        tag_ids: Vec<String>,
+        yjs: Option<Vec<u8>>,
+    }
+
+    fn stored_entry(engine: &MemloreEngine, id: &str) -> StoredEntry {
+        let conn = engine.state.lock().unwrap();
+        let e = db::get_entry_raw(&conn, id).unwrap().unwrap();
+        StoredEntry {
+            title: e.title,
+            emotion: e.emotion,
+            is_favorite: e.is_favorite,
+            entry_date: e.entry_date,
+            journal_id: e.journal_id,
+            is_deleted: e.is_deleted,
+            tag_ids: db::get_tag_ids_for_entry(&conn, id).unwrap(),
+            yjs: db::get_entry_content(&conn, id).unwrap(),
+        }
+    }
+
+    /// What the calls of `entry_calls_refuse_unlisted_entries` are made
+    /// with. The journal and the tags are listed, so only the entry's own
+    /// gate can refuse a call.
+    struct Unlisted {
+        entry: String,
+        elsewhere: String,
+        kept_tag: String,
+        other_tag: String,
+        base: Vec<u8>,
+    }
+
     /// `require_listed_entry`: a locked entry, an entry of an invisible
-    /// journal and a deleted entry are "not found" for both the load and the
-    /// save, and the rejected save leaves the stored document untouched.
+    /// journal and a deleted entry are "not found" for every entry call, and
+    /// no refused call changes the stored row, its tags or its document.
     #[test]
-    fn entry_yjs_calls_refuse_unlisted_entries() {
+    fn entry_calls_refuse_unlisted_entries() {
         type Hide = fn(&rusqlite::Connection, &str);
-        let cases: [(&str, Hide); 3] = [
+        let cases: [(&str, Hide); 4] = [
             ("locked entry", |conn, id| {
                 db::set_entry_locked(conn, id, true).unwrap()
+            }),
+            ("entry in a locked journal", |conn, id| {
+                let journal_id = db::get_entry(conn, id).unwrap().unwrap().journal_id;
+                db::set_journal_locked(conn, &journal_id, true).unwrap();
             }),
             ("invisible journal", |conn, id| {
                 let journal_id = db::get_entry(conn, id).unwrap().unwrap().journal_id;
@@ -644,39 +673,224 @@ mod tests {
                 db::trash_entry(conn, id, 1).unwrap()
             }),
         ];
+        type Call = fn(&MemloreEngine, &Unlisted) -> Result<(), MemloreError>;
+        let calls: [(&str, Call); 11] = [
+            ("get_entry", |e, u| e.get_entry(u.entry.clone()).map(drop)),
+            ("set_entry_title", |e, u| {
+                e.set_entry_title(u.entry.clone(), "Changed".into())
+            }),
+            ("set_entry_emotion", |e, u| {
+                e.set_entry_emotion(u.entry.clone(), Some("good".into()))
+            }),
+            ("toggle_entry_favorite", |e, u| {
+                e.toggle_entry_favorite(u.entry.clone()).map(drop)
+            }),
+            ("set_entry_date", |e, u| {
+                e.set_entry_date(u.entry.clone(), 86_400)
+            }),
+            ("move_entry", |e, u| {
+                e.move_entry(u.entry.clone(), u.elsewhere.clone())
+            }),
+            ("add_tag_to_entry", |e, u| {
+                e.add_tag_to_entry(u.entry.clone(), u.other_tag.clone())
+            }),
+            ("remove_tag_from_entry", |e, u| {
+                e.remove_tag_from_entry(u.entry.clone(), u.kept_tag.clone())
+            }),
+            ("load_entry_yjs", |e, u| {
+                e.load_entry_yjs(u.entry.clone()).map(drop)
+            }),
+            ("save_entry_yjs", |e, u| {
+                e.save_entry_yjs(u.entry.clone(), edited(&u.base), "x".into(), "x".into())
+            }),
+            ("trash_entry", |e, u| e.trash_entry(u.entry.clone())),
+        ];
         for (case, hide) in cases {
-            let dir = tempfile::TempDir::new().unwrap();
-            let engine = MemloreEngine::new(
-                dir.path().to_string_lossy().into_owned(),
-                "0.0.0-test".into(),
-            )
-            .unwrap();
-            engine.create_vault("password12".to_string()).unwrap();
-            let id = engine.create_entry("Hidden".to_string()).unwrap();
-            let base = engine.load_entry_yjs(id.clone()).unwrap();
-            let stored = |engine: &MemloreEngine| {
+            let (_dir, engine) = unlocked_engine();
+            let entry = engine.create_entry("Hidden".to_string(), None).unwrap();
+            let base = engine.load_entry_yjs(entry.clone()).unwrap();
+            let (elsewhere, kept_tag, other_tag) = {
                 let conn = engine.state.lock().unwrap();
-                db::get_entry_content(&conn, &id).unwrap()
+                let elsewhere = db::create_journal(&conn, "Elsewhere", None).unwrap().id;
+                let kept_tag = db::create_tag(&conn, "kept", None).unwrap().id;
+                let other_tag = db::create_tag(&conn, "other", None).unwrap().id;
+                db::add_tag_to_entry(&conn, &entry, &kept_tag).unwrap();
+                hide(&conn, &entry);
+                (elsewhere, kept_tag, other_tag)
             };
-            let before = stored(&engine);
-            hide(&engine.state.lock().unwrap(), &id);
+            let unlisted = Unlisted {
+                entry,
+                elsewhere,
+                kept_tag,
+                other_tag,
+                base,
+            };
+            let before = stored_entry(&engine, &unlisted.entry);
 
-            assert!(
-                matches!(
-                    engine.load_entry_yjs(id.clone()),
-                    Err(MemloreError::Io { .. })
-                ),
-                "{case}: load"
+            for (call, run) in calls {
+                expect_not_found(run(&engine, &unlisted), &format!("{case}: {call}"));
+            }
+            assert_eq!(
+                stored_entry(&engine, &unlisted.entry),
+                before,
+                "{case}: stored row changed"
             );
-            assert!(
-                matches!(
-                    engine.save_entry_yjs(id.clone(), edited(&base), "x".into(), "x".into()),
-                    Err(MemloreError::Io { .. })
-                ),
-                "{case}: save"
-            );
-            assert_eq!(stored(&engine), before, "{case}: stored doc changed");
         }
+    }
+
+    /// `require_listed_journal`: a locked or invisible journal is "not found"
+    /// as a target. Moving an entry into it would hide the entry, creating
+    /// one would write an entry nobody can list, and listing or renaming it
+    /// would read or touch a hidden journal.
+    #[test]
+    fn hidden_journals_are_refused_as_targets() {
+        type Hide = fn(&rusqlite::Connection, &str);
+        let cases: [(&str, Hide); 2] = [
+            ("locked journal", |conn, journal_id| {
+                db::set_journal_locked(conn, journal_id, true).unwrap()
+            }),
+            ("invisible journal", |conn, journal_id| {
+                let vault = db::insert_invisible_vault(conn, "verifier").unwrap();
+                db::set_journal_invisible(conn, journal_id, true, Some(&vault.id)).unwrap();
+            }),
+        ];
+        for (case, hide) in cases {
+            let (_dir, engine) = unlocked_engine();
+            let id = engine.create_entry("Listed".to_string(), None).unwrap();
+            let (home, hidden) = {
+                let conn = engine.state.lock().unwrap();
+                let home = db::get_entry(&conn, &id).unwrap().unwrap().journal_id;
+                let hidden = db::create_journal(&conn, "Hidden", None).unwrap().id;
+                hide(&conn, &hidden);
+                (home, hidden)
+            };
+            // Every row, hidden ones included: `list_entries` cannot see an
+            // entry written into a hidden journal.
+            let all_entries = || {
+                let conn = engine.state.lock().unwrap();
+                conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get::<_, i64>(0))
+                    .unwrap()
+            };
+            let count = all_entries();
+
+            expect_not_found(
+                engine.move_entry(id.clone(), hidden.clone()),
+                &format!("{case}: move_entry"),
+            );
+            let listed = engine.list_entries(None, 0).unwrap();
+            assert_eq!(
+                listed
+                    .items
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map(|row| row.journal_id.clone()),
+                Some(home),
+                "{case}: the entry left its journal or the list"
+            );
+
+            expect_not_found(
+                engine.create_entry("x".to_string(), Some(hidden.clone())),
+                &format!("{case}: create_entry"),
+            );
+            assert_eq!(all_entries(), count, "{case}: create_entry wrote a row");
+
+            expect_not_found(
+                engine.list_entries(Some(hidden.clone()), 0),
+                &format!("{case}: list_entries"),
+            );
+
+            expect_not_found(
+                engine.rename_journal(hidden.clone(), "y".to_string()),
+                &format!("{case}: rename_journal"),
+            );
+            let name = db::get_journal(&engine.state.lock().unwrap(), &hidden)
+                .unwrap()
+                .unwrap()
+                .name;
+            assert_eq!(name, "Hidden", "{case}: rename_journal renamed it");
+        }
+    }
+
+    /// Mobile has no reveal session (until M3c): the listings leave out a
+    /// locked journal, a tag used only on a locked entry and a trashed
+    /// locked entry, and the trash calls cannot purge what they do not list.
+    /// What stays visible is listed, so an empty answer cannot pass.
+    #[test]
+    fn listings_hide_locked_journals_and_locked_only_tags() {
+        let (_dir, engine) = unlocked_engine();
+        let listed = engine.create_entry("Listed".to_string(), None).unwrap();
+        let locked = engine.create_entry("Locked".to_string(), None).unwrap();
+        let trashed = engine.create_entry("Trashed".to_string(), None).unwrap();
+        let trashed_locked = engine
+            .create_entry("Trashed locked".to_string(), None)
+            .unwrap();
+        let (home, locked_journal, unused, on_listed, locked_only) = {
+            let conn = engine.state.lock().unwrap();
+            let home = db::get_entry(&conn, &listed).unwrap().unwrap().journal_id;
+            let locked_journal = db::create_journal(&conn, "Locked journal", None)
+                .unwrap()
+                .id;
+            db::set_journal_locked(&conn, &locked_journal, true).unwrap();
+            let tag = |name: &str| db::create_tag(&conn, name, None).unwrap().id;
+            let (unused, on_listed, locked_only) =
+                (tag("unused"), tag("on-listed"), tag("locked-only"));
+            db::add_tag_to_entry(&conn, &listed, &on_listed).unwrap();
+            db::add_tag_to_entry(&conn, &locked, &locked_only).unwrap();
+            db::set_entry_locked(&conn, &locked, true).unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            db::trash_entry(&conn, &trashed, now).unwrap();
+            db::trash_entry(&conn, &trashed_locked, now).unwrap();
+            db::set_entry_locked(&conn, &trashed_locked, true).unwrap();
+            (home, locked_journal, unused, on_listed, locked_only)
+        };
+
+        let journals: Vec<String> = engine
+            .list_journals()
+            .unwrap()
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        assert!(journals.contains(&home), "{journals:?}");
+        assert!(!journals.contains(&locked_journal), "locked journal listed");
+
+        let tags: Vec<String> = engine
+            .list_tags()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(tags.contains(&unused), "unused tag missing");
+        assert!(tags.contains(&on_listed), "tag of a listed entry missing");
+        assert!(!tags.contains(&locked_only), "locked-only tag listed");
+
+        let trash: Vec<String> = engine
+            .list_trash()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(trash.contains(&trashed), "trashed entry missing");
+        assert!(
+            !trash.contains(&trashed_locked),
+            "trashed locked entry listed"
+        );
+        expect_not_found(engine.purge_entry(trashed_locked.clone()), "purge_entry");
+        assert_eq!(
+            engine.empty_trash(vec![trashed_locked.clone()]).unwrap(),
+            0,
+            "empty_trash purged a locked entry"
+        );
+        // A purge keeps the row as a tombstone but clears `trashed_at`.
+        let row = db::get_entry_raw(&engine.state.lock().unwrap(), &trashed_locked)
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.is_deleted && row.trashed_at.is_some(),
+            "the locked entry left Trash"
+        );
     }
 
     /// Face ID enable, lock, unlock reads the same data: the os_kek lands in
@@ -694,7 +908,7 @@ mod tests {
         )
         .unwrap();
         engine.create_vault("password12".to_string()).unwrap();
-        let id = engine.create_entry("Kept".to_string()).unwrap();
+        let id = engine.create_entry("Kept".to_string(), None).unwrap();
         let count = engine.entry_count().unwrap();
 
         engine.enable_biometric().unwrap();

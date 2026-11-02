@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 
-import MemloreCore, { type EntryTitle } from '@/modules/memlore-core';
+import MemloreCore from '@/modules/memlore-core';
 
 export type EntryDocStatus = 'loading' | 'ready' | 'locked' | 'failed';
 export type SaveStatus = 'idle' | 'saving' | 'saved' | 'failed';
@@ -9,20 +9,33 @@ function isLocked(e: unknown): boolean {
   return typeof e === 'object' && e !== null && 'code' in e && e.code === 'ERR_LOCKED';
 }
 
-/** Newest entries for a picker. Components use this, never the native module. */
-export function useEntryTitles(limit = 50) {
+/** One row of the picker (locked and invisible entries are never listed). */
+export interface EntryTitle {
+  id: string;
+  title: string | null;
+  /** Unix seconds. */
+  entryDate: number;
+}
+
+/**
+ * The newest entries (the list's first page) for a picker. Components use
+ * this, never the native module.
+ */
+export function useEntryTitles() {
   const [titles, setTitles] = useState<EntryTitle[] | null>(null);
   const [status, setStatus] = useState<EntryDocStatus>('loading');
 
   const refresh = useCallback(() => {
     setStatus('loading');
-    MemloreCore.listEntryTitles(limit)
-      .then((rows) => {
-        setTitles(rows);
+    MemloreCore.listEntries(null, 0)
+      .then((page) => {
+        setTitles(
+          page.items.map(({ id, title, entryDate }) => ({ id, title, entryDate })),
+        );
         setStatus('ready');
       })
       .catch((e: unknown) => setStatus(isLocked(e) ? 'locked' : 'failed'));
-  }, [limit]);
+  }, []);
 
   useEffect(refresh, [refresh]);
 
