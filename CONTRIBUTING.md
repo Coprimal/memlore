@@ -51,7 +51,7 @@ A checkout can build on an external SSD instead of `~/.cargo/shared-target`, to 
 
 ```sh
 cp .cargo/config.toml.example .cargo/config.toml   # set the folder for this checkout
-mkdir -p /Volumes/Thi2TB/cargo-target/memlore-w-2
+mkdir -p /Volumes/Thi2TB/cargo-target/memlore   # main checkout; a worktree uses memlore-<worktree>
 ```
 
 Cargo reads config files from the current directory upward, and `$HOME` has the lowest priority. This `target-dir` therefore wins over `~/.cargo/config.toml`, whether you run from the repo root or from `src-tauri/`. Check it in `src-tauri/`:

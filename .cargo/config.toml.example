@@ -3,4 +3,4 @@
 # Copy to .cargo/config.toml (gitignored) and set the folder for this checkout,
 # one folder per checkout. See CONTRIBUTING.md "Cargo build cache".
 [build]
-target-dir = "/Volumes/Thi2TB/cargo-target/memlore-w-2"
+target-dir = "/Volumes/Thi2TB/cargo-target/memlore"   # a worktree: memlore-<worktree>
