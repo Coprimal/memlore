@@ -98,6 +98,8 @@ private func toException(_ error: Error) -> Exception {
     return biometricDisabled(msg)
   case MemloreError.BiometricCancelled:
     return biometricCancelled()
+  case MemloreError.NotFound:
+    return Exception(name: "MemloreNotFound", description: "Not found", code: "ERR_NOT_FOUND")
   default:
     return Exception(name: "MemloreIo", description: error.localizedDescription, code: "ERR_IO")
   }
@@ -224,19 +226,118 @@ private func biometricStatus() -> BiometricStatusRecord {
   return BiometricStatusRecord(available: available, kind: kind)
 }
 
-/// `EntryTitle` in `index.ts`.
-struct EntryTitleRecord: Record {
+/// `EntryRow` in `index.ts`.
+struct EntryRowRecord: Record {
   @Field var id: String = ""
   @Field var title: String? = nil
+  @Field var previewText: String? = nil
   /// Unix seconds.
   @Field var entryDate: Double = 0
+  @Field var emotion: String? = nil
+  @Field var isFavorite: Bool = false
+  @Field var journalId: String = ""
 
   init() {}
 
-  init(entry: EntryTitleFfi) {
+  init(_ row: EntryRowFfi) {
+    id = row.id
+    title = row.title
+    previewText = row.previewText
+    entryDate = Double(row.entryDate)
+    emotion = row.emotion
+    isFavorite = row.isFavorite
+    journalId = row.journalId
+  }
+}
+
+/// `EntryPage` in `index.ts`.
+struct EntryPageRecord: Record {
+  @Field var items: [EntryRowRecord] = []
+  @Field var total: Int = 0
+  @Field var hasMore: Bool = false
+
+  init() {}
+
+  init(_ page: EntryPageFfi) {
+    items = page.items.map { EntryRowRecord($0) }
+    total = Int(clamping: page.total)
+    hasMore = page.hasMore
+  }
+}
+
+/// `Tag` in `index.ts`.
+struct TagRecord: Record {
+  @Field var id: String = ""
+  @Field var name: String = ""
+  @Field var color: String? = nil
+
+  init() {}
+
+  init(_ tag: TagFfi) {
+    id = tag.id
+    name = tag.name
+    color = tag.color
+  }
+}
+
+/// `EntryDetail` in `index.ts`.
+struct EntryDetailRecord: Record {
+  @Field var id: String = ""
+  @Field var title: String? = nil
+  @Field var previewText: String? = nil
+  /// Unix seconds.
+  @Field var entryDate: Double = 0
+  @Field var emotion: String? = nil
+  @Field var isFavorite: Bool = false
+  @Field var journalId: String = ""
+  @Field var contentText: String? = nil
+  @Field var tags: [TagRecord] = []
+
+  init() {}
+
+  init(_ entry: EntryDetailFfi) {
     id = entry.id
     title = entry.title
+    previewText = entry.previewText
     entryDate = Double(entry.entryDate)
+    emotion = entry.emotion
+    isFavorite = entry.isFavorite
+    journalId = entry.journalId
+    contentText = entry.contentText
+    tags = entry.tags.map { TagRecord($0) }
+  }
+}
+
+/// `Journal` in `index.ts`.
+struct JournalRecord: Record {
+  @Field var id: String = ""
+  @Field var name: String = ""
+  @Field var color: String? = nil
+
+  init() {}
+
+  init(_ journal: JournalFfi) {
+    id = journal.id
+    name = journal.name
+    color = journal.color
+  }
+}
+
+/// `TrashRow` in `index.ts`.
+struct TrashRowRecord: Record {
+  @Field var id: String = ""
+  @Field var title: String? = nil
+  @Field var previewText: String? = nil
+  /// Unix seconds.
+  @Field var trashedAt: Double = 0
+
+  init() {}
+
+  init(_ row: TrashRowFfi) {
+    id = row.id
+    title = row.title
+    previewText = row.previewText
+    trashedAt = Double(row.trashedAt)
   }
 }
 
@@ -247,7 +348,7 @@ public class MemloreCoreModule: Module {
   public func definition() -> ModuleDefinition {
     Name("MemloreCore")
 
-    Events("onAutoLock", "onScreenCaptureChange")
+    Events("onAutoLock", "onScreenCaptureChange", "onFlushRequest")
 
     // Both hop to main in order, so a reload's destroy never runs before its
     // create. Destroy holds the module until the observers are gone.
@@ -274,6 +375,11 @@ public class MemloreCoreModule: Module {
 
     AsyncFunction("releasePrivacyShield") {
       MainActor.assumeIsolated { self.deviceSecurity?.releasePrivacyShield() }
+    }.runOnQueue(.main)
+
+    // Save before lock: JS's answer to `onFlushRequest`.
+    AsyncFunction("flushDone") { (id: Int) in
+      MainActor.assumeIsolated { self.deviceSecurity?.flushDone(id) }
     }.runOnQueue(.main)
 
     AsyncFunction("isScreenCaptured") { () -> Bool in
@@ -391,16 +497,91 @@ public class MemloreCoreModule: Module {
       try withEngine { engine in try Int(engine.entryCount()) }
     }.runOnQueue(engineQueue)
 
-    AsyncFunction("createEntry") { (title: String) throws -> String in
-      try withEngine { engine in try engine.createEntry(title: title) }
+    AsyncFunction("listEntries") { (journalId: String?, page: Int) throws -> EntryPageRecord in
+      try withEngine { engine in
+        try EntryPageRecord(
+          engine.listEntries(journalId: journalId, page: UInt32(clamping: max(0, page))))
+      }
     }.runOnQueue(engineQueue)
 
-    AsyncFunction("listEntryTitles") { (limit: Int) throws -> [EntryTitleRecord] in
-      try withEngine { engine in
-        try engine.listEntryTitles(limit: UInt32(clamping: max(0, limit))).map {
-          EntryTitleRecord(entry: $0)
-        }
+    AsyncFunction("getEntry") { (id: String) throws -> EntryDetailRecord in
+      try withEngine { engine in try EntryDetailRecord(engine.getEntry(id: id)) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("createEntry") { (title: String, journalId: String?) throws -> String in
+      try withEngine { engine in try engine.createEntry(title: title, journalId: journalId) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setEntryTitle") { (id: String, title: String) throws in
+      try withEngine { engine in try engine.setEntryTitle(id: id, title: title) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setEntryEmotion") { (id: String, emotion: String?) throws in
+      try withEngine { engine in try engine.setEntryEmotion(id: id, emotion: emotion) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("toggleEntryFavorite") { (id: String) throws -> Bool in
+      try withEngine { engine in try engine.toggleEntryFavorite(id: id) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setEntryDate") { (id: String, entryDate: Double) throws in
+      guard entryDate.isFinite, let seconds = Int64(exactly: entryDate.rounded(.towardZero)) else {
+        throw Exception(
+          name: "MemloreFormat", description: "entry date out of range", code: "ERR_FORMAT")
       }
+      try withEngine { engine in try engine.setEntryDate(id: id, entryDate: seconds) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("moveEntry") { (id: String, journalId: String) throws in
+      try withEngine { engine in try engine.moveEntry(id: id, journalId: journalId) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("trashEntry") { (id: String) throws in
+      try withEngine { engine in try engine.trashEntry(id: id) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("listTrash") { () throws -> [TrashRowRecord] in
+      try withEngine { engine in try engine.listTrash().map { TrashRowRecord($0) } }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("restoreEntry") { (id: String) throws in
+      try withEngine { engine in try engine.restoreEntry(id: id) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("purgeEntry") { (id: String) throws in
+      try withEngine { engine in try engine.purgeEntry(id: id) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("emptyTrash") { (ids: [String]) throws -> Int in
+      try withEngine { engine in try Int(engine.emptyTrash(ids: ids)) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("listJournals") { () throws -> [JournalRecord] in
+      try withEngine { engine in try engine.listJournals().map { JournalRecord($0) } }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("createJournal") { (name: String) throws -> JournalRecord in
+      try withEngine { engine in try JournalRecord(engine.createJournal(name: name)) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("renameJournal") { (id: String, name: String) throws -> JournalRecord in
+      try withEngine { engine in try JournalRecord(engine.renameJournal(id: id, name: name)) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("listTags") { () throws -> [TagRecord] in
+      try withEngine { engine in try engine.listTags().map { TagRecord($0) } }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("createTag") { (name: String) throws -> TagRecord in
+      try withEngine { engine in try TagRecord(engine.createTag(name: name)) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("addTagToEntry") { (entryId: String, tagId: String) throws in
+      try withEngine { engine in try engine.addTagToEntry(entryId: entryId, tagId: tagId) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("removeTagFromEntry") { (entryId: String, tagId: String) throws in
+      try withEngine { engine in try engine.removeTagFromEntry(entryId: entryId, tagId: tagId) }
     }.runOnQueue(engineQueue)
 
     // Yjs bytes cross the bridge as base64: the DOM editor decodes them, JS

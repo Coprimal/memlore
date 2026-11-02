@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 
 import MemloreCore, {
@@ -6,6 +6,8 @@ import MemloreCore, {
   type BiometricKind,
   type MemloreErrorCode,
 } from '@/modules/memlore-core';
+import { flushAll } from '@/src/lib/flushRegistry';
+import { clearRowCache, enableRowCache } from '@/src/lib/rowCache';
 
 export type VaultStatus =
   | 'loading'
@@ -40,25 +42,59 @@ const ERROR_CODES: readonly MemloreErrorCode[] = [
   'ERR_FORMAT',
   'ERR_BIOMETRIC_DISABLED',
   'ERR_BIOMETRIC_CANCELLED',
+  'ERR_NOT_FOUND',
 ];
 
-function errorCode(e: unknown): MemloreErrorCode | null {
+/**
+ * How long JS waits for the lock screen after an auto-lock before it stops
+ * holding the shield. The native safety timeout (~2 s after the app is
+ * active) takes the shield itself off; this only keeps the JS state in step,
+ * so the Face ID prompt still arms if no lock screen ever calls
+ * `lockScreenShown()`.
+ */
+const SHIELD_FALLBACK_MS = 2500;
+
+/**
+ * Save before lock: how long a lock waits for the open editor's saves. The
+ * native wait is 2 s, so the ack for `onFlushRequest` leaves before it.
+ */
+const FLUSH_REQUEST_MS = 1800;
+const MANUAL_LOCK_FLUSH_MS = 2000;
+
+/** The module's error code of a rejected call, or null for anything else. */
+export function errorCode(e: unknown): MemloreErrorCode | null {
   if (typeof e !== 'object' || e === null || !('code' in e)) return null;
   return ERROR_CODES.find((code) => code === e.code) ?? null;
 }
 
 /**
- * The vault lifecycle for the home screen. Components use this hook, never
- * the native module.
+ * The vault lifecycle, once for the whole app: wrap the root layout in it.
+ * Components read it through `useVault()`, never the native module.
  */
-export function useVault() {
+export function VaultProvider({ children }: { children: ReactNode }) {
+  const vault = useVaultState();
+  return <VaultContext.Provider value={vault}>{children}</VaultContext.Provider>;
+}
+
+export type Vault = ReturnType<typeof useVaultState>;
+
+const VaultContext = createContext<Vault | null>(null);
+
+/** The app-wide vault state; only under `VaultProvider`. */
+export function useVault(): Vault {
+  const vault = useContext(VaultContext);
+  if (vault === null) throw new Error('useVault() needs a VaultProvider above it');
+  return vault;
+}
+
+/** The provider's state; it holds the one `onAutoLock` listener of the app. */
+function useVaultState() {
   const [status, setStatus] = useState<VaultStatus>('loading');
   const [error, setError] = useState<VaultError | null>(null);
   const [busy, setBusy] = useState(false);
   // A Face ID/Touch ID unlock prompt is up. Apart from `busy`, so the password
   // form does not read "Unlocking…" while the system sheet is shown.
   const [biometricPrompting, setBiometricPrompting] = useState(false);
-  const [entryCount, setEntryCount] = useState<number | null>(null);
   // Shown once after creation; cleared as soon as the user confirms. An
   // auto-lock on the phrase screen keeps it, and the next unlock shows it again.
   const [recoveryPhrase, setRecoveryPhrase] = useState<string | null>(null);
@@ -67,8 +103,11 @@ export function useVault() {
   const [autoLockSeconds, setAutoLockValue] = useState<AutoLockSeconds | null>(null);
   const [appActive, setAppActive] = useState(AppState.currentState === 'active');
   // An auto-lock left the native privacy shield up; it comes off once the
-  // lock screen has rendered.
+  // lock screen has mounted (`lockScreenShown()`).
   const [shieldHeld, setShieldHeld] = useState(false);
+  // The lock screen has mounted since the vault last locked. Cleared whenever
+  // the status leaves 'locked', so it always refers to the current lock.
+  const [lockScreenMounted, setLockScreenMounted] = useState(false);
   // One automatic Face ID/Touch ID prompt per lock event. Consumed when it
   // fires, so a cancel never brings it back; the button always prompts.
   const [autoPromptPending, setAutoPromptPending] = useState(false);
@@ -106,22 +145,47 @@ export function useVault() {
     // The vault is already locked (or locking) natively, and the app is not
     // active yet. Never prompt from here: the effects below do, once the
     // shield is off and the app is active.
+    // The only onAutoLock subscription of the app.
     const autoLock = MemloreCore.addListener('onAutoLock', () => {
       setAppActive(false);
-      showLocked();
+      markLocked();
       setShieldHeld(true);
-      void refreshBiometric();
+    });
+    // Save before lock: native holds its background lock until this ack (or
+    // ~2 s), so every edit reaches the engine queue before the lock does.
+    const flushRequest = MemloreCore.addListener('onFlushRequest', ({ id }) => {
+      const started = Date.now();
+      void flushAll(FLUSH_REQUEST_MS)
+        .then(() => {
+          if (__DEV__) console.log(`[useVault] flush ${id} acked in ${Date.now() - started} ms`);
+          return MemloreCore.flushDone(id);
+        })
+        // No ack: native locks at its timeout anyway (fail closed).
+        .catch(() => {});
     });
     return () => {
       appState.remove();
       autoLock.remove();
+      flushRequest.remove();
     };
   }, []);
 
-  // After an auto-lock, once the lock screen has rendered: take the shield
-  // off, then arm the Face ID prompt.
+  // Out of 'locked': the next lock waits for its own lock screen, and a shield
+  // still held (an unlock before the lock screen answered) is not carried over
+  // to a later manual lock, which must not prompt.
   useEffect(() => {
-    if (!shieldHeld || status !== 'locked') return;
+    if (status === 'locked') return;
+    setLockScreenMounted(false);
+    setShieldHeld(false);
+  }, [status]);
+
+  // After an auto-lock, once the lock screen has mounted: take the shield
+  // off, then arm the Face ID prompt. Never while protected screens may still
+  // be on screen, so not on the status change alone.
+  // TODO(later): release on a native signal that the protected screens left the
+  // view hierarchy (docs/LATER.md "Mobile M3a notes").
+  useEffect(() => {
+    if (!shieldHeld || status !== 'locked' || !lockScreenMounted) return;
     MemloreCore.releasePrivacyShield()
       // The native safety timeout takes it off anyway.
       .catch(() => {})
@@ -129,7 +193,18 @@ export function useVault() {
         setShieldHeld(false);
         setAutoPromptPending(true);
       });
-  }, [shieldHeld, status]);
+  }, [shieldHeld, status, lockScreenMounted]);
+
+  // Safety: no lock screen mounted in time (should not happen). Native has
+  // taken the shield off by now; stop holding it here so the prompt arms.
+  useEffect(() => {
+    if (!shieldHeld || status !== 'locked' || lockScreenMounted) return;
+    const timer = setTimeout(() => {
+      setShieldHeld(false);
+      setAutoPromptPending(true);
+    }, SHIELD_FALLBACK_MS);
+    return () => clearTimeout(timer);
+  }, [shieldHeld, status, lockScreenMounted]);
 
   /** Re-runs the startup check from the `error` screen. */
   function retry() {
@@ -139,10 +214,29 @@ export function useVault() {
 
   /** Drops everything read from the vault and shows the lock screen. */
   function showLocked() {
+    clearRowCache();
     setError(null);
-    setEntryCount(null);
     setAutoLockValue(null);
     setStatus('locked');
+  }
+
+  /**
+   * The vault is locked natively: a data hook got ERR_LOCKED, or the
+   * auto-lock fired. The lock screen, with no prompt of its own (the
+   * auto-lock arms one once its shield is off).
+   */
+  function markLocked() {
+    showLocked();
+    void refreshBiometric();
+  }
+
+  /**
+   * The lock screen calls this from its mount effect. After an auto-lock it
+   * takes the privacy shield off and arms the Face ID prompt; otherwise it
+   * does nothing.
+   */
+  function lockScreenShown() {
+    setLockScreenMounted(true);
   }
 
   /**
@@ -159,30 +253,12 @@ export function useVault() {
    * After a password or Face ID unlock: back to a pending recovery phrase,
    * else the vault.
    */
-  async function enterUnlocked() {
+  function enterUnlocked() {
+    enableRowCache();
     setAutoPromptPending(false);
     void refreshBiometric();
     void refreshAutoLock();
-    if (recoveryPhrase !== null) {
-      setStatus('show_phrase');
-      return;
-    }
-    setStatus('unlocked');
-    await refreshCount();
-  }
-
-  /** Reads the entry count. False when the vault turned out to be locked. */
-  async function refreshCount(): Promise<boolean> {
-    try {
-      setEntryCount(await MemloreCore.entryCount());
-    } catch (e) {
-      if (errorCode(e) === 'ERR_LOCKED') {
-        showLocked();
-        return false;
-      }
-      setError('failed');
-    }
-    return true;
+    setStatus(recoveryPhrase !== null ? 'show_phrase' : 'unlocked');
   }
 
   /**
@@ -259,28 +335,32 @@ export function useVault() {
     });
 
   /** The vault is already unlocked after creation: go straight to it. */
-  async function confirmPhraseSaved() {
+  function confirmPhraseSaved() {
+    enableRowCache();
     setRecoveryPhrase(null);
     setStatus('unlocked');
-    await refreshCount();
   }
 
   const unlock = (password: string) =>
     run(async () => {
       await MemloreCore.unlock(password);
-      await enterUnlocked();
+      enterUnlocked();
     });
 
   /** A cancel stays locked with no message. */
   const unlockWithBiometric = () =>
     run(async () => {
       await MemloreCore.unlockWithBiometric();
-      await enterUnlocked();
+      enterUnlocked();
     }, setBiometricPrompting);
 
-  /** A manual lock: the lock screen without a prompt (the button prompts). */
+  /**
+   * A manual lock: the open editor's saves first (bounded), then the lock
+   * screen without a prompt (the button prompts).
+   */
   const lock = () =>
     run(async () => {
+      await flushAll(MANUAL_LOCK_FLUSH_MS);
       await MemloreCore.lock();
       showLocked();
       void refreshBiometric();
@@ -316,16 +396,6 @@ export function useVault() {
     return ok;
   }
 
-  /** True only when the entry was created and the vault is still unlocked. */
-  async function createEntry(title: string): Promise<boolean> {
-    let unlocked = true;
-    const ok = await run(async () => {
-      await MemloreCore.createEntry(title);
-      unlocked = await refreshCount();
-    });
-    return ok && unlocked;
-  }
-
   // The automatic prompt: once per lock event, only while the lock screen is
   // up, the app is active (the Keychain prompt needs it) and the shield is
   // off. Cleared before it fires, so a cancel does not prompt again.
@@ -342,7 +412,6 @@ export function useVault() {
     error,
     busy,
     biometricPrompting,
-    entryCount,
     recoveryPhrase,
     biometric,
     autoLockSeconds,
@@ -354,7 +423,8 @@ export function useVault() {
     enableBiometric,
     disableBiometric,
     setAutoLockSeconds,
-    createEntry,
+    markLocked,
+    lockScreenShown,
     retry,
   };
 }

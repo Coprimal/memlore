@@ -3045,7 +3045,32 @@ fn get_tag_by_id(conn: &Connection, id: &str) -> Result<Option<Tag>> {
 }
 
 pub fn list_tags(conn: &Connection, active_vault_id: Option<&str>) -> Result<Vec<Tag>> {
-    let visibility = invisible_entry_visibility_predicate(active_vault_id);
+    list_tags_with_locked_view(conn, LockedView::Revealed, active_vault_id)
+}
+
+/// Live tags, sorted by name: a tag is listed when a live visible entry uses
+/// it, or when no live entry uses it and it is unused or a deleted visible
+/// entry uses it. Follows the `*_with_locked_view` convention: `Hidden` also
+/// treats locked entries (entry-locked or in a locked journal) as not
+/// visible, so a tag used only on locked entries is omitted; `Revealed`
+/// ignores the lock. `Covered` behaves like `Revealed` here (a tag has
+/// nothing to redact). Invisible entries count only for the active vault
+/// (`None` excludes every invisible entry).
+pub fn list_tags_with_locked_view(
+    conn: &Connection,
+    view: LockedView,
+    active_vault_id: Option<&str>,
+) -> Result<Vec<Tag>> {
+    let visibility = match view {
+        LockedView::Hidden => format!(
+            "{} AND {}",
+            invisible_entry_visibility_predicate(active_vault_id),
+            locked_entry_exclusion_predicate()
+        ),
+        LockedView::Covered | LockedView::Revealed => {
+            invisible_entry_visibility_predicate(active_vault_id)
+        }
+    };
     let sql = format!(
         "SELECT t.id, t.name, t.color
          FROM tags t

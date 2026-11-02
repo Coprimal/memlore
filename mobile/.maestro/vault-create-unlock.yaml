@@ -86,10 +86,10 @@ appId: app.memlore.mobile
 - assertNotVisible:
     id: unlock-button
 
-# Security panel: the Face ID row is there (its state depends on the
+# Settings tab (Security panel): the Face ID row is there (its state depends on the
 # simulator's enrolment), and auto-lock goes to "Immediately".
 - tapOn:
-    id: security-button
+    id: settings-tab
 - extendedWaitUntil:
     visible:
       id: biometric-row
@@ -100,11 +100,20 @@ appId: app.memlore.mobile
     id: auto-lock-0
     selected: true
 - tapOn:
-    id: security-back-button
+    id: entries-tab
 - extendedWaitUntil:
     visible:
       id: entry-count
     timeout: 10000
+
+# Open an entry (a new one: the vault is empty), so a pushed protected route is
+# on screen when the vault locks.
+- tapOn:
+    id: new-entry-button
+- extendedWaitUntil:
+    visible:
+      id: entry-title-input
+    timeout: 15000
 
 # Background and return: the vault locked itself.
 - pressKey: Home
@@ -116,6 +125,8 @@ appId: app.memlore.mobile
     timeout: 15000
 - assertNotVisible:
     id: entry-count
+- assertNotVisible:
+    id: entry-title-input
 - tapOn:
     id: password-input
 - inputText: "12345678"
@@ -125,17 +136,20 @@ appId: app.memlore.mobile
     visible:
       id: entry-count
     timeout: 30000
+# The lock removed the entry screen: the unlock lands on the list.
+- assertNotVisible:
+    id: entry-title-input
 
 # Leave the vault on the 1-minute default.
 - tapOn:
-    id: security-button
+    id: settings-tab
 - tapOn:
     id: auto-lock-60
 - assertVisible:
     id: auto-lock-60
     selected: true
 - tapOn:
-    id: security-back-button
+    id: entries-tab
 - extendedWaitUntil:
     visible:
       id: entry-count

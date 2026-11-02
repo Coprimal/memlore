@@ -7,7 +7,9 @@ use crate::AppState;
 
 #[cfg(test)]
 pub(crate) use crate::ops::tags::UpdateTagError;
-pub(crate) use crate::ops::tags::{delete_tag_impl, update_tag_impl};
+pub(crate) use crate::ops::tags::{
+    add_tag_to_entry_impl, delete_tag_impl, remove_tag_from_entry_impl, update_tag_impl,
+};
 
 /// Create a new tag. Returns the created tag.
 #[tauri::command]
@@ -96,36 +98,6 @@ pub fn update_tag(
         payload.color.as_ref().map(|c| c.as_deref()),
     )
     .map_err(|e| e.to_string())
-}
-
-/// Wrap `entry_tags` insert + `touch_entry_updated_at` + `mark_entry_pending`
-/// in one transaction so the tag change and the pending mark are atomic.
-pub(crate) fn add_tag_to_entry_impl(
-    conn: &rusqlite::Connection,
-    entry_id: &str,
-    tag_id: &str,
-) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    db::require_live_entry(&tx, entry_id).map_err(|e| e.to_string())?;
-    db::add_tag_to_entry(&tx, entry_id, tag_id).map_err(|e| e.to_string())?;
-    db::touch_entry_updated_at(&tx, entry_id).map_err(|e| e.to_string())?;
-    db::mark_entry_pending(&tx, entry_id).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
-}
-
-/// Wrap `entry_tags` delete + `touch_entry_updated_at` + `mark_entry_pending`
-/// in one transaction so the tag removal and the pending mark are atomic.
-pub(crate) fn remove_tag_from_entry_impl(
-    conn: &rusqlite::Connection,
-    entry_id: &str,
-    tag_id: &str,
-) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    db::require_live_entry(&tx, entry_id).map_err(|e| e.to_string())?;
-    db::remove_tag_from_entry(&tx, entry_id, tag_id).map_err(|e| e.to_string())?;
-    db::touch_entry_updated_at(&tx, entry_id).map_err(|e| e.to_string())?;
-    db::mark_entry_pending(&tx, entry_id).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Associate a tag with an entry.

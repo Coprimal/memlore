@@ -1,21 +1,23 @@
-import { type ReactNode, useState } from 'react';
+import { type ReactNode, useEffect, useState } from 'react';
 import { ActivityIndicator, KeyboardAvoidingView, ScrollView, Text, TextInput } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { ActionButton } from '@/src/components/ActionButton';
 import { ErrorText, errorMessage } from '@/src/components/ErrorText';
-import { biometricName, SecurityPanel } from '@/src/components/SecurityPanel';
+import { biometricName } from '@/src/components/SecurityPanel';
 import { useScreenPrivacy } from '@/src/hooks/useScreenPrivacy';
-import { useVault } from '@/src/hooks/useVault';
+import { useVault, type Vault } from '@/src/hooks/useVault';
 import { t } from '@/src/i18n';
 
 // Mirrors MIN_PASSWORD_LEN in memlore-engine (vault/mod.rs), which still
 // validates it.
 const MIN_PASSWORD_LEN = 8;
 
-type Vault = ReturnType<typeof useVault>;
-
-export default function Home() {
+/**
+ * Everything shown while the vault is not unlocked. The root layout guards
+ * this route with `!unlocked`, so an unlock replaces it with the tabs.
+ */
+export default function VaultScreen() {
   const vault = useVault();
 
   let body: ReactNode;
@@ -33,7 +35,8 @@ export default function Home() {
       body = <Unlock vault={vault} />;
       break;
     case 'unlocked':
-      body = <Unlocked vault={vault} />;
+      // Only for the frame before the guard swaps this route for the tabs.
+      body = null;
       break;
     case 'boot_file_corrupt':
       body = (
@@ -147,6 +150,13 @@ function Unlock({ vault }: { vault: Vault }) {
   const { available, kind, enabled } = vault.biometric;
   const biometric = biometricName(kind);
 
+  // Mounted only while locked: after an auto-lock, the shield comes off now.
+  // The root layout swaps to this route without animation, so the protected
+  // screen is already covered when this runs.
+  useEffect(() => {
+    vault.lockScreenShown();
+  }, []);
+
   async function submit() {
     if (vault.busy || vault.biometricPrompting || password.length === 0) return;
     await vault.unlock(password);
@@ -184,57 +194,6 @@ function Unlock({ vault }: { vault: Vault }) {
           onPress={() => void vault.unlockWithBiometric()}
         />
       ) : null}
-    </>
-  );
-}
-
-function Unlocked({ vault }: { vault: Vault }) {
-  const { theme } = useUnistyles();
-  const [title, setTitle] = useState('');
-  // Local, not a route: a lock replaces this view, which unmounts the panel.
-  const [showSecurity, setShowSecurity] = useState(false);
-
-  async function submit() {
-    if (vault.busy) return;
-    if (await vault.createEntry(title)) setTitle('');
-  }
-
-  if (showSecurity) {
-    return <SecurityPanel vault={vault} onBack={() => setShowSecurity(false)} />;
-  }
-
-  return (
-    <>
-      <Text style={styles.title}>Memlore</Text>
-      <Text testID="entry-count" style={styles.body}>
-        {t('mobile.entry_count', { count: vault.entryCount ?? '…' })}
-      </Text>
-      <TextInput
-        testID="entry-title-input"
-        style={styles.input}
-        placeholder={t('mobile.entry_title_placeholder')}
-        placeholderTextColor={theme.colors.fgMuted}
-        value={title}
-        onChangeText={setTitle}
-      />
-      <ErrorText message={errorMessage(vault.error)} />
-      <ActionButton
-        testID="new-entry-button"
-        label={t('mobile.new_entry')}
-        disabled={vault.busy}
-        onPress={submit}
-      />
-      <ActionButton
-        testID="security-button"
-        label={t('mobile.security')}
-        onPress={() => setShowSecurity(true)}
-      />
-      <ActionButton
-        testID="lock-button"
-        label={t('mobile.lock')}
-        disabled={vault.busy}
-        onPress={vault.lock}
-      />
     </>
   );
 }

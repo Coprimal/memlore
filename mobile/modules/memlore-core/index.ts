@@ -8,7 +8,8 @@ export type StartupMode = 'first_launch' | 'password_locked' | 'boot_file_corrup
  * ERR_BIOMETRIC_DISABLED: Face ID/Touch ID cannot be used now (not enrolled,
  * locked out, or the unlock found it broken and turned it off); use the
  * password. ERR_BIOMETRIC_CANCELLED: the user dismissed or failed the
- * prompt; nothing changed.
+ * prompt; nothing changed. ERR_NOT_FOUND: the entry, journal or tag does
+ * not exist or is not listed on mobile (deleted, locked or invisible).
  */
 export type MemloreErrorCode =
   | 'ERR_LOCKED'
@@ -16,7 +17,8 @@ export type MemloreErrorCode =
   | 'ERR_IO'
   | 'ERR_FORMAT'
   | 'ERR_BIOMETRIC_DISABLED'
-  | 'ERR_BIOMETRIC_CANCELLED';
+  | 'ERR_BIOMETRIC_CANCELLED'
+  | 'ERR_NOT_FOUND';
 
 /** The device's biometric hardware. */
 export type BiometricKind = 'faceID' | 'touchID' | 'none';
@@ -31,12 +33,54 @@ export interface BiometricStatus {
 /** Auto-lock interval: 0 (immediate), 1, 5 or 15 minutes. */
 export type AutoLockSeconds = 0 | 60 | 300 | 900;
 
+/** The engine only stores these three; null is no emotion. */
+export type Emotion = 'good' | 'neutral' | 'bad';
+
 /** One row of the entry list (locked and invisible entries are never listed). */
-export interface EntryTitle {
+export interface EntryRow {
   id: string;
   title: string | null;
+  previewText: string | null;
   /** Unix seconds. */
   entryDate: number;
+  emotion: Emotion | null;
+  isFavorite: boolean;
+  journalId: string;
+}
+
+/** One page of the entry list, newest first. */
+export interface EntryPage {
+  items: EntryRow[];
+  /** Entries in the whole list, every page. */
+  total: number;
+  hasMore: boolean;
+}
+
+export interface Tag {
+  id: string;
+  name: string;
+  color: string | null;
+}
+
+/** One listed entry with its plain text and tags. */
+export interface EntryDetail extends EntryRow {
+  contentText: string | null;
+  tags: Tag[];
+}
+
+export interface Journal {
+  id: string;
+  name: string;
+  color: string | null;
+}
+
+/** One row of Trash (locked and invisible entries are never listed). */
+export interface TrashRow {
+  id: string;
+  title: string | null;
+  previewText: string | null;
+  /** Unix seconds. */
+  trashedAt: number;
 }
 
 /** Spike 17.1: one file of the picked `MemloreSpike` folder. */
@@ -101,6 +145,11 @@ export interface ScreenCaptureChangeEvent {
   captured: boolean;
 }
 
+/** Save before lock: answer with `flushDone(id)` once the edits are saved. */
+export interface FlushRequestEvent {
+  id: number;
+}
+
 export type MemloreCoreEvents = {
   /**
    * The vault was locked after the auto-lock interval in the background.
@@ -110,6 +159,13 @@ export type MemloreCoreEvents = {
    */
   onAutoLock: () => void;
   onScreenCaptureChange: (event: ScreenCaptureChangeEvent) => void;
+  /**
+   * The app is leaving the foreground while the vault is unlocked: save every
+   * pending edit, then call `flushDone(id)`. Native holds its background
+   * lock for the matching ack, at most ~2 s; it never waits to show the
+   * privacy shield.
+   */
+  onFlushRequest: (event: FlushRequestEvent) => void;
 };
 
 declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
@@ -142,17 +198,57 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
   setAutoLockSeconds(seconds: AutoLockSeconds): Promise<void>;
   /** Takes the privacy shield off after handling `onAutoLock`. */
   releasePrivacyShield(): Promise<void>;
+  /** Answers `onFlushRequest`; an id other than the latest request is ignored. */
+  flushDone(id: number): Promise<void>;
   /** Whether the screen is being recorded, mirrored or AirPlayed now. */
   isScreenCaptured(): Promise<boolean>;
   /** Rejects with ERR_LOCKED while the vault is locked. */
   entryCount(): Promise<number>;
-  /** Creates an entry with an empty body; resolves with its id. */
-  createEntry(title: string): Promise<string>;
-  /** Newest first, at most `limit`. */
-  listEntryTitles(limit: number): Promise<EntryTitle[]>;
+  /**
+   * Page `page` of the entry list (1-based; 0 reads as 1), newest first:
+   * every listed journal, or only `journalId` (ERR_NOT_FOUND unless listed).
+   */
+  listEntries(journalId: string | null, page: number): Promise<EntryPage>;
+  /** Rejects with ERR_NOT_FOUND for an entry the list does not show. */
+  getEntry(id: string): Promise<EntryDetail>;
+  /**
+   * Creates an entry with an empty body in `journalId` (ERR_NOT_FOUND unless
+   * listed), or else in the first visible, unlocked journal; resolves with
+   * its id.
+   */
+  createEntry(title: string, journalId?: string | null): Promise<string>;
+  /** Sets the title as typed; '' clears it. */
+  setEntryTitle(id: string, title: string): Promise<void>;
+  /** null clears the emotion. */
+  setEntryEmotion(id: string, emotion: Emotion | null): Promise<void>;
+  /** Resolves with the new value. */
+  toggleEntryFavorite(id: string): Promise<boolean>;
+  /** Unix seconds (a fraction is dropped); marks the date user-edited. */
+  setEntryDate(id: string, entryDate: number): Promise<void>;
+  /** Both the entry and the journal must be listed (else ERR_NOT_FOUND). */
+  moveEntry(id: string, journalId: string): Promise<void>;
+  trashEntry(id: string): Promise<void>;
+  /** Most recently trashed first. */
+  listTrash(): Promise<TrashRow[]>;
+  /** ERR_NOT_FOUND unless `listTrash` shows the entry. */
+  restoreEntry(id: string): Promise<void>;
+  /** Deletes for good; ERR_NOT_FOUND unless `listTrash` shows the entry. */
+  purgeEntry(id: string): Promise<void>;
+  /**
+   * Deletes for good the confirmed `ids` that `listTrash` still shows; any
+   * other id is skipped. Resolves with how many were deleted.
+   */
+  emptyTrash(ids: string[]): Promise<number>;
+  listJournals(): Promise<Journal[]>;
+  createJournal(name: string): Promise<Journal>;
+  renameJournal(id: string, name: string): Promise<Journal>;
+  listTags(): Promise<Tag[]>;
+  createTag(name: string): Promise<Tag>;
+  addTagToEntry(entryId: string, tagId: string): Promise<void>;
+  removeTagFromEntry(entryId: string, tagId: string): Promise<void>;
   /**
    * The entry's Yjs document (full state) as base64; '' when it has no body
-   * yet. Rejects with ERR_IO for an entry the list does not show.
+   * yet. Rejects with ERR_NOT_FOUND for an entry the list does not show.
    */
   loadEntryYjs(id: string): Promise<string>;
   /**
