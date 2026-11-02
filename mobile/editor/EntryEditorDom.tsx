@@ -9,6 +9,7 @@ import * as Y from 'yjs'
 
 import desktopSchema from './__fixtures__/desktop-schema.json'
 import { installContentPolicy, safeExternalUrl, setLinkHandler } from './contentPolicy'
+import { fromBase64, restoreVersionCommand, setContentCommand } from './editorCommands'
 import { buildMobileExtensions } from './extensions'
 import { schemaDifferences, snapshotSchema } from './schemaSnapshot'
 
@@ -50,12 +51,20 @@ export type FormatState = {
   linkHref: string | null
 }
 
-export type EditorCommand = Exclude<Format, 'link'> | 'setLink' | 'focusEnd' | 'blur'
+export type EditorCommand =
+  | Exclude<Format, 'link'>
+  | 'setLink'
+  | 'focusEnd'
+  | 'blur'
+  | 'setContent'
+  | 'restoreVersion'
 
 /**
  * Native calls `flush()`; the DOM side answers with `onFlushed` once the save
  * is done. `exec` runs a toolbar command (a no-op unless editable); `arg` is
- * the URL for `setLink`, where '' removes the link.
+ * the URL for `setLink`, where '' removes the link, a JSON
+ * `SetContentPayload` (templateBody.ts) for `setContent`, and a version's Yjs
+ * state (base64) for `restoreVersion`. Invalid arguments do nothing.
  */
 export type EntryEditorHandle = {
   flush: () => void
@@ -363,6 +372,8 @@ const COMMANDS: Record<EditorCommand, (editor: Editor, arg: string) => void> = {
   },
   // Not `commands.blur()`: it also clears the selection, which Done keeps.
   blur: (editor) => editor.view.dom.blur(),
+  setContent: setContentCommand,
+  restoreVersion: restoreVersionCommand,
 }
 
 /** Native may send anything across the bridge; unknown commands do nothing. */
@@ -447,14 +458,7 @@ function xmlElementToText(elem: Y.XmlElement): string {
   return BLOCK_TAGS.has(tag) ? result + '\n' : result
 }
 
-// --- base64 (no Uint8Array.fromBase64 on the iOS 17 WebView) --------------
-
-function fromBase64(b64: string): Uint8Array {
-  const binary = atob(b64)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-  return bytes
-}
+// --- base64 (no Uint8Array.toBase64 on the iOS 17 WebView) ----------------
 
 function toBase64(bytes: Uint8Array): string {
   let binary = ''

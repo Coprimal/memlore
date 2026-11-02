@@ -14,12 +14,15 @@ import {
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import EntryEditorDom, { type EntryEditorHandle, type FormatState } from '@/editor/EntryEditorDom';
+import { type SetContentPayload, templateBody } from '@/editor/templateBody';
+import type { Template } from '@/modules/memlore-core';
 import { EditorToolbar } from '@/src/components/EditorToolbar';
 import { EntryMeta, META_ROW_HEIGHT } from '@/src/components/EntryMeta';
 import { EntryPlaceholder, placeholderBody } from '@/src/components/EntryPlaceholder';
 import { ErrorText } from '@/src/components/ErrorText';
 import { getCachedRow, useEntryActions, useEntryDetail } from '@/src/hooks/useEntries';
 import { useEntryDoc } from '@/src/hooks/useEntryDoc';
+import { useTemplateLookup } from '@/src/hooks/useTemplates';
 import { useVault } from '@/src/hooks/useVault';
 import { t } from '@/src/i18n';
 import { registerFlusher } from '@/src/lib/flushRegistry';
@@ -45,10 +48,15 @@ function delay(ms: number): Promise<void> {
  * `getEntry`) and lies over all three until the editor says it is ready; it
  * leaves the meta row's fixed height under its title, so the swap does not
  * jump. Leaving (Back, swipe back) first saves the title and flushes the
- * editor; Move to Trash (header menu) leaves without it.
+ * editor; Move to Trash (header menu) leaves without it. A `template` param
+ * (a new entry from the template picker) fills the body once the editor is
+ * ready, only while it is still empty; the title is left alone.
  */
 export default function EntryScreen() {
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const params = useLocalSearchParams<{ id: string; template?: string | string[] }>();
+  const id = params.id;
+  // A repeated param arrives as an array: only a single id names a template.
+  const templateId = typeof params.template === 'string' ? params.template : undefined;
   const router = useRouter();
   const vault = useVault();
   const { theme } = useUnistyles();
@@ -70,6 +78,10 @@ export default function EntryScreen() {
   const [format, setFormat] = useState<FormatState | null>(null);
   // A tap on the placeholder: focus the editor once it is ready.
   const pendingFocus = useRef(false);
+  const lookupTemplate = useTemplateLookup();
+  // The `template` param's row: undefined while it is read, null when gone.
+  const [template, setTemplate] = useState<Template | null | undefined>(undefined);
+  const templateApplied = useRef(false);
 
   // The title as typed; null until `getEntry` answered (the field is read-only till then).
   const [title, setTitle] = useState<string | null>(null);
@@ -116,6 +128,32 @@ export default function EntryScreen() {
       if (titleTimer.current) clearTimeout(titleTimer.current);
     };
   }, []);
+
+  // Read in parallel with the entry, so applying waits only for the editor.
+  useEffect(() => {
+    if (!templateId) return;
+    let live = true;
+    void lookupTemplate(templateId).then((row) => {
+      if (live) setTemplate(row);
+    });
+    return () => {
+      live = false;
+    };
+  }, [templateId, lookupTemplate]);
+
+  // Once per screen, when both the editor and the row are ready. The DOM side
+  // applies it only to an empty body, so a reopen never applies it twice.
+  useEffect(() => {
+    if (templateApplied.current || !templateId || editable === null) return;
+    if (editable && template === undefined) return;
+    templateApplied.current = true;
+    const body = editable && template ? templateBody(template, t) : null;
+    if (body) {
+      const payload: SetContentPayload = { ...body, onlyIfEmpty: true };
+      editorRef.current?.exec?.('setContent', JSON.stringify(payload));
+    }
+    router.setParams({ template: undefined });
+  }, [templateId, editable, template, router]);
 
   /** Saves the typed title now if it changed; resolves once every title save ended. */
   const flushTitle = useCallback((): Promise<void> => {

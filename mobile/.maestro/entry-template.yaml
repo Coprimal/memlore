@@ -1,0 +1,69 @@
+# New entry from a template (M3b task 3.7): Daily reflection fills the body
+# with its "Today" / "Tomorrow" headings, the list preview shows them, and a
+# reopen still shows the saved body.
+#
+# Runs against the Release simulator build (see vault-create-unlock.yaml):
+#   pnpm mobile:ios:release
+#   pnpm mobile:e2e
+# clearState wipes the app's container, so the flow creates its own vault.
+appId: app.memlore.mobile
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible:
+      id: backup-notice
+    timeout: 15000
+- tapOn:
+    id: password-input
+- inputText: "12345678"
+- tapOn:
+    id: confirm-password-input
+- inputText: "12345678"
+- tapOn:
+    id: create-vault-button
+- extendedWaitUntil:
+    visible:
+      id: recovery-phrase
+    timeout: 30000
+- tapOn:
+    id: phrase-saved-button
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+    timeout: 15000
+
+# Daily reflection is the second built-in (Blank, Daily reflection, Morning pages).
+- tapOn:
+    id: new-from-template-button
+- extendedWaitUntil:
+    visible:
+      id: template-option-1
+    timeout: 5000
+- tapOn:
+    id: template-option-1
+- extendedWaitUntil:
+    notVisible:
+      id: entry-placeholder
+    timeout: 15000
+- extendedWaitUntil:
+    visible: "Today"
+    timeout: 10000
+- assertVisible: "Tomorrow"
+
+# The template body is saved: the list preview shows it.
+- tapOn:
+    point: "10%,7%"
+- extendedWaitUntil:
+    visible:
+      text: ".*Today.*"
+    timeout: 10000
+
+# A reopen shows the saved body.
+- tapOn:
+    id: entry-row-0
+- extendedWaitUntil:
+    notVisible:
+      id: entry-placeholder
+    timeout: 15000
+- assertVisible: "Today"

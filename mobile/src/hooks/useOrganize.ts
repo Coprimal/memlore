@@ -23,7 +23,7 @@ export { TRASH_RETENTION_DAYS, trashDaysLeft } from '@/src/lib/trashRetention';
  * A list read with `load` on every focus of the screen (and by `refresh`).
  * `error` is a failed read; ERR_LOCKED shows the lock screen instead.
  */
-function useFocusList<T>(load: () => Promise<T[]>) {
+export function useFocusList<T>(load: () => Promise<T[]>) {
   const vault = useVault();
   const [items, setItems] = useState<T[]>([]);
   const [loading, setLoading] = useState(true);
@@ -80,7 +80,7 @@ function useChangeFailure(refresh: () => Promise<void>) {
  * `useChangeFailure`, then the refusal's code for the screen to show
  * (ERR_IO for an error without a known code).
  */
-function useCodedFailure(refresh: () => Promise<void>) {
+export function useCodedFailure(refresh: () => Promise<void>) {
   const onFail = useChangeFailure(refresh);
   return (e: unknown): MemloreErrorCode => {
     onFail(e);
