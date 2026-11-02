@@ -1,14 +1,24 @@
 import { Stack, useLocalSearchParams, usePreventRemove, useRouter } from 'expo-router';
 import { useHeaderHeight } from 'expo-router/react-navigation';
+import { SymbolView } from 'expo-symbols';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, KeyboardAvoidingView, Linking, TextInput, View } from 'react-native';
+import {
+  ActionSheetIOS,
+  Alert,
+  KeyboardAvoidingView,
+  Linking,
+  Pressable,
+  TextInput,
+  View,
+} from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import EntryEditorDom, { type EntryEditorHandle, type FormatState } from '@/editor/EntryEditorDom';
 import { EditorToolbar } from '@/src/components/EditorToolbar';
+import { EntryMeta, META_ROW_HEIGHT } from '@/src/components/EntryMeta';
 import { EntryPlaceholder, placeholderBody } from '@/src/components/EntryPlaceholder';
 import { ErrorText } from '@/src/components/ErrorText';
-import { getCachedRow, useEntryDetail } from '@/src/hooks/useEntries';
+import { getCachedRow, useEntryActions, useEntryDetail } from '@/src/hooks/useEntries';
 import { useEntryDoc } from '@/src/hooks/useEntryDoc';
 import { useVault } from '@/src/hooks/useVault';
 import { t } from '@/src/i18n';
@@ -30,10 +40,12 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * One entry: its title field above the DOM editor. The placeholder paints in
- * the push's frame from the list's row cache (then from `getEntry`) and lies
- * over both until the editor says it is ready, so the swap does not jump.
- * Leaving (Back, swipe back) first saves the title and flushes the editor.
+ * One entry: its title field and meta row above the DOM editor. The
+ * placeholder paints in the push's frame from the list's row cache (then from
+ * `getEntry`) and lies over all three until the editor says it is ready; it
+ * leaves the meta row's fixed height under its title, so the swap does not
+ * jump. Leaving (Back, swipe back) first saves the title and flushes the
+ * editor; Move to Trash (header menu) leaves without it.
  */
 export default function EntryScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -46,7 +58,8 @@ export default function EntryScreen() {
   // Both reads start in the same frame and run in parallel.
   const entry = useEntryDetail(id);
   const doc = useEntryDoc(id);
-  const notFound = entry.notFound || doc.status === 'notFound';
+  const actions = useEntryActions(id, entry.detail);
+  const notFound = entry.notFound || doc.status === 'notFound' || actions.notFound;
   const failed = !notFound && (entry.failed || doc.status === 'failed');
 
   const editorRef = useRef<EntryEditorHandle>(null);
@@ -70,6 +83,8 @@ export default function EntryScreen() {
   const flushWaiters = useRef(new Set<() => void>());
   const [leaving, setLeaving] = useState(false);
   const flushing = useRef(false);
+  // Moved to Trash: the leave must not save (the entry is gone).
+  const trashed = useRef(false);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -144,7 +159,11 @@ export default function EntryScreen() {
 
   /** Title and body saved (or the cap passed). */
   const flushEntry = useCallback(
-    () => Promise.race([Promise.all([flushTitle(), flushEditor()]), delay(FLUSH_CAP_MS)]),
+    // A trashed entry is never saved again (the engine refuses it anyway).
+    () =>
+      trashed.current
+        ? Promise.resolve()
+        : Promise.race([Promise.all([flushTitle(), flushEditor()]), delay(FLUSH_CAP_MS)]),
     [flushTitle, flushEditor],
   );
 
@@ -160,6 +179,11 @@ export default function EntryScreen() {
   // Back and swipe back wait for the saves. Never while locked: the lock's
   // removal of this screen must go through at once.
   usePreventRemove(vault.status === 'unlocked' && !leaving && !notFound, ({ repeat }) => {
+    // `leaving` from a trash may not have rendered yet: let the pop through.
+    if (trashed.current) {
+      repeat();
+      return;
+    }
     if (flushing.current) return;
     flushing.current = true;
     void flushEntry().then(() => {
@@ -199,6 +223,39 @@ export default function EntryScreen() {
     ]);
   }, []);
 
+  /** `actions.trash()` saves the open edits first; on success the screen goes back. */
+  const moveToTrash = useCallback(async () => {
+    if (!(await actions.trash())) return;
+    // A lock during the trash's flush already removed the screen.
+    if (!mounted.current) return;
+    trashed.current = true;
+    setLeaving(true);
+    if (router.canGoBack()) router.back();
+    else router.replace('/');
+  }, [actions.trash, router]);
+
+  /** The header menu: Move to Trash, then its confirmation (decision 7). */
+  const openMenu = useCallback(() => {
+    ActionSheetIOS.showActionSheetWithOptions(
+      {
+        options: [t('editor:entry_card.delete_title'), t('common:confirm_dialog.cancel')],
+        destructiveButtonIndex: 0,
+        cancelButtonIndex: 1,
+      },
+      (index) => {
+        if (index !== 0) return;
+        Alert.alert(t('editor:entry_card.delete_title'), t('mobile.trash_confirm_body'), [
+          { text: t('editor:entry_card.delete_cancel'), style: 'cancel' },
+          {
+            text: t('editor:entry_card.delete_confirm'),
+            style: 'destructive',
+            onPress: () => void moveToTrash(),
+          },
+        ]);
+      },
+    );
+  }, [moveToTrash]);
+
   const onChangeTitle = (value: string) => {
     titleRef.current = value;
     setTitle(value);
@@ -209,7 +266,7 @@ export default function EntryScreen() {
   if (notFound || failed) {
     return (
       <View style={styles.screen}>
-        <Stack.Screen options={{ headerTitle: '' }} />
+        <Stack.Screen options={{ headerTitle: '', headerRight: () => null }} />
         <View style={styles.message}>
           <ErrorText message={notFound ? t('editor:panel.not_found') : t('mobile.error')} />
         </View>
@@ -225,7 +282,22 @@ export default function EntryScreen() {
 
   return (
     <View style={styles.screen}>
-      <Stack.Screen options={{ headerTitle: '' }} />
+      <Stack.Screen
+        options={{
+          headerTitle: '',
+          headerRight: () => (
+            <Pressable
+              testID="entry-menu"
+              accessibilityRole="button"
+              accessibilityLabel={t('editor:pills.more_aria')}
+              hitSlop={8}
+              onPress={openMenu}
+            >
+              <SymbolView name="ellipsis.circle" tintColor={theme.colors.accentText} size={24} />
+            </Pressable>
+          ),
+        }}
+      />
       {/* The WebView frame ends at the toolbar, which sits right above the keyboard. */}
       <KeyboardAvoidingView
         style={styles.screen}
@@ -244,6 +316,7 @@ export default function EntryScreen() {
           placeholderTextColor={theme.colors.fgMuted}
           returnKeyType="done"
         />
+        <EntryMeta meta={actions.meta} actions={actions} canAddTags={entry.detail !== null} />
         <View style={styles.editor}>
           {doc.status === 'ready' && doc.stateB64 !== null ? (
             <EntryEditorDom
@@ -267,6 +340,7 @@ export default function EntryScreen() {
           title={placeholderTitle}
           body={body}
           style={StyleSheet.absoluteFill}
+          spacerHeight={META_ROW_HEIGHT}
           onPress={() => {
             pendingFocus.current = true;
           }}

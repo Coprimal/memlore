@@ -5,7 +5,7 @@ import { useUnistyles } from 'react-native-unistyles';
 
 import { t } from '@/src/i18n';
 
-/** The tab bar; Journals joins Entries and Settings in Phase 4. */
+/** The tab bar: Entries, Journals and Settings. */
 export default function TabsLayout() {
   const { theme } = useUnistyles();
   return (
@@ -29,6 +29,14 @@ export default function TabsLayout() {
           title: t('nav:entries'),
           tabBarButtonTestID: 'entries-tab',
           tabBarIcon: ({ color, size }) => tabIcon('book', color, size),
+        }}
+      />
+      <Tabs.Screen
+        name="journals"
+        options={{
+          title: t('mobile.tab_journals'),
+          tabBarButtonTestID: 'journals-tab',
+          tabBarIcon: ({ color, size }) => tabIcon('books.vertical', color, size),
         }}
       />
       <Tabs.Screen

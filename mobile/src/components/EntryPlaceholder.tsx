@@ -26,12 +26,15 @@ export function placeholderBody(text: string): string {
  * `style` lets a screen lay it over the editor (`StyleSheet.absoluteFill`);
  * `onPress` gets a tap on it (the screen focuses the editor once it is ready).
  * The title is one line, like the screen's single-line title field.
+ * `spacerHeight` leaves room under the title for a row the screen draws there
+ * (the entry's meta row), so the body starts where the editor does.
  */
 export function EntryPlaceholder(props: {
   title: string | null;
   body: string | null;
   style?: StyleProp<ViewStyle>;
   onPress?: () => void;
+  spacerHeight?: number;
 }) {
   const title = props.title?.trim();
   return (
@@ -46,6 +49,7 @@ export function EntryPlaceholder(props: {
       <Text style={[styles.title, !title && styles.untitled]} numberOfLines={1}>
         {title || t('nav:media_gallery.untitled')}
       </Text>
+      {props.spacerHeight ? <View style={{ height: props.spacerHeight }} /> : null}
       <View style={styles.body}>
         {props.body ? <Text style={styles.text}>{props.body}</Text> : null}
       </View>

@@ -1,4 +1,4 @@
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, Pressable, SectionList, Text, View } from 'react-native';
@@ -6,7 +6,9 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import type { EntryRow } from '@/modules/memlore-core';
 import { ErrorText } from '@/src/components/ErrorText';
+import { JournalPicker } from '@/src/components/JournalPicker';
 import { useEntries } from '@/src/hooks/useEntries';
+import { useJournals } from '@/src/hooks/useOrganize';
 import { activeLocale, t } from '@/src/i18n';
 import { type DayKey, groupByDay } from '@/src/lib/dayGroups';
 
@@ -34,10 +36,18 @@ function dayLabel(key: DayKey, now: Date): string {
   return (year === now.getFullYear() ? dayFormat : dayYearFormat).format(date);
 }
 
-/** The entries of every listed journal, newest first, grouped by day. */
+/**
+ * The entries of every listed journal, or of the one in the `journal` param
+ * (set by the Journals tab and the filter picker), newest first, grouped by day.
+ */
 export default function EntriesScreen() {
   const router = useRouter();
-  const list = useEntries(null);
+  const params = useLocalSearchParams<{ journal?: string }>();
+  // '' (the picker's "All journals") and a missing param both mean no filter.
+  const journalId = typeof params.journal === 'string' && params.journal ? params.journal : null;
+  const list = useEntries(journalId);
+  const { journals } = useJournals();
+  const [pickerOpen, setPickerOpen] = useState(false);
   // The new-entry button dims at once while `createEntry` runs.
   const [creating, setCreating] = useState(false);
   const showSpinner = useDelayed(list.loading && list.rows.length === 0, SPINNER_DELAY_MS);
@@ -50,6 +60,16 @@ export default function EntriesScreen() {
     // The flat index across sections, for `entry-row-<index>`.
     data: group.items.map((row) => ({ row, index: index++ })),
   }));
+
+  // The filtered journal's name; "All journals" too until the list knows it.
+  const filterLabel =
+    journals.find((journal) => journal.id === journalId)?.name ??
+    t('nav:entry_list.filter.journal.all');
+
+  function selectJournal(id: string | null) {
+    setPickerOpen(false);
+    router.setParams({ journal: id ?? '' });
+  }
 
   // The tap navigates in the same frame; the entry screen shows the cached row.
   function open(id: string) {
@@ -70,9 +90,25 @@ export default function EntriesScreen() {
   return (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Text testID="entry-count" style={styles.count}>
-          {list.total === null ? '…' : t('nav:entry_list.entry_count', { count: list.total })}
-        </Text>
+        <View style={styles.headerStart}>
+          <Pressable
+            testID="journal-filter-button"
+            accessibilityRole="button"
+            accessibilityLabel={t('nav:entry_list.filter.journal.menu_label')}
+            accessibilityValue={{ text: filterLabel }}
+            hitSlop={8}
+            onPress={() => setPickerOpen(true)}
+            style={styles.filter}
+          >
+            <Text style={styles.filterLabel} numberOfLines={1}>
+              {filterLabel}
+            </Text>
+            <FilterChevron />
+          </Pressable>
+          <Text testID="entry-count" style={styles.count}>
+            {list.total === null ? '…' : t('nav:entry_list.entry_count', { count: list.total })}
+          </Text>
+        </View>
         <Pressable
           testID="new-entry-button"
           accessibilityRole="button"
@@ -107,8 +143,21 @@ export default function EntriesScreen() {
         }
         ListFooterComponent={list.loadingMore ? <DelayedFooterSpinner /> : undefined}
       />
+      <JournalPicker
+        visible={pickerOpen}
+        title={t('nav:entry_list.filter.journal.menu_label')}
+        selectedId={journalId}
+        includeAll
+        onSelect={selectJournal}
+        onClose={() => setPickerOpen(false)}
+      />
     </View>
   );
+}
+
+function FilterChevron() {
+  const { theme } = useUnistyles();
+  return <SymbolView name="chevron.down" tintColor={theme.colors.fgSecondary} size={13} />;
 }
 
 function NewEntryIcon() {
@@ -214,6 +263,22 @@ const styles = StyleSheet.create((theme) => ({
     justifyContent: 'space-between',
     paddingVertical: theme.space(2),
     paddingHorizontal: theme.space(4),
+  },
+  headerStart: {
+    flex: 1,
+    gap: theme.space(0.5),
+  },
+  filter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    gap: theme.space(1),
+  },
+  filterLabel: {
+    flexShrink: 1,
+    fontSize: 17,
+    fontWeight: '600',
+    color: theme.colors.fg,
   },
   count: {
     fontSize: 15,
