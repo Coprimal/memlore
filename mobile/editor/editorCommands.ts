@@ -28,15 +28,17 @@ export function setContentCommand(editor: Editor, arg: string): void {
 /**
  * Desktop EditorPanel's restore: the version's document (its Yjs state,
  * base64) replaces the current one as an edit, so other devices' changes
- * merge, not clobber.
+ * merge, not clobber. True when it was applied; false when refused (bytes
+ * that do not decode, an empty or invalid document), the entry unchanged.
  */
-export function restoreVersionCommand(editor: Editor, arg: string): void {
+export function restoreVersionCommand(editor: Editor, arg: string): boolean {
   const tmp = new Y.Doc()
   try {
     Y.applyUpdate(tmp, fromBase64(arg))
-    replaceWithJson(editor, yDocToProsemirrorJSON(tmp, 'default') as JSONContent)
+    return replaceWithJson(editor, yDocToProsemirrorJSON(tmp, 'default') as JSONContent)
   } catch {
     // Bytes that do not decode: the entry stays as it is.
+    return false
   } finally {
     tmp.destroy()
   }
@@ -46,12 +48,14 @@ export function restoreVersionCommand(editor: Editor, arg: string): void {
  * `setContent` of a JSON document, refused whole when the schema cannot hold
  * it. Without `errorOnInvalidContent`, tiptap swaps invalid JSON for an empty
  * document and the entry would be wiped. It throws before any dispatch.
+ * True when the document was replaced.
  */
-function replaceWithJson(editor: Editor, doc: JSONContent): void {
+function replaceWithJson(editor: Editor, doc: JSONContent): boolean {
   try {
-    editor.commands.setContent(doc, { emitUpdate: true, errorOnInvalidContent: true })
+    return editor.commands.setContent(doc, { emitUpdate: true, errorOnInvalidContent: true })
   } catch {
     // Not a document of this schema: nothing is written.
+    return false
   }
 }
 

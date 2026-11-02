@@ -7,6 +7,7 @@ import MemloreCore, {
   type MemloreErrorCode,
 } from '@/modules/memlore-core';
 import { flushAll } from '@/src/lib/flushRegistry';
+import { clearPendingRestore } from '@/src/lib/pendingRestore';
 import { clearRowCache, enableRowCache } from '@/src/lib/rowCache';
 
 export type VaultStatus =
@@ -221,6 +222,7 @@ function useVaultState() {
   /** Drops everything read from the vault and shows the lock screen. */
   function showLocked() {
     clearRowCache();
+    clearPendingRestore();
     setError(null);
     setAutoLockValue(null);
     setStatus('locked');

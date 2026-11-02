@@ -38,7 +38,8 @@ const versionB64 = toBase64(Y.encodeStateAsUpdate(versionDoc))
 
 const payload = (body: object, onlyIfEmpty: boolean) => JSON.stringify({ ...body, onlyIfEmpty })
 
-type Run = (editor: Editor) => void
+// `restoreVersion` also returns whether it applied (native shows a failure).
+type Run = (editor: Editor) => boolean | void
 // Each command on an entry with a body: `null` expects the Y.Doc untouched,
 // a document expects the fragment to become exactly it.
 const cases: [name: string, run: Run, expected: JSONContent | null][] = [
@@ -63,6 +64,11 @@ const cases: [name: string, run: Run, expected: JSONContent | null][] = [
   [
     'restoreVersion of bytes that are not a Yjs update is ignored',
     (e) => restoreVersionCommand(e, toBase64(new TextEncoder().encode('not a yjs update'))),
+    null,
+  ],
+  [
+    'restoreVersion of a version with an empty document is refused',
+    (e) => restoreVersionCommand(e, toBase64(Y.encodeStateAsUpdate(new Y.Doc()))),
     null,
   ],
   // Positive controls: the harness sees a write when one is allowed.
@@ -98,8 +104,10 @@ describe('editor commands', () => {
     const updates: Uint8Array[] = []
     doc.on('update', (update: Uint8Array) => updates.push(update))
 
-    run(editor)
+    const result = run(editor)
     await settle()
+
+    if (typeof result === 'boolean') expect(result).toBe(expected !== null)
 
     if (expected === null) {
       expect(updates).toHaveLength(0)

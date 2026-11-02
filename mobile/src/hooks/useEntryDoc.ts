@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-import MemloreCore from '@/modules/memlore-core';
+import MemloreCore, { type MemloreErrorCode } from '@/modules/memlore-core';
 import { errorCode, useVault } from '@/src/hooks/useVault';
 import { getCachedRow, putCachedRow } from '@/src/lib/rowCache';
+import { createVersionSession } from '@/src/lib/versionSession';
 
 export type EntryDocStatus = 'loading' | 'ready' | 'notFound' | 'failed';
+
+/** A version's Yjs document (base64), or why it could not be read. */
+export type VersionRead = { b64: string } | { error: MemloreErrorCode };
 
 /**
  * One entry's Yjs document for the DOM editor: the stored full state
@@ -13,11 +17,24 @@ export type EntryDocStatus = 'loading' | 'ready' | 'notFound' | 'failed';
  * desktop editor. ERR_LOCKED shows the lock screen; ERR_NOT_FOUND (the entry
  * is gone, locked or invisible) sets `status` to 'notFound'. Components use
  * this, never the native module.
+ *
+ * Version history, like the desktop: the first content save of a session
+ * keeps the STORED doc as a version before it saves. A session is one load of
+ * the entry, or a save after more than 10 min since the last one.
+ * `markSnapshotTaken` skips the next snapshot (the pre-restore one was taken);
+ * `snapshot` and `versionContent` are the restore's two reads, and
+ * `lastSaveError` says whether the body on screen is stored (null) first.
  */
 export function useEntryDoc(id: string) {
   const vault = useVault();
   const [stateB64, setStateB64] = useState<string | null>(null);
   const [status, setStatus] = useState<EntryDocStatus>('loading');
+  const sessionRef = useRef(createVersionSession());
+  // The outcome of the last body save started: null once it succeeded, its
+  // error code (ERR_IO when unknown) when it failed. An older save's outcome
+  // is ignored: each save sends the full state, so the newest one decides.
+  const saveError = useRef<MemloreErrorCode | null>(null);
+  const saveSeq = useRef(0);
 
   /** Maps a load or save error; anything but these two leaves `status` alone. */
   function onError(e: unknown) {
@@ -28,6 +45,8 @@ export function useEntryDoc(id: string) {
 
   useEffect(() => {
     let cancelled = false;
+    sessionRef.current = createVersionSession();
+    saveError.current = null;
     setStatus('loading');
     setStateB64(null);
     MemloreCore.loadEntryYjs(id)
@@ -49,12 +68,43 @@ export function useEntryDoc(id: string) {
   /** Rejects when the save failed, so the editor retries on its next edit. */
   const save = useCallback(
     async (fullStateB64: string, contentText: string, previewText: string) => {
+      const session = sessionRef.current;
+      const now = Date.now();
+      const seq = ++saveSeq.current;
+      const settle = (code: MemloreErrorCode | null) => {
+        if (seq === saveSeq.current) saveError.current = code;
+      };
+      // The snapshot keeps the stored doc as it was before this save:
+      // - it is awaited before saveEntryYjs in this same handler;
+      // - the Swift engineQueue is serial, so it runs before that save;
+      // - an overlapping second save sees the guard already set and skips it;
+      // - a reordered older full-state merge is a CRDT no-op;
+      // - until M2 nothing else writes the stored doc between saves.
+      if (session.shouldSnapshot(now)) {
+        try {
+          const versionId = await MemloreCore.snapshotEntryVersion(id);
+          // Blank stored text: nothing kept, the next save tries again.
+          if (versionId === null) session.result(false);
+        } catch (e) {
+          // Best effort: a missed snapshot is one fewer checkpoint. Other
+          // errors (ERR_NOT_FOUND) come back from the save below.
+          if (errorCode(e) === 'ERR_LOCKED') {
+            session.result(false);
+            settle('ERR_LOCKED');
+            onError(e);
+            throw e;
+          }
+        }
+      }
       try {
         await MemloreCore.saveEntryYjs(id, fullStateB64, contentText, previewText);
       } catch (e) {
+        settle(errorCode(e) ?? 'ERR_IO');
         onError(e);
         throw e;
       }
+      settle(null);
+      session.noteSave(now);
     },
     [id],
   );
@@ -74,5 +124,50 @@ export function useEntryDoc(id: string) {
     if (row) putCachedRow({ ...row, title: title === '' ? null : title });
   }, []);
 
-  return { stateB64, status, save, saveTitle };
+  const markSnapshotTaken = useCallback(() => sessionRef.current.markTaken(Date.now()), []);
+
+  /** Why the last body save failed, or null when it succeeded (or none ran). */
+  const lastSaveError = useCallback(() => saveError.current, []);
+
+  /**
+   * Keeps the stored doc as a version now, outside the session (the
+   * pre-restore snapshot, taken on every restore like the desktop). Resolves
+   * the version id, or null when the stored text is blank (nothing kept).
+   * Rejects when it failed.
+   */
+  const snapshot = useCallback(async (): Promise<string | null> => {
+    try {
+      return await MemloreCore.snapshotEntryVersion(id);
+    } catch (e) {
+      onError(e);
+      throw e;
+    }
+  }, [id]);
+
+  /** A version's Yjs document (base64), or the read's error code (ERR_IO when unknown). */
+  const versionContent = useCallback(
+    async (versionId: string): Promise<VersionRead> => {
+      try {
+        return { b64: await MemloreCore.getEntryVersionContent(id, versionId) };
+      } catch (e) {
+        const code = errorCode(e) ?? 'ERR_IO';
+        if (code === 'ERR_LOCKED') vault.markLocked();
+        // ERR_NOT_FOUND: the version was pruned, or the entry is gone; the
+        // entry's own reads say which.
+        return { error: code };
+      }
+    },
+    [id],
+  );
+
+  return {
+    stateB64,
+    status,
+    save,
+    saveTitle,
+    markSnapshotTaken,
+    lastSaveError,
+    snapshot,
+    versionContent,
+  };
 }

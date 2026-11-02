@@ -64,7 +64,8 @@ export type EditorCommand =
  * is done. `exec` runs a toolbar command (a no-op unless editable); `arg` is
  * the URL for `setLink`, where '' removes the link, a JSON
  * `SetContentPayload` (templateBody.ts) for `setContent`, and a version's Yjs
- * state (base64) for `restoreVersion`. Invalid arguments do nothing.
+ * state (base64) for `restoreVersion`, which answers with `onRestored`.
+ * Invalid arguments do nothing.
  */
 export type EntryEditorHandle = {
   flush: () => void
@@ -102,6 +103,12 @@ interface Props {
   onFormatState: (state: FormatState) => Promise<void>
   /** A tap on a link, only for an absolute http(s) or mailto URL; nothing navigates here. */
   onLinkPress: (url: string) => Promise<void>
+  /**
+   * After each `restoreVersion` in editable mode: false when it was refused
+   * (bytes that do not decode, an empty or invalid document); the entry is
+   * then unchanged. Read-only modes never answer: native checks `editable`.
+   */
+  onRestored: (ok: boolean) => Promise<void>
   readOnly: boolean
   ref?: Ref<EntryEditorHandle>
   dom?: DOMProps
@@ -128,6 +135,7 @@ export default function EntryEditorDom({
   onReady,
   onFormatState,
   onLinkPress,
+  onRestored,
   readOnly,
   ref,
 }: Props) {
@@ -142,6 +150,8 @@ export default function EntryEditorDom({
   onFormatStateRef.current = onFormatState
   const onLinkPressRef = useRef(onLinkPress)
   onLinkPressRef.current = onLinkPress
+  const onRestoredRef = useRef(onRestored)
+  onRestoredRef.current = onRestored
   /** Saves now what the debounce would save later; a no-op when read-only. */
   const flushRef = useRef<() => Promise<void>>(() => Promise.resolve())
   /** Runs a toolbar command; a no-op until the editable editor exists. */
@@ -226,12 +236,15 @@ export default function EntryEditorDom({
     let lastSaved = Y.snapshot(doc)
     let timer: ReturnType<typeof setTimeout> | null = null
     let inFlight: Promise<void> = Promise.resolve()
+    // True while a save is on its way to native (lastSaved already moved on).
+    let saving = false
     const save = () => {
       if (timer) clearTimeout(timer)
       timer = null
       const current = Y.snapshot(doc)
       if (Y.equalSnapshots(lastSaved, current)) return
       lastSaved = current
+      saving = true
       const contentText = extractPlainText(doc)
       inFlight = onUpdateRef
         .current(
@@ -242,6 +255,9 @@ export default function EntryEditorDom({
         .catch(() => {
           // Retry on the next edit or flush: the stored doc is unchanged.
           lastSaved = Y.snapshot(new Y.Doc())
+        })
+        .finally(() => {
+          saving = false
         })
     }
     flushRef.current = async () => {
@@ -281,7 +297,15 @@ export default function EntryEditorDom({
     editor.on('focus', onFormatChange)
     editor.on('blur', onFormatChange)
     execRef.current = (cmd, arg) => {
-      if (!editor.isDestroyed) COMMANDS[cmd](editor, arg)
+      if (editor.isDestroyed) return
+      if (cmd === 'restoreVersion') {
+        // Refuse while anything is unsaved (typed after native's flush, a save
+        // still on its way, or a failed save): the pre-restore snapshot holds
+        // only the stored doc, so replacing unsaved text would leave it in no
+        // version.
+        const unsaved = saving || !Y.equalSnapshots(lastSaved, Y.snapshot(doc))
+        void onRestoredRef.current(!unsaved && restoreVersionCommand(editor, arg))
+      } else COMMANDS[cmd](editor, arg)
     }
 
     return () => {

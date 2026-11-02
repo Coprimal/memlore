@@ -1,4 +1,10 @@
-import { Stack, useLocalSearchParams, usePreventRemove, useRouter } from 'expo-router';
+import {
+  Stack,
+  useFocusEffect,
+  useLocalSearchParams,
+  usePreventRemove,
+  useRouter,
+} from 'expo-router';
 import { useHeaderHeight } from 'expo-router/react-navigation';
 import { SymbolView } from 'expo-symbols';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -15,7 +21,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import EntryEditorDom, { type EntryEditorHandle, type FormatState } from '@/editor/EntryEditorDom';
 import { type SetContentPayload, templateBody } from '@/editor/templateBody';
-import type { Template } from '@/modules/memlore-core';
+import type { MemloreErrorCode, Template } from '@/modules/memlore-core';
 import { EditorToolbar } from '@/src/components/EditorToolbar';
 import { EntryMeta, META_ROW_HEIGHT } from '@/src/components/EntryMeta';
 import { EntryPlaceholder, placeholderBody } from '@/src/components/EntryPlaceholder';
@@ -23,7 +29,8 @@ import { ErrorText } from '@/src/components/ErrorText';
 import { getCachedRow, useEntryActions, useEntryDetail } from '@/src/hooks/useEntries';
 import { useEntryDoc } from '@/src/hooks/useEntryDoc';
 import { useTemplateLookup } from '@/src/hooks/useTemplates';
-import { useVault } from '@/src/hooks/useVault';
+import { errorCode, useVault } from '@/src/hooks/useVault';
+import { type PendingRestore, takePendingRestore } from '@/src/hooks/useVersions';
 import { t } from '@/src/i18n';
 import { registerFlusher } from '@/src/lib/flushRegistry';
 
@@ -42,6 +49,12 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Says the restore failed, unless the lock screen (ERR_LOCKED) already shows. */
+function restoreFailed(code: MemloreErrorCode | null = null) {
+  if (code === 'ERR_LOCKED') return;
+  Alert.alert(t('editor:versionHistory.restore_failed'));
+}
+
 /**
  * One entry: its title field and meta row above the DOM editor. The
  * placeholder paints in the push's frame from the list's row cache (then from
@@ -50,7 +63,10 @@ function delay(ms: number): Promise<void> {
  * jump. Leaving (Back, swipe back) first saves the title and flushes the
  * editor; Move to Trash (header menu) leaves without it. A `template` param
  * (a new entry from the template picker) fills the body once the editor is
- * ready, only while it is still empty; the title is left alone.
+ * ready, only while it is still empty; the title is left alone. Version
+ * history (header menu) opens at once while it saves; a restore confirmed
+ * there runs here on return, after a snapshot of the current content (desktop
+ * EditorPanel).
  */
 export default function EntryScreen() {
   const params = useLocalSearchParams<{ id: string; template?: string | string[] }>();
@@ -74,6 +90,10 @@ export default function EntryScreen() {
   const [overlay, setOverlay] = useState(true);
   // From `onReady`: null until the editor is ready, false when it opened read-only.
   const [editable, setEditable] = useState<boolean | null>(null);
+  // The same, for callbacks that must not wait for a render.
+  const editableRef = useRef<boolean | null>(null);
+  // A restore taken on focus before the editor was ready: run by `onReady`.
+  const parkedRestore = useRef<PendingRestore | null>(null);
   // From `onFormatState`: the toolbar shows while `focused`.
   const [format, setFormat] = useState<FormatState | null>(null);
   // A tap on the placeholder: focus the editor once it is ready.
@@ -173,24 +193,26 @@ export default function EntryScreen() {
   }, [id, doc.saveTitle]);
 
   /**
-   * Asks the editor to save what its debounce holds and resolves on its
-   * `onFlushed`, or after `FLUSH_CAP_MS`; at once when the editor has not
-   * registered its handle yet (nothing typed). Any `onFlushed` answers every
-   * flush waiting: two flushes overlap only within one leave or lock.
+   * Asks the editor to save what its debounce holds and resolves true on its
+   * `onFlushed` (the save ended, maybe failed: see `doc.lastSaveError`), false
+   * after `FLUSH_CAP_MS`; true at once when the editor has not registered its
+   * handle yet (nothing typed). Any `onFlushed` answers every flush waiting:
+   * two flushes overlap only within one leave, lock, or history round trip.
    */
   // TODO(later): expo/dom can log an unhandled DomWebView rejection after Back
   // (docs/LATER.md "Mobile M3a notes").
-  const flushEditor = useCallback((): Promise<void> => {
+  const flushEditor = useCallback((): Promise<boolean> => {
     const flush = editorRef.current?.flush;
-    if (!flush) return Promise.resolve();
-    return new Promise<void>((resolve) => {
-      const done = () => {
+    if (!flush) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      const finish = (flushed: boolean) => {
         clearTimeout(timer);
-        flushWaiters.current.delete(done);
-        resolve();
+        flushWaiters.current.delete(answered);
+        resolve(flushed);
       };
-      const timer = setTimeout(done, FLUSH_CAP_MS);
-      flushWaiters.current.add(done);
+      const answered = () => finish(true);
+      const timer = setTimeout(() => finish(false), FLUSH_CAP_MS);
+      flushWaiters.current.add(answered);
       flush();
     });
   }, []);
@@ -236,12 +258,86 @@ export default function EntryScreen() {
     for (const done of [...flushWaiters.current]) done();
   }, []);
 
-  const onReady = useCallback(async (canEdit: boolean) => {
-    setEditable(canEdit);
-    setOverlay(false);
-    if (!pendingFocus.current || !canEdit) return;
-    pendingFocus.current = false;
-    editorRef.current?.exec?.('focusEnd');
+  /**
+   * Desktop's restore: the body is saved, then the stored content is kept as
+   * a version (none when blank, as desktop), then the version replaces the
+   * body as an edit. A save that failed or did not end within the cap, a
+   * failed snapshot or a failed read aborts with nothing changed: the
+   * snapshot reads the STORED doc, so restoring over unsaved edits would lose
+   * them from every version. The editor answers the restore with `onRestored`.
+   */
+  const runRestore = useCallback(
+    async (restore: PendingRestore) => {
+      const flushed = await flushEditor();
+      if (!mounted.current) return;
+      const saveError = doc.lastSaveError();
+      if (!flushed || saveError !== null) {
+        // ERR_NOT_FOUND: "Entry not found" already says so.
+        if (saveError !== 'ERR_NOT_FOUND') restoreFailed(saveError);
+        return;
+      }
+      let kept: string | null;
+      try {
+        kept = await doc.snapshot();
+      } catch (e) {
+        // Locked or gone: the lock screen or "Entry not found" already says so.
+        const code = errorCode(e);
+        if (mounted.current && code !== 'ERR_LOCKED' && code !== 'ERR_NOT_FOUND') {
+          restoreFailed();
+        }
+        return;
+      }
+      // Its first save must not keep the same content again.
+      if (kept !== null) doc.markSnapshotTaken();
+      const read = await doc.versionContent(restore.versionId);
+      if (!mounted.current) return;
+      if ('error' in read) {
+        restoreFailed(read.error);
+        return;
+      }
+      const exec = editorRef.current?.exec;
+      if (!exec) {
+        restoreFailed();
+        return;
+      }
+      exec('restoreVersion', read.b64);
+    },
+    [flushEditor, doc.lastSaveError, doc.snapshot, doc.markSnapshotTaken, doc.versionContent],
+  );
+
+  // Back from version history: `take` empties the mailbox, so a restore runs
+  // once (one left for another entry is dropped). Only an editable editor
+  // restores; until the editor is ready the restore waits for `onReady`.
+  useFocusEffect(
+    useCallback(() => {
+      const restore = takePendingRestore(id);
+      if (!restore) return;
+      if (editableRef.current === null) parkedRestore.current = restore;
+      else if (editableRef.current) void runRestore(restore);
+      else restoreFailed();
+    }, [id, runRestore]),
+  );
+
+  const onReady = useCallback(
+    async (canEdit: boolean) => {
+      editableRef.current = canEdit;
+      setEditable(canEdit);
+      setOverlay(false);
+      const restore = parkedRestore.current;
+      parkedRestore.current = null;
+      if (restore) {
+        if (canEdit) void runRestore(restore);
+        else restoreFailed();
+      }
+      if (!pendingFocus.current || !canEdit) return;
+      pendingFocus.current = false;
+      editorRef.current?.exec?.('focusEnd');
+    },
+    [runRestore],
+  );
+
+  const onRestored = useCallback(async (ok: boolean) => {
+    if (!ok) restoreFailed();
   }, []);
 
   const onFormatState = useCallback(async (state: FormatState) => setFormat(state), []);
@@ -272,16 +368,37 @@ export default function EntryScreen() {
     else router.replace('/');
   }, [actions.trash, router]);
 
-  /** The header menu: Move to Trash, then its confirmation (decision 7). */
+  /**
+   * Opens the list at once and saves the title and body meanwhile; the list
+   * reads again once the save's session snapshot has likely landed.
+   */
+  const openHistory = useCallback(() => {
+    void flushEntry();
+    // Restore is offered only for an entry that opened editable.
+    // Hidden only for an entry known to be read-only; before onReady the restore is
+    // parked and refused there if the editor opens read-only.
+    const canRestore = editableRef.current === false ? '0' : '1';
+    router.push({ pathname: '/history/[id]', params: { id, editable: canRestore } });
+  }, [flushEntry, id, router]);
+
+  /** The header menu: Version history; Move to Trash, then its confirmation (decision 7). */
   const openMenu = useCallback(() => {
     ActionSheetIOS.showActionSheetWithOptions(
       {
-        options: [t('editor:entry_card.delete_title'), t('common:confirm_dialog.cancel')],
-        destructiveButtonIndex: 0,
-        cancelButtonIndex: 1,
+        options: [
+          t('editor:entry_context.version_history'),
+          t('editor:entry_card.delete_title'),
+          t('common:confirm_dialog.cancel'),
+        ],
+        destructiveButtonIndex: 1,
+        cancelButtonIndex: 2,
       },
       (index) => {
-        if (index !== 0) return;
+        if (index === 0) {
+          openHistory();
+          return;
+        }
+        if (index !== 1) return;
         Alert.alert(t('editor:entry_card.delete_title'), t('mobile.trash_confirm_body'), [
           { text: t('editor:entry_card.delete_cancel'), style: 'cancel' },
           {
@@ -292,7 +409,7 @@ export default function EntryScreen() {
         ]);
       },
     );
-  }, [moveToTrash]);
+  }, [moveToTrash, openHistory]);
 
   const onChangeTitle = (value: string) => {
     titleRef.current = value;
@@ -366,6 +483,7 @@ export default function EntryScreen() {
               onReady={onReady}
               onFormatState={onFormatState}
               onLinkPress={onLinkPress}
+              onRestored={onRestored}
               readOnly={false}
               dom={{ style: { flex: 1 }, hideKeyboardAccessoryView: true }}
             />
