@@ -3,7 +3,6 @@ import { ActivityIndicator, Pressable, Switch, Text, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import type { AutoLockSeconds, BiometricKind } from '@/modules/memlore-core';
-import { ActionButton } from '@/src/components/ActionButton';
 import { ErrorText, errorMessage } from '@/src/components/ErrorText';
 import type { useVault } from '@/src/hooks/useVault';
 import { type AuthKey, t } from '@/src/i18n';
@@ -23,10 +22,10 @@ export function biometricName(kind: BiometricKind): string {
 }
 
 /**
- * Face ID/Touch ID and the auto-lock interval. Rendered in place of the
- * unlocked view, so a lock unmounts it.
+ * Face ID/Touch ID and the auto-lock interval. Rendered in the Settings tab,
+ * behind the unlocked guard, so a lock unmounts it.
  */
-export function SecurityPanel({ vault, onBack }: { vault: Vault; onBack: () => void }) {
+export function SecurityPanel({ vault }: { vault: Vault }) {
   return (
     <>
       <Text style={styles.title}>{t('mobile.security')}</Text>
@@ -52,7 +51,6 @@ export function SecurityPanel({ vault, onBack }: { vault: Vault; onBack: () => v
         })}
       </View>
       <ErrorText message={errorMessage(vault.error)} />
-      <ActionButton testID="security-back-button" label={t('mobile.back')} onPress={onBack} />
     </>
   );
 }
