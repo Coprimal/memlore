@@ -1,11 +1,22 @@
 import { Stack } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Animated, FlatList, Pressable, Text, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Alert,
+  Animated,
+  FlatList,
+  Platform,
+  Pressable,
+  Text,
+  View,
+} from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import type { TrashRow } from '@/modules/memlore-core';
 import { ErrorText } from '@/src/components/ErrorText';
+import { PasswordSheet } from '@/src/components/PasswordSheet';
+import { useLockSession } from '@/src/hooks/useLockSession';
 import { trashDaysLeft, useTrash } from '@/src/hooks/useOrganize';
 import { t } from '@/src/i18n';
 
@@ -16,13 +27,68 @@ const SPINNER_DELAY_MS = 150;
  * Recently deleted entries, most recently trashed first. Each row restores at
  * once or deletes for good after a confirmation; Empty trash deletes the rows
  * shown when the user tapped it, after a confirmation with their count.
+ * A locked entry shows redacted (lock and days left) unless revealed; its
+ * Delete forever asks for the reveal first (the engine refuses the purge
+ * while covered), and Empty trash leaves it out.
  */
 export default function TrashScreen() {
+  // A reveal, re-lock or lock change reloads the list (the engine decides what it shows).
   const trash = useTrash();
+  const session = useLockSession();
   // A restore or delete that was refused (the list has reloaded already).
   const [changeFailed, setChangeFailed] = useState(false);
-  const showSpinner = useDelayed(trash.loading && trash.rows.length === 0, SPINNER_DELAY_MS);
+  // A locked row while not revealed shows redacted (Covered). Under Hidden
+  // (show existence off) the next read omits it; until then it is left out.
+  // So is an invisible row once its vault closed.
+  const listed = trash.rows.filter((row) => !row.isInvisible || session.vaultOpen);
+  const shown = session.showExistence
+    ? listed
+    : listed.filter((row) => !row.isLocked || session.revealed);
+  // The rows Empty trash deletes: the engine skips covered ones.
+  const deletable = shown.filter((row) => !isCovered(row));
+  const showSpinner = useDelayed(trash.loading && shown.length === 0, SPINNER_DELAY_MS);
   const nowSecs = Math.floor(Date.now() / 1000);
+
+  // The reveal sheet is open; what runs once it closed after a successful reveal.
+  const [revealOpen, setRevealOpen] = useState(false);
+  const afterReveal = useRef<(() => void) | null>(null);
+  const revealed = useRef(false);
+
+  /** Locked and not revealed: shown redacted. */
+  function isCovered(row: TrashRow) {
+    return row.isLocked && !session.revealed;
+  }
+
+  /** Shows the reveal sheet at once; `then` runs after a successful reveal. */
+  function askReveal(then: () => void) {
+    afterReveal.current = then;
+    revealed.current = false;
+    setRevealOpen(true);
+  }
+
+  /**
+   * The sheet closed: after a reveal, what it was for runs once the sheet has
+   * slid away (iOS), else nothing. An Alert shown while the sheet is still
+   * dismissing may never appear.
+   */
+  function closeReveal() {
+    if (!revealed.current) afterReveal.current = null;
+    revealed.current = false;
+    setRevealOpen(false);
+    if (Platform.OS !== 'ios') runAfterReveal();
+  }
+
+  function runAfterReveal() {
+    const then = afterReveal.current;
+    afterReveal.current = null;
+    if (then) then();
+  }
+
+  /** Runs `action` at once, or after a reveal for a covered row. */
+  function gated(row: TrashRow, action: () => void) {
+    if (isCovered(row)) askReveal(action);
+    else action();
+  }
 
   async function run(change: Promise<boolean | number | null>) {
     setChangeFailed(false);
@@ -46,8 +112,9 @@ export default function TrashScreen() {
   }
 
   function confirmEmpty() {
-    // The rows on screen now: the count the user confirms is what gets deleted.
-    const ids = trash.rows.map((row) => row.id);
+    // The deletable rows on screen now: the count the user confirms is what
+    // gets deleted (covered rows stay).
+    const ids = deletable.map((row) => row.id);
     if (ids.length === 0) return;
     Alert.alert(
       t('settings:data_section.trash.empty_trash_title'),
@@ -69,7 +136,7 @@ export default function TrashScreen() {
         options={{
           title: t('settings:data_section.tabs.trash'),
           headerRight: () =>
-            trash.rows.length > 0 ? (
+            deletable.length > 0 ? (
               <Pressable
                 testID="empty-trash-button"
                 accessibilityRole="button"
@@ -85,15 +152,17 @@ export default function TrashScreen() {
       />
       <ErrorText message={trash.error || changeFailed ? t('mobile.error') : null} />
       <FlatList
-        data={trash.rows}
+        data={shown}
         keyExtractor={(row) => row.id}
         renderItem={({ item, index }) => (
           <TrashListRow
             row={item}
             index={index}
+            // Under Hidden the next read omits it; until then it shows redacted.
+            covered={isCovered(item)}
             daysLeft={trashDaysLeft(item.trashedAt, nowSecs)}
             onRestore={() => void run(trash.restore(item.id))}
-            onPurge={() => confirmPurge(item.id)}
+            onPurge={() => gated(item, () => confirmPurge(item.id))}
           />
         )}
         ListEmptyComponent={
@@ -107,6 +176,21 @@ export default function TrashScreen() {
           )
         }
       />
+      {/* Outside the list: a list ancestor would take the sheet's first tap. */}
+      <PasswordSheet
+        visible={revealOpen}
+        title={t('nav:sidebar.unlock_second_lock')}
+        description={t('nav:sidebar.unlock_second_lock_description')}
+        placeholder={t('editor:second_lock_prompt.password_placeholder')}
+        submitLabel={t('editor:second_lock_prompt.unlock')}
+        onSubmit={async (password) => {
+          if (!(await session.reveal(password))) return false;
+          revealed.current = true;
+          return true;
+        }}
+        onClose={closeReveal}
+        onDismissed={runAfterReveal}
+      />
     </View>
   );
 }
@@ -119,6 +203,8 @@ export default function TrashScreen() {
 function TrashListRow(props: {
   row: TrashRow;
   index: number;
+  /** Locked and not revealed: the title is not shown. */
+  covered: boolean;
   daysLeft: number;
   onRestore: () => void;
   onPurge: () => void;
@@ -127,9 +213,18 @@ function TrashListRow(props: {
   return (
     <View testID={`trash-row-${props.index}`} style={styles.row}>
       <View style={styles.rowText}>
-        <Text style={styles.title} numberOfLines={1}>
-          {props.row.title?.trim() || t('nav:media_gallery.untitled')}
-        </Text>
+        {props.covered ? (
+          <View style={styles.lockedTop}>
+            <SymbolView name="lock.fill" tintColor={theme.colors.fgMuted} size={14} />
+            <Text style={styles.lockedTitle} numberOfLines={1}>
+              {t('editor:entry_card.locked_entry')}
+            </Text>
+          </View>
+        ) : (
+          <Text style={styles.title} numberOfLines={1}>
+            {props.row.title?.trim() || t('nav:media_gallery.untitled')}
+          </Text>
+        )}
         <Text style={styles.daysLeft}>
           {t('settings:data_section.trash.days_left', { count: props.daysLeft })}
         </Text>
@@ -220,6 +315,17 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: 17,
     fontWeight: '600',
     color: theme.colors.fg,
+  },
+  lockedTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.space(2),
+  },
+  lockedTitle: {
+    flexShrink: 1,
+    fontSize: 17,
+    fontWeight: '600',
+    color: theme.colors.fgMuted,
   },
   daysLeft: {
     fontSize: 13,

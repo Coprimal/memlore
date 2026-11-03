@@ -1,0 +1,6 @@
+# Overrides target-dir from ~/.cargo/config.toml for this checkout: every
+# build (dev, test, clippy, rust-analyzer, release) goes to the external SSD.
+# Copy to .cargo/config.toml (gitignored) and set the folder for this checkout,
+# one folder per checkout. See CONTRIBUTING.md "Cargo build cache".
+[build]
+target-dir = "/Volumes/Thi2TB/cargo-target/memlore"   # a worktree: memlore-<worktree>

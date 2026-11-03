@@ -107,6 +107,10 @@ private func toException(_ error: Error) -> Exception {
     return Exception(
       name: "MemloreLastJournal", description: "The last journal cannot be deleted",
       code: "ERR_LAST_JOURNAL")
+  case MemloreError.SecondLockRequired:
+    return Exception(
+      name: "MemloreSecondLockRequired", description: "The second lock is locked",
+      code: "ERR_SECOND_LOCK_REQUIRED")
   default:
     return Exception(name: "MemloreIo", description: error.localizedDescription, code: "ERR_IO")
   }
@@ -204,6 +208,26 @@ private func autoLockVault(done: @escaping @MainActor () -> Void) {
   }
 }
 
+/// `DeviceSecurity`'s background re-lock of the second lock and the invisible
+/// vault, after the flush wait. On `engineQueue`, so it runs after the saves
+/// queued before it. Both calls are infallible no-ops while the vault is
+/// locked.
+private func endLockSession(done: @escaping @MainActor () -> Void) {
+  engineQueue.async {
+    do {
+      try withEngine { engine in
+        engine.lockSecondLock()
+        engine.closeInvisibleVault()
+      }
+    } catch {
+      NSLog("[MemloreCore] could not end the lock session: \(error)")
+    }
+    DispatchQueue.main.async {
+      MainActor.assumeIsolated { done() }
+    }
+  }
+}
+
 /// `BiometricStatus` in `index.ts`.
 struct BiometricStatusRecord: Record {
   @Field var available: Bool = false
@@ -243,6 +267,8 @@ struct EntryRowRecord: Record {
   @Field var emotion: String? = nil
   @Field var isFavorite: Bool = false
   @Field var journalId: String = ""
+  @Field var isLocked: Bool = false
+  @Field var isInvisible: Bool = false
 
   init() {}
 
@@ -254,6 +280,8 @@ struct EntryRowRecord: Record {
     emotion = row.emotion
     isFavorite = row.isFavorite
     journalId = row.journalId
+    isLocked = row.isLocked
+    isInvisible = row.isInvisible
   }
 }
 
@@ -297,6 +325,8 @@ struct EntryDetailRecord: Record {
   @Field var emotion: String? = nil
   @Field var isFavorite: Bool = false
   @Field var journalId: String = ""
+  @Field var isLocked: Bool = false
+  @Field var isInvisible: Bool = false
   @Field var contentText: String? = nil
   @Field var tags: [TagRecord] = []
 
@@ -310,6 +340,8 @@ struct EntryDetailRecord: Record {
     emotion = entry.emotion
     isFavorite = entry.isFavorite
     journalId = entry.journalId
+    isLocked = entry.isLocked
+    isInvisible = entry.isInvisible
     contentText = entry.contentText
     tags = entry.tags.map { TagRecord($0) }
   }
@@ -320,6 +352,8 @@ struct JournalRecord: Record {
   @Field var id: String = ""
   @Field var name: String = ""
   @Field var color: String? = nil
+  @Field var isLocked: Bool = false
+  @Field var isInvisible: Bool = false
 
   init() {}
 
@@ -327,6 +361,8 @@ struct JournalRecord: Record {
     id = journal.id
     name = journal.name
     color = journal.color
+    isLocked = journal.isLocked
+    isInvisible = journal.isInvisible
   }
 }
 
@@ -337,6 +373,8 @@ struct TrashRowRecord: Record {
   @Field var previewText: String? = nil
   /// Unix seconds.
   @Field var trashedAt: Double = 0
+  @Field var isLocked: Bool = false
+  @Field var isInvisible: Bool = false
 
   init() {}
 
@@ -345,6 +383,8 @@ struct TrashRowRecord: Record {
     title = row.title
     previewText = row.previewText
     trashedAt = Double(row.trashedAt)
+    isLocked = row.isLocked
+    isInvisible = row.isInvisible
   }
 }
 
@@ -429,6 +469,37 @@ struct TemplateRecord: Record {
   }
 }
 
+/// `LockState` in `index.ts`.
+struct LockStateRecord: Record {
+  @Field var enabled: Bool = false
+  @Field var revealed: Bool = false
+  @Field var showExistence: Bool = false
+  @Field var autoLockMinutes: Int = 5
+  @Field var invisibleAutoLockMinutes: Int = 5
+  @Field var vaultOpen: Bool = false
+
+  init() {}
+
+  init(_ state: LockStateFfi) {
+    enabled = state.enabled
+    revealed = state.revealed
+    showExistence = state.showExistence
+    autoLockMinutes = Int(state.autoLockMinutes)
+    invisibleAutoLockMinutes = Int(state.invisibleAutoLockMinutes)
+    vaultOpen = state.vaultOpen
+  }
+}
+
+/// A JS re-lock interval as the engine's `u32`; the engine checks the
+/// allowed values, this only rejects what does not fit.
+private func relockMinutes(_ minutes: Int) throws -> UInt32 {
+  guard let value = UInt32(exactly: minutes) else {
+    throw Exception(
+      name: "MemloreFormat", description: "re-lock minutes out of range", code: "ERR_FORMAT")
+  }
+  return value
+}
+
 public class MemloreCoreModule: Module {
   /// Main thread only.
   private var deviceSecurity: DeviceSecurity?
@@ -436,7 +507,7 @@ public class MemloreCoreModule: Module {
   public func definition() -> ModuleDefinition {
     Name("MemloreCore")
 
-    Events("onAutoLock", "onScreenCaptureChange", "onFlushRequest")
+    Events("onAutoLock", "onScreenCaptureChange", "onFlushRequest", "onLockSessionEnded")
 
     // Both hop to main in order, so a reload's destroy never runs before its
     // create. Destroy holds the module until the observers are gone.
@@ -445,7 +516,8 @@ public class MemloreCoreModule: Module {
         MainActor.assumeIsolated {
           let security = DeviceSecurity(
             sendEvent: { [weak module = self] name, body in module?.sendEvent(name, body) },
-            lockVault: autoLockVault)
+            lockVault: autoLockVault,
+            endLockSession: endLockSession)
           security.start()
           self.deviceSecurity = security
         }
@@ -755,6 +827,90 @@ public class MemloreCoreModule: Module {
 
     AsyncFunction("deleteTemplate") { (id: String) throws in
       try withEngine { engine in try engine.deleteTemplate(id: id) }
+    }.runOnQueue(engineQueue)
+
+    // Second lock and invisible vault: the session lives in Rust. Never log
+    // the passwords these take.
+    AsyncFunction("lockState") { () throws -> LockStateRecord in
+      try withEngine { engine in try LockStateRecord(engine.lockState()) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setSecondLockPassword") { (password: String) throws in
+      try withEngine { engine in try engine.setSecondLockPassword(password: password) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("unlockSecondLock") { (password: String) throws -> Bool in
+      try withEngine { engine in try engine.unlockSecondLock(password: password) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("lockSecondLock") { () throws in
+      try withEngine { engine in engine.lockSecondLock() }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("changeSecondLockPassword") {
+      (oldPassword: String, newPassword: String) throws in
+      try withEngine { engine in
+        try engine.changeSecondLockPassword(oldPassword: oldPassword, newPassword: newPassword)
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("disableSecondLock") { (password: String) throws in
+      try withEngine { engine in try engine.disableSecondLock(password: password) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setSecondLockShowExistence") { (show: Bool) throws in
+      try withEngine { engine in try engine.setSecondLockShowExistence(show: show) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setSecondLockAutoLockMinutes") { (minutes: Int) throws in
+      let value = try relockMinutes(minutes)
+      try withEngine { engine in try engine.setSecondLockAutoLockMinutes(minutes: value) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setInvisibleAutoLockMinutes") { (minutes: Int) throws in
+      let value = try relockMinutes(minutes)
+      try withEngine { engine in try engine.setInvisibleAutoLockMinutes(minutes: value) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setEntryLocked") { (entryId: String, locked: Bool) throws in
+      try withEngine { engine in try engine.setEntryLocked(entryId: entryId, locked: locked) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setJournalLocked") { (journalId: String, locked: Bool) throws in
+      try withEngine { engine in
+        try engine.setJournalLocked(journalId: journalId, locked: locked)
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("openInvisibleVault") { (password: String) throws in
+      try withEngine { engine in try engine.openInvisibleVault(password: password) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("closeInvisibleVault") { () throws in
+      try withEngine { engine in engine.closeInvisibleVault() }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("changeInvisibleVaultPassword") {
+      (oldPassword: String, newPassword: String) throws in
+      try withEngine { engine in
+        try engine.changeInvisibleVaultPassword(oldPassword: oldPassword, newPassword: newPassword)
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("removeEmptyInvisibleVaults") { () throws in
+      try withEngine { engine in try engine.removeEmptyInvisibleVaults() }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setEntryInvisible") { (entryId: String, invisible: Bool) throws in
+      try withEngine { engine in
+        try engine.setEntryInvisible(entryId: entryId, invisible: invisible)
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("setJournalInvisible") { (journalId: String, invisible: Bool) throws in
+      try withEngine { engine in
+        try engine.setJournalInvisible(journalId: journalId, invisible: invisible)
+      }
     }.runOnQueue(engineQueue)
 
     // Spike 17.1, dev route only (`app/(dev)/spike-icloud.tsx`); read-only,

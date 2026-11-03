@@ -27,7 +27,7 @@ export function takePendingRestore(entryId: string): PendingRestore | null {
   return restore?.entryId === entryId ? restore : null;
 }
 
-/** Drops any pending restore (on lock). */
-export function clearPendingRestore(): void {
-  pendingRestore = null;
+/** Drops any pending restore (on lock), or only the one for `entryId` (hidden again). */
+export function clearPendingRestore(entryId?: string): void {
+  if (entryId === undefined || pendingRestore?.entryId === entryId) pendingRestore = null;
 }

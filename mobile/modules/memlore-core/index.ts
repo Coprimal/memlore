@@ -14,6 +14,9 @@ export type StartupMode = 'first_launch' | 'password_locked' | 'boot_file_corrup
  * ERR_NAME_TAKEN: a tag rename onto a name another tag holds, a deleted one
  * included (no merge). ERR_LAST_JOURNAL: the last journal mobile lists
  * cannot be deleted, even when locked journals remain.
+ * ERR_SECOND_LOCK_REQUIRED: the entry or journal is locked and shown
+ * redacted (`showExistence` on, not revealed); reveal with the second-lock
+ * password. Never returned while locked rows are hidden.
  */
 export type MemloreErrorCode =
   | 'ERR_LOCKED'
@@ -24,7 +27,8 @@ export type MemloreErrorCode =
   | 'ERR_BIOMETRIC_CANCELLED'
   | 'ERR_NOT_FOUND'
   | 'ERR_NAME_TAKEN'
-  | 'ERR_LAST_JOURNAL';
+  | 'ERR_LAST_JOURNAL'
+  | 'ERR_SECOND_LOCK_REQUIRED';
 
 /** The device's biometric hardware. */
 export type BiometricKind = 'faceID' | 'touchID' | 'none';
@@ -39,10 +43,33 @@ export interface BiometricStatus {
 /** Auto-lock interval: 0 (immediate), 1, 5 or 15 minutes. */
 export type AutoLockSeconds = 0 | 60 | 300 | 900;
 
+/** Second-lock and invisible-vault re-lock interval in minutes; 0 is never. */
+export type RelockMinutes = 0 | 1 | 5 | 15 | 30;
+
+/** The Rust-held lock session and its settings (never the open vault's id). */
+export interface LockState {
+  /** A second-lock password is set. */
+  enabled: boolean;
+  /** Locked entries and journals are open now. */
+  revealed: boolean;
+  /** Locked rows are listed redacted instead of left out. */
+  showExistence: boolean;
+  /** Any unexpected stored value reads as 5. */
+  autoLockMinutes: RelockMinutes;
+  /** Any unexpected stored value reads as 5. */
+  invisibleAutoLockMinutes: RelockMinutes;
+  /** An invisible vault is open. */
+  vaultOpen: boolean;
+}
+
 /** The engine only stores these three; null is no emotion. */
 export type Emotion = 'good' | 'neutral' | 'bad';
 
-/** One row of the entry list (locked and invisible entries are never listed). */
+/**
+ * One row of the entry list. Locked entries are left out, listed redacted
+ * (`showExistence`) or listed in full (revealed); invisible ones only while
+ * their vault is open.
+ */
 export interface EntryRow {
   id: string;
   title: string | null;
@@ -52,6 +79,10 @@ export interface EntryRow {
   emotion: Emotion | null;
   isFavorite: boolean;
   journalId: string;
+  /** Locked by its own flag or its journal's. */
+  isLocked: boolean;
+  /** Invisible by its own flag or its journal's. */
+  isInvisible: boolean;
 }
 
 /** One page of the entry list, newest first. */
@@ -78,15 +109,21 @@ export interface Journal {
   id: string;
   name: string;
   color: string | null;
+  isLocked: boolean;
+  isInvisible: boolean;
 }
 
-/** One row of Trash (locked and invisible entries are never listed). */
+/** One row of Trash, with the visibility rules of `EntryRow`. */
 export interface TrashRow {
   id: string;
   title: string | null;
   previewText: string | null;
   /** Unix seconds. */
   trashedAt: number;
+  /** Locked by its own flag or its journal's. */
+  isLocked: boolean;
+  /** Invisible by its own flag or its journal's. */
+  isInvisible: boolean;
 }
 
 /** Search filters; an empty list means no restriction. */
@@ -211,6 +248,12 @@ export type MemloreCoreEvents = {
    * privacy shield.
    */
   onFlushRequest: (event: FlushRequestEvent) => void;
+  /**
+   * The second lock and the invisible vault were re-locked natively after the
+   * app went to the background (once the flush wait ended, every auto-lock
+   * interval). Re-read `lockState()`. Arrives in either order with `onAutoLock`.
+   */
+  onLockSessionEnded: () => void;
 };
 
 declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
@@ -251,15 +294,19 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
   entryCount(): Promise<number>;
   /**
    * Page `page` of the entry list (1-based; 0 reads as 1), newest first:
-   * every listed journal, or only `journalId` (ERR_NOT_FOUND unless listed).
+   * every listed journal, or only `journalId` (ERR_NOT_FOUND unless listed,
+   * ERR_SECOND_LOCK_REQUIRED for a locked journal listed redacted).
    */
   listEntries(journalId: string | null, page: number): Promise<EntryPage>;
-  /** Rejects with ERR_NOT_FOUND for an entry the list does not show. */
+  /**
+   * Rejects with ERR_NOT_FOUND for an entry the list does not show, and with
+   * ERR_SECOND_LOCK_REQUIRED for a locked one listed redacted.
+   */
   getEntry(id: string): Promise<EntryDetail>;
   /**
    * Creates an entry with an empty body in `journalId` (ERR_NOT_FOUND unless
-   * listed), or else in the first visible, unlocked journal; resolves with
-   * its id.
+   * listed, ERR_SECOND_LOCK_REQUIRED for a locked journal listed redacted),
+   * or else in the first visible, unlocked journal; resolves with its id.
    */
   createEntry(title: string, journalId?: string | null): Promise<string>;
   /** Sets the title as typed; '' clears it. */
@@ -270,31 +317,45 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
   toggleEntryFavorite(id: string): Promise<boolean>;
   /** Unix seconds (a fraction is dropped); marks the date user-edited. */
   setEntryDate(id: string, entryDate: number): Promise<void>;
-  /** Both the entry and the journal must be listed (else ERR_NOT_FOUND). */
+  /**
+   * Both the entry and the journal must be listed (else ERR_NOT_FOUND) and
+   * readable: a locked one listed redacted is ERR_SECOND_LOCK_REQUIRED.
+   */
   moveEntry(id: string, journalId: string): Promise<void>;
   trashEntry(id: string): Promise<void>;
   /** Most recently trashed first. */
   listTrash(): Promise<TrashRow[]>;
-  /** ERR_NOT_FOUND unless `listTrash` shows the entry. */
+  /**
+   * ERR_NOT_FOUND unless `listTrash` shows the entry. A redacted locked row
+   * (Covered) can be restored: nothing is lost.
+   */
   restoreEntry(id: string): Promise<void>;
-  /** Deletes for good; ERR_NOT_FOUND unless `listTrash` shows the entry. */
+  /**
+   * Deletes for good; ERR_NOT_FOUND unless `listTrash` shows the entry
+   * readably. A redacted locked row (Covered) is ERR_NOT_FOUND until the
+   * second lock is revealed.
+   */
   purgeEntry(id: string): Promise<void>;
   /**
-   * Deletes for good the confirmed `ids` that `listTrash` still shows; any
-   * other id is skipped. Resolves with how many were deleted.
+   * Deletes for good the confirmed `ids` that `listTrash` still shows
+   * readably; any other id is skipped, a redacted locked row (Covered) too.
+   * Resolves with how many were deleted.
    */
   emptyTrash(ids: string[]): Promise<number>;
   listJournals(): Promise<Journal[]>;
   createJournal(name: string): Promise<Journal>;
+  /** ERR_SECOND_LOCK_REQUIRED for a locked journal listed redacted. */
   renameJournal(id: string, name: string): Promise<Journal>;
   /**
    * The delete confirmation's count (desktop's): live entries, locked ones
    * included. Trashed and invisible entries also go but are not counted.
+   * ERR_SECOND_LOCK_REQUIRED for a locked journal listed redacted.
    */
   journalEntryCount(id: string): Promise<number>;
   /**
    * Deletes the journal and every entry in it, locked ones included
-   * (irreversible). Rejects with ERR_LAST_JOURNAL for the last listed one.
+   * (irreversible). Rejects with ERR_LAST_JOURNAL for the last listed one,
+   * ERR_SECOND_LOCK_REQUIRED for a locked journal listed redacted.
    */
   deleteJournal(id: string): Promise<void>;
   listTags(): Promise<Tag[]>;
@@ -351,6 +412,71 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
   updateTemplate(id: string, name: string, description?: string | null): Promise<Template>;
   /** ERR_NOT_FOUND for a predefined template. */
   deleteTemplate(id: string): Promise<void>;
+
+  // Second lock and invisible vault. The session (reveal, open vault) lives
+  // in Rust and ends on `lock()`. Every call but `lockSecondLock` and
+  // `closeInvisibleVault` rejects with ERR_LOCKED while the vault is locked.
+  // Never log the passwords these take.
+  lockState(): Promise<LockState>;
+  /** Sets the first password (ERR_FORMAT when too short) and reveals. */
+  setSecondLockPassword(password: string): Promise<void>;
+  /** Resolves true and reveals for the right password; false changes nothing. */
+  unlockSecondLock(password: string): Promise<boolean>;
+  /** Ends the reveal. */
+  lockSecondLock(): Promise<void>;
+  /** ERR_WRONG_PASSWORD for a wrong old one, ERR_FORMAT for a short new one. */
+  changeSecondLockPassword(oldPassword: string, newPassword: string): Promise<void>;
+  /**
+   * Removes the password and every lock flag, then ends the session (the
+   * reveal and the open vault). ERR_WRONG_PASSWORD for a wrong password.
+   */
+  disableSecondLock(password: string): Promise<void>;
+  /**
+   * List locked rows redacted (true) or leave them out (false). With the
+   * second lock set, turning it on needs the reveal (else
+   * ERR_SECOND_LOCK_REQUIRED); turning it off is always allowed.
+   */
+  setSecondLockShowExistence(show: boolean): Promise<void>;
+  /**
+   * ERR_FORMAT for any other value. With the second lock set and not
+   * revealed it may only shorten (0, never, counts as the longest): a longer
+   * value or 0 is ERR_SECOND_LOCK_REQUIRED.
+   */
+  setSecondLockAutoLockMinutes(minutes: RelockMinutes): Promise<void>;
+  /**
+   * ERR_FORMAT for any other value. With no vault open it may only shorten
+   * (0, never, counts as the longest): a longer value or 0 is ERR_IO.
+   */
+  setInvisibleAutoLockMinutes(minutes: RelockMinutes): Promise<void>;
+  /**
+   * Unlocking a locked entry needs the reveal (ERR_SECOND_LOCK_REQUIRED or
+   * ERR_NOT_FOUND otherwise). ERR_IO keeps the engine's text (second lock not
+   * set, entry in Trash).
+   */
+  setEntryLocked(entryId: string, locked: boolean): Promise<void>;
+  /** The rules of `setEntryLocked`, for a listed journal. */
+  setJournalLocked(journalId: string, locked: boolean): Promise<void>;
+  /**
+   * Opens the vault this password opens, or creates an empty one: the same
+   * result either way. ERR_FORMAT for a short password, else ERR_IO.
+   */
+  openInvisibleVault(password: string): Promise<void>;
+  closeInvisibleVault(): Promise<void>;
+  /**
+   * Changes the open vault's password (merging into the vault the new one
+   * opens, if any). ERR_FORMAT for a short new password; every other refusal
+   * is ERR_IO.
+   */
+  changeInvisibleVaultPassword(oldPassword: string, newPassword: string): Promise<void>;
+  /** Deletes every empty vault and closes the open one if it was removed. */
+  removeEmptyInvisibleVaults(): Promise<void>;
+  /**
+   * Moves an entry into the open vault (ERR_IO with no vault open) or out of
+   * it; clears its lock flag.
+   */
+  setEntryInvisible(entryId: string, invisible: boolean): Promise<void>;
+  /** The rules of `setEntryInvisible`, for a listed journal and its entries. */
+  setJournalInvisible(journalId: string, invisible: boolean): Promise<void>;
 
   // Spike 17.1 (dev route `app/(dev)/spike-icloud.tsx` only, read-only; see
   // ios/ICloudSpike.swift). Reject with code ERR_SPIKE.

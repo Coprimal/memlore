@@ -143,7 +143,9 @@ the `aarch64-apple-darwin` and `x86_64-apple-darwin` targets, and Xcode command
 line tools. It pins `CARGO_TARGET_DIR` to `src-tauri/target` so the bundle stays
 in the repo. The first local universal release build is cold (the release
 profile and the x86_64 half were never built here); later releases reuse
-`src-tauri/target`.
+`src-tauri/target`. In a checkout with a repo-root `.cargo/config.toml` (the
+external SSD, see CONTRIBUTING.md), it unsets `CARGO_TARGET_DIR` instead and
+reads the bundle from that `target-dir` (it then also needs `jq`).
 
 ### Checking the materials
 

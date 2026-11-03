@@ -1,0 +1,236 @@
+# Invisible vault (M3c task 5.4): open a vault with a test-only password, add
+# an entry to it (still listed while the vault is open), close it from the
+# Entries indicator (the entry is gone), open a different vault (silently
+# empty, no error: the entry stays gone), reopen the first one (the entry is
+# back), then background and return: native closes the vault on every
+# background, so the entry is gone again while the app itself stays unlocked
+# at the 1-minute default.
+#
+# Runs against the Release simulator build (see vault-create-unlock.yaml):
+#   pnpm mobile:ios:release
+#   pnpm mobile:e2e
+# clearState wipes the app's container, so the flow creates its own vault.
+# The vault passwords below are test-only values.
+appId: app.memlore.mobile
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible:
+      id: backup-notice
+    timeout: 15000
+- tapOn:
+    id: password-input
+- inputText: "12345678"
+- tapOn:
+    id: confirm-password-input
+- inputText: "12345678"
+- tapOn:
+    id: create-vault-button
+- extendedWaitUntil:
+    visible:
+      id: recovery-phrase
+    timeout: 30000
+- tapOn:
+    id: phrase-saved-button
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+    timeout: 15000
+
+# 1. An entry with a unique title.
+- tapOn:
+    id: new-entry-button
+# The placeholder covers the title field until the editor is ready.
+- extendedWaitUntil:
+    notVisible:
+      id: entry-placeholder
+    timeout: 15000
+- tapOn:
+    id: entry-title-input
+- inputText: "Hidden 5.4"
+- tapOn:
+    point: "50%,40%"
+- inputText: "vault body"
+- tapOn:
+    point: "10%,7%"
+- extendedWaitUntil:
+    visible:
+      text: ".*Hidden 5.4.*"
+    timeout: 10000
+- assertVisible:
+    id: entry-count
+    text: "1 entry"
+- assertNotVisible:
+    id: invisible-vault-indicator
+
+# Open (silently create) the first vault.
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: invisible-vault-open
+    direction: DOWN
+    # Centred: at the bottom edge it counts as visible under the tab bar.
+    centerElement: true
+- tapOn:
+    id: invisible-vault-open
+- extendedWaitUntil:
+    visible:
+      id: password-sheet-input
+    timeout: 5000
+- tapOn:
+    id: password-sheet-input
+- inputText: "vaultpw45"
+- tapOn:
+    id: password-sheet-submit
+- extendedWaitUntil:
+    visible:
+      id: invisible-vault-close
+    timeout: 10000
+
+# Add the entry to it from the entry menu (no second lock: no confirmation).
+- tapOn:
+    id: entries-tab
+- tapOn:
+    text: ".*Hidden 5.4.*"
+- extendedWaitUntil:
+    notVisible:
+      id: entry-placeholder
+    timeout: 15000
+- tapOn:
+    id: entry-menu
+- tapOn: "Add to invisible vault"
+- tapOn:
+    point: "10%,7%"
+
+# The vault is open: the entry stays listed and the indicator shows.
+- extendedWaitUntil:
+    visible:
+      id: invisible-vault-indicator
+    timeout: 10000
+- assertVisible:
+    text: ".*Hidden 5.4.*"
+- assertVisible:
+    id: entry-count
+    text: "1 entry"
+
+# Close the vault from the indicator: the entry is gone.
+- tapOn:
+    id: invisible-vault-indicator
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+      text: "0 entries"
+    timeout: 10000
+- assertNotVisible:
+    text: ".*Hidden 5.4.*"
+- assertNotVisible:
+    id: invisible-vault-indicator
+
+# 2. A different password opens (silently creates) another, empty vault: no
+# error, and the entry is still gone.
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: invisible-vault-open
+    direction: DOWN
+    # Centred: at the bottom edge it counts as visible under the tab bar.
+    centerElement: true
+- tapOn:
+    id: invisible-vault-open
+- extendedWaitUntil:
+    visible:
+      id: password-sheet-input
+    timeout: 5000
+- tapOn:
+    id: password-sheet-input
+- inputText: "otherpw45"
+- tapOn:
+    id: password-sheet-submit
+- extendedWaitUntil:
+    visible:
+      id: invisible-vault-close
+    timeout: 10000
+- assertNotVisible: "Unable to update."
+- tapOn:
+    id: entries-tab
+- extendedWaitUntil:
+    visible:
+      id: invisible-vault-indicator
+    timeout: 10000
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+      text: "0 entries"
+    timeout: 10000
+- assertNotVisible:
+    text: ".*Hidden 5.4.*"
+- tapOn:
+    id: invisible-vault-indicator
+- extendedWaitUntil:
+    notVisible:
+      id: invisible-vault-indicator
+    timeout: 10000
+
+# 3. The first password again: the entry is back.
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: invisible-vault-open
+    direction: DOWN
+    # Centred: at the bottom edge it counts as visible under the tab bar.
+    centerElement: true
+- tapOn:
+    id: invisible-vault-open
+- extendedWaitUntil:
+    visible:
+      id: password-sheet-input
+    timeout: 5000
+- tapOn:
+    id: password-sheet-input
+- inputText: "vaultpw45"
+- tapOn:
+    id: password-sheet-submit
+- extendedWaitUntil:
+    visible:
+      id: invisible-vault-close
+    timeout: 10000
+- tapOn:
+    id: entries-tab
+- extendedWaitUntil:
+    visible:
+      text: ".*Hidden 5.4.*"
+    timeout: 10000
+- assertVisible:
+    id: invisible-vault-indicator
+- assertVisible:
+    id: entry-count
+    text: "1 entry"
+
+# 4. Background and return: native closes the vault on every background. The
+# app stays unlocked at the 1-minute default; unlock anyway if it did lock.
+- pressKey: Home
+- launchApp:
+    stopApp: false
+- runFlow:
+    when:
+      visible:
+        id: unlock-button
+    commands:
+      - tapOn:
+          id: password-input
+      - inputText: "12345678"
+      - tapOn:
+          id: unlock-button
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+      text: "0 entries"
+    timeout: 15000
+- assertNotVisible:
+    id: invisible-vault-indicator
+- assertNotVisible:
+    text: ".*Hidden 5.4.*"

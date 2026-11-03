@@ -1,0 +1,308 @@
+use rusqlite::Connection;
+
+use crate::db;
+use crate::utils::second_lock::{
+    hash_second_lock_password, verify_second_lock_password as verify_second_lock_password_phc,
+};
+
+/// Contract error: a lock flag setter ran while no second-lock password is set.
+#[doc(hidden)]
+pub const SECOND_LOCK_NOT_ENABLED: &str = "Second lock is not enabled";
+
+/// Contract error: a password was set while one already exists.
+#[doc(hidden)]
+pub const SECOND_LOCK_ALREADY_ENABLED: &str = "Second lock is already enabled";
+
+/// Contract error: the old (change) or current (disable) password is wrong.
+#[doc(hidden)]
+pub const INVALID_SECOND_LOCK_PASSWORD: &str = "Invalid second-lock password";
+
+#[doc(hidden)]
+pub fn require_second_lock_enabled(conn: &Connection) -> Result<(), String> {
+    if second_lock_status_impl(conn)? {
+        Ok(())
+    } else {
+        Err(SECOND_LOCK_NOT_ENABLED.to_string())
+    }
+}
+
+/// Minimum length for a second-lock password. Counted in Unicode code
+/// points so multi-byte characters (emoji, accents, etc.) count as one each.
+#[doc(hidden)]
+pub const MIN_SECOND_LOCK_PASSWORD_LEN: usize = 4;
+
+/// Contract error text for a password shorter than
+/// [`MIN_SECOND_LOCK_PASSWORD_LEN`].
+#[doc(hidden)]
+pub fn second_lock_password_too_short_message() -> String {
+    format!(
+        "Second-lock password must be at least {} characters",
+        MIN_SECOND_LOCK_PASSWORD_LEN
+    )
+}
+
+#[doc(hidden)]
+pub fn validate_second_lock_password(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_SECOND_LOCK_PASSWORD_LEN {
+        Err(second_lock_password_too_short_message())
+    } else {
+        Ok(())
+    }
+}
+
+#[doc(hidden)]
+pub fn second_lock_status_impl(conn: &Connection) -> Result<bool, String> {
+    db::get_second_lock_verifier(conn)
+        .map(|verifier| verifier.is_some())
+        .map_err(|e| e.to_string())
+}
+
+#[doc(hidden)]
+pub fn set_second_lock_password_impl(conn: &Connection, password: &str) -> Result<(), String> {
+    if second_lock_status_impl(conn)? {
+        return Err(SECOND_LOCK_ALREADY_ENABLED.to_string());
+    }
+    validate_second_lock_password(password)?;
+    let verifier = hash_second_lock_password(password)?;
+    db::set_second_lock_verifier(conn, &verifier).map_err(|e| e.to_string())
+}
+
+#[doc(hidden)]
+pub fn verify_second_lock_password_impl(conn: &Connection, password: &str) -> Result<bool, String> {
+    let Some(verifier) = db::get_second_lock_verifier(conn).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    Ok(verify_second_lock_password_phc(password, &verifier))
+}
+
+#[doc(hidden)]
+pub fn change_second_lock_password_impl(
+    conn: &Connection,
+    old_password: &str,
+    new_password: &str,
+) -> Result<(), String> {
+    if !verify_second_lock_password_impl(conn, old_password)? {
+        return Err(INVALID_SECOND_LOCK_PASSWORD.to_string());
+    }
+    validate_second_lock_password(new_password)?;
+    let verifier = hash_second_lock_password(new_password)?;
+    db::set_second_lock_verifier(conn, &verifier).map_err(|e| e.to_string())
+}
+
+#[doc(hidden)]
+pub fn disable_second_lock_impl(conn: &Connection, password: &str) -> Result<(), String> {
+    if !verify_second_lock_password_impl(conn, password)? {
+        return Err(INVALID_SECOND_LOCK_PASSWORD.to_string());
+    }
+    db::clear_second_lock_verifier_and_all_locks(conn).map_err(|e| e.to_string())
+}
+
+#[doc(hidden)]
+pub fn set_entry_locked_impl(
+    conn: &Connection,
+    entry_id: &str,
+    locked: bool,
+) -> Result<(), String> {
+    require_second_lock_enabled(conn)?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    db::require_live_entry(&tx, entry_id).map_err(|e| e.to_string())?;
+    db::set_entry_locked(&tx, entry_id, locked).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[doc(hidden)]
+pub fn set_journal_locked_impl(
+    conn: &Connection,
+    journal_id: &str,
+    locked: bool,
+) -> Result<(), String> {
+    require_second_lock_enabled(conn)?;
+    db::set_journal_locked(conn, journal_id, locked).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{self, schema::migrate, CreateEntryParams};
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        migrate(&conn).expect("migrate");
+        conn
+    }
+
+    fn make_entry(conn: &Connection) -> String {
+        let journal_id = db::list_journals(conn, None).unwrap()[0].id.clone();
+        db::create_entry(
+            conn,
+            CreateEntryParams {
+                journal_id: &journal_id,
+                title: Some("Private"),
+                content_text: Some("body"),
+                preview_text: None,
+                entry_date: 1,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn status_set_verify_change_roundtrip() {
+        let conn = setup();
+        assert!(!second_lock_status_impl(&conn).unwrap());
+
+        set_second_lock_password_impl(&conn, "secret one").unwrap();
+        assert!(second_lock_status_impl(&conn).unwrap());
+        assert!(verify_second_lock_password_impl(&conn, "secret one").unwrap());
+        assert!(!verify_second_lock_password_impl(&conn, "wrong").unwrap());
+
+        change_second_lock_password_impl(&conn, "secret one", "secret two").unwrap();
+        assert!(!verify_second_lock_password_impl(&conn, "secret one").unwrap());
+        assert!(verify_second_lock_password_impl(&conn, "secret two").unwrap());
+    }
+
+    #[test]
+    fn set_password_rejects_when_already_enabled() {
+        let conn = setup();
+        set_second_lock_password_impl(&conn, "secret one").unwrap();
+
+        let err = set_second_lock_password_impl(&conn, "secret two").unwrap_err();
+        assert!(err.contains("already enabled"));
+        assert!(verify_second_lock_password_impl(&conn, "secret one").unwrap());
+    }
+
+    #[test]
+    fn change_password_rejects_wrong_old_password() {
+        let conn = setup();
+        set_second_lock_password_impl(&conn, "secret one").unwrap();
+
+        let err = change_second_lock_password_impl(&conn, "wrong", "secret two").unwrap_err();
+        assert!(err.contains("Invalid second-lock password"));
+        assert!(verify_second_lock_password_impl(&conn, "secret one").unwrap());
+    }
+
+    #[test]
+    fn disable_requires_password_and_clears_flags() {
+        let conn = setup();
+        let entry_id = make_entry(&conn);
+        let journal_id = db::get_entry(&conn, &entry_id).unwrap().unwrap().journal_id;
+        set_second_lock_password_impl(&conn, "secret").unwrap();
+        set_entry_locked_impl(&conn, &entry_id, true).unwrap();
+        set_journal_locked_impl(&conn, &journal_id, true).unwrap();
+
+        let err = disable_second_lock_impl(&conn, "wrong").unwrap_err();
+        assert!(err.contains("Invalid second-lock password"));
+        assert!(second_lock_status_impl(&conn).unwrap());
+        assert!(db::get_entry(&conn, &entry_id).unwrap().unwrap().is_locked);
+        assert!(
+            db::get_journal(&conn, &journal_id)
+                .unwrap()
+                .unwrap()
+                .is_locked
+        );
+
+        disable_second_lock_impl(&conn, "secret").unwrap();
+        assert!(!second_lock_status_impl(&conn).unwrap());
+        assert!(!db::get_entry(&conn, &entry_id).unwrap().unwrap().is_locked);
+        assert!(
+            !db::get_journal(&conn, &journal_id)
+                .unwrap()
+                .unwrap()
+                .is_locked
+        );
+    }
+
+    #[test]
+    fn set_password_rejects_below_minimum_length() {
+        let conn = setup();
+        let err = set_second_lock_password_impl(&conn, "abc").unwrap_err();
+        assert!(err.contains("at least 4 characters"));
+        assert!(!second_lock_status_impl(&conn).unwrap());
+    }
+
+    #[test]
+    fn set_password_accepts_minimum_length_any_characters() {
+        let conn = setup();
+        // 4 code points, including a multi-byte emoji -> still valid.
+        set_second_lock_password_impl(&conn, "a😊b ").unwrap();
+        assert!(second_lock_status_impl(&conn).unwrap());
+        assert!(verify_second_lock_password_impl(&conn, "a😊b ").unwrap());
+    }
+
+    #[test]
+    fn set_password_rejects_empty() {
+        let conn = setup();
+        assert!(set_second_lock_password_impl(&conn, "").is_err());
+        assert!(!second_lock_status_impl(&conn).unwrap());
+    }
+
+    #[test]
+    fn change_password_rejects_new_password_below_minimum_length() {
+        let conn = setup();
+        set_second_lock_password_impl(&conn, "secret").unwrap();
+        let err = change_second_lock_password_impl(&conn, "secret", "ab").unwrap_err();
+        assert!(err.contains("at least 4 characters"));
+        // Old password still works.
+        assert!(verify_second_lock_password_impl(&conn, "secret").unwrap());
+    }
+
+    #[test]
+    fn change_password_accepts_minimum_length_any_characters() {
+        let conn = setup();
+        set_second_lock_password_impl(&conn, "secret").unwrap();
+        change_second_lock_password_impl(&conn, "secret", "1️⃣2️⃣3️⃣4️⃣").unwrap();
+        assert!(verify_second_lock_password_impl(&conn, "1️⃣2️⃣3️⃣4️⃣").unwrap());
+    }
+
+    #[test]
+    fn lock_flag_setters_require_feature_enabled() {
+        let conn = setup();
+        let entry_id = make_entry(&conn);
+        let journal_id = db::get_entry(&conn, &entry_id).unwrap().unwrap().journal_id;
+
+        assert!(set_entry_locked_impl(&conn, &entry_id, true)
+            .unwrap_err()
+            .contains("not enabled"));
+        assert!(set_journal_locked_impl(&conn, &journal_id, true)
+            .unwrap_err()
+            .contains("not enabled"));
+
+        set_second_lock_password_impl(&conn, "secret").unwrap();
+        let before_version = db::get_entry_local_version(&conn, &entry_id)
+            .unwrap()
+            .unwrap_or(0);
+        set_entry_locked_impl(&conn, &entry_id, true).unwrap();
+        let after_version = db::get_entry_local_version(&conn, &entry_id)
+            .unwrap()
+            .unwrap_or(0);
+        set_journal_locked_impl(&conn, &journal_id, true).unwrap();
+        assert!(db::get_entry(&conn, &entry_id).unwrap().unwrap().is_locked);
+        assert_eq!(
+            after_version,
+            before_version + 1,
+            "entry lock command should queue sync exactly once"
+        );
+        assert!(
+            db::get_journal(&conn, &journal_id)
+                .unwrap()
+                .unwrap()
+                .is_locked
+        );
+    }
+
+    // ── Phase 9: Trash guard ─────────────────────────────────────────────
+
+    #[test]
+    fn set_entry_locked_refuses_trashed_entry_and_leaves_it_unchanged() {
+        let conn = setup();
+        let entry_id = make_entry(&conn);
+        set_second_lock_password_impl(&conn, "secret").unwrap();
+        db::trash_entry(&conn, &entry_id, 1_700_000_000).unwrap();
+
+        let err = set_entry_locked_impl(&conn, &entry_id, true).unwrap_err();
+
+        assert_eq!(err, db::LiveEntryError::Trashed.to_string());
+        assert!(!db::get_entry(&conn, &entry_id).unwrap().unwrap().is_locked);
+    }
+}

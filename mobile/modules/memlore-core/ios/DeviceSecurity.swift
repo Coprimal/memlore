@@ -3,7 +3,8 @@ import UIKit
 
 /// The app-switcher privacy shield, the background auto-lock clock, save
 /// before lock and screen-capture detection (decisions 5 and 6). Main thread
-/// only. It never calls the engine itself: `lockVault` queues `lock()` on the
+/// only. It never calls the engine itself: `lockVault` queues `lock()` and
+/// `endLockSession` queues the second-lock and invisible-vault re-lock on the
 /// one serial engine queue in `MemloreCoreModule.swift`, like every other
 /// engine call.
 @MainActor
@@ -32,6 +33,9 @@ final class DeviceSecurity {
   private let sendEvent: (String, [String: Any?]) -> Void
   /// Queues the engine's `lock()`; `done` runs on the main thread after it.
   private let lockVault: (@escaping @MainActor () -> Void) -> Void
+  /// Queues the engine's `lockSecondLock()` and `closeInvisibleVault()`;
+  /// `done` runs on the main thread after them.
+  private let endLockSession: (@escaping @MainActor () -> Void) -> Void
 
   private var observers: [NSObjectProtocol] = []
   private var shields: [UIView] = []
@@ -53,10 +57,12 @@ final class DeviceSecurity {
 
   init(
     sendEvent: @escaping (String, [String: Any?]) -> Void,
-    lockVault: @escaping (@escaping @MainActor () -> Void) -> Void
+    lockVault: @escaping (@escaping @MainActor () -> Void) -> Void,
+    endLockSession: @escaping (@escaping @MainActor () -> Void) -> Void
   ) {
     self.sendEvent = sendEvent
     self.lockVault = lockVault
+    self.endLockSession = endLockSession
   }
 
   func start() {
@@ -222,21 +228,28 @@ final class DeviceSecurity {
     DispatchQueue.main.asyncAfter(deadline: .now() + Self.flushAckTimeout, execute: timeout)
   }
 
-  /// Ends the wait (ack, timeout, foreground return, expiry or reload). Only
-  /// "immediate" locks here: a suspended app runs no timer, so a 1/5/15-minute
-  /// interval is measured at willEnterForeground. The lock is queued on the
-  /// engine queue after the ack, so it runs after every save JS awaited; the
-  /// task ends once it has. Reads the live state: a manual lock that ran
-  /// during the wait is not locked again nor reported as an auto-lock.
+  /// Ends the wait (ack, timeout, foreground return, expiry or reload), once
+  /// per background transition. For every interval it ends the lock session
+  /// (second lock and invisible vault, no-ops when there is none), then sends
+  /// `onLockSessionEnded`. Only "immediate" locks the vault here: a suspended
+  /// app runs no timer, so a 1/5/15-minute interval is measured at
+  /// willEnterForeground. Both are queued on the engine queue after the ack,
+  /// back to back, so they run after every save JS awaited (a re-lock first
+  /// would gate the save of a revealed locked entry); the task ends once they
+  /// have. Reads the live state: a manual lock that ran during the wait is not
+  /// locked again nor reported as an auto-lock.
   private func finishFlushWait() {
     guard let end = endFlushWait else { return }
     endFlushWait = nil
     flushTimeout?.cancel()
     flushTimeout = nil
-    guard Self.vaultUnlocked, AutoLockCache.seconds == 0 else {
-      end()
-      return
+    let lockDue = Self.vaultUnlocked && AutoLockCache.seconds == 0
+    let send = self.sendEvent
+    endLockSession {
+      send("onLockSessionEnded", [:])
+      if !lockDue { end() }
     }
+    guard lockDue else { return }
     Self.vaultUnlocked = false
     lockedInBackground = true
     lockVault { end() }

@@ -105,6 +105,8 @@ incremental = false
 
 Keep that profile identical to `src-tauri/Cargo.toml`. After the config is in place, delete this repo's old `src-tauri/target` — `cargo clean` no longer sees it. `pnpm tauri dev` and `cargo test` use the shared directory. `pnpm tauri build` still writes `src-tauri/target`. Why these flags are set is in [CONTRIBUTING.md](CONTRIBUTING.md#cargo-build-cache).
 
+A checkout can instead build on an external SSD: copy `.cargo/config.toml.example` to `.cargo/config.toml` (gitignored) and set its folder. Every build, `pnpm tauri build` included, then goes there, and the bundle lands at `<target-dir>/release/bundle/macos/Memlore.app`. See [CONTRIBUTING.md](CONTRIBUTING.md#target-on-the-external-ssd-per-checkout-opt-in).
+
 Optional `.env` (copy `.env.example`): [Google Drive OAuth](docs/gdrive-oauth-setup.md) and [MapKit JS](docs/mapkit-js-setup.md).
 
 ### 📦 Releasing

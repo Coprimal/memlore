@@ -1,9 +1,10 @@
 //! Keyword search of [`MemloreEngine`]: the desktop Search modal's query
-//! (FTS5, accent-insensitive) with its basic filters. Like the lists, it uses
-//! `LockedView::Hidden` and no invisible vault, so locked, invisible and
-//! trashed entries are never returned.
+//! (FTS5, accent-insensitive) with its basic filters, for the lock session's
+//! view and open invisible vault. Trashed entries are never returned, and
+//! locked ones only when revealed (the engine leaves them out under Covered
+//! too, as desktop does); invisible ones only while their vault is open.
 
-use memlore_engine::db::{self, EmotionKey, LockedView, SearchFilters, TimeRangeFilter};
+use memlore_engine::db::{self, EmotionKey, SearchFilters, TimeRangeFilter};
 
 use crate::{format_err, io, MemloreEngine, MemloreError};
 
@@ -53,7 +54,7 @@ impl MemloreEngine {
         query: String,
         filters: SearchFiltersFfi,
     ) -> Result<Vec<SearchResultFfi>, MemloreError> {
-        self.with_unlocked(|conn| {
+        self.with_scope(|conn, scope| {
             let filters = search_filters(filters)?;
             let query = query.trim();
             let rows = if !query.is_empty() {
@@ -61,16 +62,16 @@ impl MemloreEngine {
                     conn,
                     query,
                     Some(&filters),
-                    LockedView::Hidden,
-                    None,
+                    scope.view,
+                    scope.vault.as_deref(),
                     false,
                 )
             } else if !filters.is_empty() {
                 db::list_entries_with_filters_and_locked_view(
                     conn,
                     &filters,
-                    LockedView::Hidden,
-                    None,
+                    scope.view,
+                    scope.vault.as_deref(),
                 )
             } else {
                 return Ok(Vec::new());
