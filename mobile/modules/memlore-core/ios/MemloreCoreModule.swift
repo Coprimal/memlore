@@ -208,6 +208,26 @@ private func autoLockVault(done: @escaping @MainActor () -> Void) {
   }
 }
 
+/// `DeviceSecurity`'s background re-lock of the second lock and the invisible
+/// vault, after the flush wait. On `engineQueue`, so it runs after the saves
+/// queued before it. Both calls are infallible no-ops while the vault is
+/// locked.
+private func endLockSession(done: @escaping @MainActor () -> Void) {
+  engineQueue.async {
+    do {
+      try withEngine { engine in
+        engine.lockSecondLock()
+        engine.closeInvisibleVault()
+      }
+    } catch {
+      NSLog("[MemloreCore] could not end the lock session: \(error)")
+    }
+    DispatchQueue.main.async {
+      MainActor.assumeIsolated { done() }
+    }
+  }
+}
+
 /// `BiometricStatus` in `index.ts`.
 struct BiometricStatusRecord: Record {
   @Field var available: Bool = false
@@ -487,7 +507,7 @@ public class MemloreCoreModule: Module {
   public func definition() -> ModuleDefinition {
     Name("MemloreCore")
 
-    Events("onAutoLock", "onScreenCaptureChange", "onFlushRequest")
+    Events("onAutoLock", "onScreenCaptureChange", "onFlushRequest", "onLockSessionEnded")
 
     // Both hop to main in order, so a reload's destroy never runs before its
     // create. Destroy holds the module until the observers are gone.
@@ -496,7 +516,8 @@ public class MemloreCoreModule: Module {
         MainActor.assumeIsolated {
           let security = DeviceSecurity(
             sendEvent: { [weak module = self] name, body in module?.sendEvent(name, body) },
-            lockVault: autoLockVault)
+            lockVault: autoLockVault,
+            endLockSession: endLockSession)
           security.start()
           self.deviceSecurity = security
         }

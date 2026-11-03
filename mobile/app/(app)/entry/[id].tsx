@@ -28,6 +28,7 @@ import { EntryPlaceholder, placeholderBody } from '@/src/components/EntryPlaceho
 import { ErrorText } from '@/src/components/ErrorText';
 import { getCachedRow, useEntryActions, useEntryDetail } from '@/src/hooks/useEntries';
 import { useEntryDoc } from '@/src/hooks/useEntryDoc';
+import { noteActivity } from '@/src/hooks/useLockSession';
 import { useTemplateLookup } from '@/src/hooks/useTemplates';
 import { errorCode, useVault } from '@/src/hooks/useVault';
 import { type PendingRestore, takePendingRestore } from '@/src/hooks/useVersions';
@@ -412,6 +413,8 @@ export default function EntryScreen() {
   }, [moveToTrash, openHistory]);
 
   const onChangeTitle = (value: string) => {
+    // Keys are not touches: typing the title keeps the second lock's reveal.
+    noteActivity();
     titleRef.current = value;
     setTitle(value);
     if (titleTimer.current) clearTimeout(titleTimer.current);

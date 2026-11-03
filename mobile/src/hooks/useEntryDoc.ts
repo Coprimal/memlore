@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import MemloreCore, { type MemloreErrorCode } from '@/modules/memlore-core';
+import { noteActivity } from '@/src/hooks/useLockSession';
 import { errorCode, useVault } from '@/src/hooks/useVault';
 import { getCachedRow, putCachedRow } from '@/src/lib/rowCache';
 import { createVersionSession } from '@/src/lib/versionSession';
@@ -68,6 +69,9 @@ export function useEntryDoc(id: string) {
   /** Rejects when the save failed, so the editor retries on its next edit. */
   const save = useCallback(
     async (fullStateB64: string, contentText: string, previewText: string) => {
+      // Typing is activity for the second lock's idle re-lock: keys are not
+      // touches, and the editor's WebView may hide its touches from the root.
+      noteActivity();
       const session = sessionRef.current;
       const now = Date.now();
       const seq = ++saveSeq.current;

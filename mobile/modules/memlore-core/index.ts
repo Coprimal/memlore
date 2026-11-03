@@ -248,6 +248,12 @@ export type MemloreCoreEvents = {
    * privacy shield.
    */
   onFlushRequest: (event: FlushRequestEvent) => void;
+  /**
+   * The second lock and the invisible vault were re-locked natively after the
+   * app went to the background (once the flush wait ended, every auto-lock
+   * interval). Re-read `lockState()`. Arrives in either order with `onAutoLock`.
+   */
+  onLockSessionEnded: () => void;
 };
 
 declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
