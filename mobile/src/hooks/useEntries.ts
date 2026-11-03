@@ -30,8 +30,9 @@ function appendNew(rows: readonly EntryRow[], items: readonly EntryRow[]): Entry
   return out;
 }
 
-// Bumped by every lock change of an entry or journal (and every move): rows
-// read before it may show an entry now locked as plain, so lists drop them.
+// Bumped by every lock or invisibility change of an entry or journal (and
+// every move): rows read before it may show an entry now locked as plain, so
+// lists drop them.
 let listsDirty = 0;
 const dirtyListeners = new Set<() => void>();
 
@@ -202,8 +203,9 @@ export function useEntries(journalId: string | null) {
 
   /**
    * A new untitled entry with an empty body in this list's journal (or the
-   * first listed one); resolves with its id, or null when it failed or a
-   * creation is already running.
+   * engine's first listed journal outside any vault); resolves with its id, or
+   * null when it failed or a creation is already running. A list filtered on a
+   * vault journal passes it explicitly, so the entry is created in the vault.
    */
   const createEntry = useCallback(async (): Promise<string | null> => {
     if (creating.current) return null;
@@ -307,6 +309,12 @@ export interface EntryMeta {
   entryDate: number;
   journalId: string;
   tags: Tag[];
+}
+
+/** An entry's second lock and invisibility, its journal's included. */
+export interface EntryFlags {
+  locked: boolean;
+  invisible: boolean;
 }
 
 /** The fields that are also on the list's row (tags are not). */
@@ -515,19 +523,21 @@ export function useEntryActions(id: string, detail: EntryDetail | null) {
   }, [id]);
 
   /**
-   * Whether the entry is locked now, its journal's lock included (e.g. after
-   * a move). A refusal for the lock or a gone entry (ERR_SECOND_LOCK_REQUIRED,
-   * ERR_NOT_FOUND, ERR_LOCKED) counts as locked; null when the read failed
-   * otherwise (callers count it as locked too, after saving what is open).
+   * Whether the entry is locked and invisible now, its journal's flags
+   * included (e.g. after a move). A refusal for the lock or a gone entry
+   * (ERR_SECOND_LOCK_REQUIRED, ERR_NOT_FOUND, ERR_LOCKED) counts as both;
+   * null when the read failed otherwise (callers count it as both too, after
+   * saving what is open).
    */
-  const readLocked = useCallback(async (): Promise<boolean | null> => {
+  const readFlags = useCallback(async (): Promise<EntryFlags | null> => {
     try {
-      return (await MemloreCore.getEntry(id)).isLocked;
+      const entry = await MemloreCore.getEntry(id);
+      return { locked: entry.isLocked, invisible: entry.isInvisible };
     } catch (e) {
       const code = errorCode(e);
       const refused =
         code === 'ERR_SECOND_LOCK_REQUIRED' || code === 'ERR_NOT_FOUND' || code === 'ERR_LOCKED';
-      return refused ? true : null;
+      return refused ? { locked: true, invisible: true } : null;
     }
   }, [id]);
 
@@ -556,7 +566,32 @@ export function useEntryActions(id: string, detail: EntryDetail | null) {
         removeCachedRow(id);
         return true;
       }
-      return (await readLocked()) ?? true;
+      return (await readFlags())?.locked ?? true;
+    },
+    [id],
+  );
+
+  /**
+   * Moves the entry into the open invisible vault, or out of it, and resolves
+   * its flags read back (null when that read failed): moving in clears its
+   * own second lock (engine rule), but a locked or invisible journal still
+   * counts. Moving in needs an open vault. It stays listed while the vault is
+   * open, so no save is needed first. Like `setLocked` it rejects with the
+   * module's error (any refusal but ERR_LOCKED and ERR_NOT_FOUND is the
+   * generic "Unable to update"); those two are also handled as above.
+   */
+  const setInvisible = useCallback(
+    async (invisible: boolean): Promise<EntryFlags | null> => {
+      try {
+        await MemloreCore.setEntryInvisible(id, invisible);
+      } catch (e) {
+        await fail(e, false);
+        throw e;
+      }
+      markEntryListsDirty();
+      // The cache never holds an invisible row.
+      if (invisible) removeCachedRow(id);
+      return readFlags();
     },
     [id],
   );
@@ -572,6 +607,7 @@ export function useEntryActions(id: string, detail: EntryDetail | null) {
     removeTag,
     trash,
     setLocked,
-    readLocked,
+    setInvisible,
+    readFlags,
   };
 }

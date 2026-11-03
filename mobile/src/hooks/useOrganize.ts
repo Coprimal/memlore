@@ -319,6 +319,30 @@ export function useJournals() {
     [refresh],
   );
 
+  /**
+   * Moves the journal and its entries into the open invisible vault, or out
+   * of it, then reads the list again. Moving in clears the journal's second
+   * lock (engine rule) and needs an open vault. Rejects like `setLocked`
+   * (any refusal but ERR_LOCKED and ERR_NOT_FOUND is the generic "Unable to
+   * update").
+   */
+  const setInvisible = useCallback(
+    async (id: string, invisible: boolean): Promise<void> => {
+      try {
+        await MemloreCore.setJournalInvisible(id, invisible);
+      } catch (e) {
+        onFail(e);
+        throw e;
+      }
+      // Entry lists read before it show its entries' old flags.
+      markEntryListsDirty();
+      // Its entries may have plain rows cached; the cache never holds an invisible one.
+      if (invisible) dropCachedRows();
+      void refresh();
+    },
+    [refresh],
+  );
+
   return {
     journals,
     loading,
@@ -329,6 +353,7 @@ export function useJournals() {
     entryCount,
     deleteJournal,
     setLocked,
+    setInvisible,
   };
 }
 

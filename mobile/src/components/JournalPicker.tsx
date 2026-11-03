@@ -48,10 +48,11 @@ export function JournalPicker(props: Props) {
   }, [props.visible]);
 
   // Under Hidden (show existence off) the next read omits a locked journal;
-  // until then it is left out.
+  // until then it is left out. So is an invisible one once its vault closed.
+  const listed = journals.filter((journal) => !journal.isInvisible || session.vaultOpen);
   const shown = session.showExistence
-    ? journals
-    : journals.filter((journal) => !journal.isLocked || session.revealed);
+    ? listed
+    : listed.filter((journal) => !journal.isLocked || session.revealed);
 
   /**
    * The sheet closes: after a successful reveal, the journal is selected once

@@ -76,6 +76,12 @@ appId: app.memlore.mobile
 # Restore it from the trash: it is listed again.
 - tapOn:
     id: settings-tab
+# The lock panels push the row below the fold; centred, it clears the tab bar.
+- scrollUntilVisible:
+    element:
+      id: trash-row
+    direction: DOWN
+    centerElement: true
 - tapOn:
     id: trash-row
 - extendedWaitUntil:
@@ -119,6 +125,12 @@ appId: app.memlore.mobile
     timeout: 10000
 - tapOn:
     id: settings-tab
+# The lock panels push the row below the fold; centred, it clears the tab bar.
+- scrollUntilVisible:
+    element:
+      id: trash-row
+    direction: DOWN
+    centerElement: true
 - tapOn:
     id: trash-row
 - extendedWaitUntil:

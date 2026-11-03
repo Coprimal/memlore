@@ -50,6 +50,8 @@ function dayLabel(key: DayKey, now: Date): string {
 /**
  * The entries of every listed journal, or of the one in the `journal` param
  * (set by the Journals tab and the filter picker), newest first, grouped by day.
+ * While an invisible vault is open, an eye in the header closes it; a new
+ * entry goes into the filtered journal (a vault journal included).
  */
 export default function EntriesScreen() {
   const router = useRouter();
@@ -67,13 +69,19 @@ export default function EntriesScreen() {
   const [revealFor, setRevealFor] = useState<string | null>(null);
   const openAfterReveal = useRef<string | null>(null);
   const showSpinner = useDelayed(list.loading && list.rows.length === 0, SPINNER_DELAY_MS);
+  // The vault indicator was tapped: it and the vault's rows go in the tap's
+  // frame, while the close saves the open edits first.
+  const [closingVault, setClosingVault] = useState(false);
+  const vaultShown = session.vaultOpen && !closingVault;
 
   const now = new Date();
   // A locked row while not revealed is redacted by the engine (Covered). Under
   // Hidden (show existence off) the next read omits it; until then it is left out.
+  // So is an invisible row once its vault closed.
+  const listed = list.rows.filter((row) => !row.isInvisible || vaultShown);
   const shown = session.showExistence
-    ? list.rows
-    : list.rows.filter((row) => !row.isLocked || session.revealed);
+    ? listed
+    : listed.filter((row) => !row.isLocked || session.revealed);
   let index = 0;
   const sections = groupByDay(shown, now).map((group) => ({
     key: group.key,
@@ -101,10 +109,12 @@ export default function EntriesScreen() {
   }, [journalId, list.loading, list.failure]);
 
   // The filtered journal's name; "All journals" too until the list knows it.
-  // A locked journal left out under Hidden never lends its name.
+  // A locked journal left out under Hidden, or an invisible one once its vault
+  // closed, never lends its name.
+  const unhidden = journals.filter((journal) => !journal.isInvisible || vaultShown);
   const listedJournals = session.showExistence
-    ? journals
-    : journals.filter((journal) => !journal.isLocked || session.revealed);
+    ? unhidden
+    : unhidden.filter((journal) => !journal.isLocked || session.revealed);
   const filterLabel =
     listedJournals.find((journal) => journal.id === journalId)?.name ??
     t('nav:entry_list.filter.journal.all');
@@ -138,6 +148,17 @@ export default function EntriesScreen() {
     const id = openAfterReveal.current;
     openAfterReveal.current = null;
     if (id !== null) open(id);
+  }
+
+  /** Never rejects; the list refetches on the session's new generation. */
+  async function closeVault() {
+    if (closingVault) return;
+    setClosingVault(true);
+    try {
+      await session.closeVault();
+    } finally {
+      setClosingVault(false);
+    }
   }
 
   async function newEntry() {
@@ -189,6 +210,17 @@ export default function EntriesScreen() {
           </Text>
         </View>
         <View style={styles.headerEnd}>
+          {vaultShown ? (
+            <Pressable
+              testID="invisible-vault-indicator"
+              accessibilityRole="button"
+              accessibilityLabel={t('nav:sidebar.lock_invisible')}
+              hitSlop={8}
+              onPress={() => void closeVault()}
+            >
+              <VaultOpenIcon />
+            </Pressable>
+          ) : null}
           <Pressable
             testID="search-button"
             accessibilityRole="button"
@@ -284,6 +316,11 @@ export default function EntriesScreen() {
 function FilterChevron() {
   const { theme } = useUnistyles();
   return <SymbolView name="chevron.down" tintColor={theme.colors.fgSecondary} size={13} />;
+}
+
+function VaultOpenIcon() {
+  const { theme } = useUnistyles();
+  return <SymbolView name="eye" tintColor={theme.colors.accentText} size={22} />;
 }
 
 function SearchIcon() {

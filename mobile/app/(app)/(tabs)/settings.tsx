@@ -4,25 +4,27 @@ import { Pressable, ScrollView, Text } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { ActionButton } from '@/src/components/ActionButton';
+import { InvisibleVaultPanel } from '@/src/components/InvisibleVaultPanel';
 import { SecondLockPanel } from '@/src/components/SecondLockPanel';
 import { SecurityPanel } from '@/src/components/SecurityPanel';
 import { useVault } from '@/src/hooks/useVault';
 import { t } from '@/src/i18n';
 
 /**
- * Security (Face ID, auto-lock), Second lock, Tags, Templates, Recently deleted
- * and the manual Lock.
+ * Security (Face ID, auto-lock), Second lock, Invisible lock, Tags, Templates,
+ * Recently deleted and the manual Lock.
  */
 export default function SettingsScreen() {
   const vault = useVault();
   const router = useRouter();
   const { theme } = useUnistyles();
   return (
-    // "handled": the second lock's password sheet is a Modal, but still a React child of this
+    // "handled": the lock panels' password sheets are Modals, but still React children of this
     // ScrollView, so with "never" its first tap on Submit/Cancel only dismissed the keyboard.
     <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       <SecurityPanel vault={vault} />
       <SecondLockPanel />
+      <InvisibleVaultPanel />
       <Pressable
         testID="tags-row"
         accessibilityRole="button"

@@ -67,20 +67,25 @@ function versionLabel(version: Version, now: Date): string {
  * lock included) while not revealed shows nothing and goes back at once; the
  * entry screen below then leaves too, without saving. Absent `locked` (the
  * entry was not read yet), the hook's read after a re-lock says so. Any reveal
- * or re-lock closes the preview and drops its document.
+ * or re-lock closes the preview and drops its document. The same for an
+ * invisible entry (`invisible=1`) once its vault closes.
  */
 export default function VersionHistoryScreen() {
   const params = useLocalSearchParams<{
     id: string;
     editable?: string | string[];
     locked?: string | string[];
+    invisible?: string | string[];
   }>();
   const id = params.id;
   const canRestore = params.editable !== '0';
   const router = useRouter();
   const session = useLockSession();
   const history = useVersions(id);
-  const hidden = (params.locked === '1' && !session.revealed) || history.lockRequired;
+  const hidden =
+    (params.locked === '1' && !session.revealed) ||
+    (params.invisible === '1' && !session.vaultOpen) ||
+    history.lockRequired;
   // The same, for a confirmation answered after a re-lock.
   const hiddenRef = useRef(hidden);
   hiddenRef.current = hidden;

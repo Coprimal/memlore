@@ -24,9 +24,10 @@ const CLOSED: LockState = {
 let lastActivity = Date.now();
 
 /**
- * The user did something: restarts the second lock's idle countdown. The root
- * layout calls it on every touch; the editor can call it on its changes (the
- * root touch capture may not see touches over the editor's WebView).
+ * The user did something: restarts the second lock's and the invisible vault's
+ * idle countdowns. The root layout calls it on every touch; the editor can call
+ * it on its changes (the root touch capture may not see touches over the
+ * editor's WebView).
  */
 export function noteActivity(): void {
   lastActivity = Date.now();
@@ -117,6 +118,29 @@ function useLockSessionState() {
     return refresh();
   }
 
+  /**
+   * The open vault ended (closed here or by a removal): shown closed at once,
+   * rows read while it was open are dropped, then the state is read again.
+   * The reveal is left alone: closing the vault does not end it natively.
+   */
+  function endVault(): Promise<void> {
+    if (current.current.vaultOpen) dropCachedRows();
+    applyLocal({ vaultOpen: false });
+    return refresh();
+  }
+
+  /**
+   * The reveal ended here (the re-lock timer, Lock now): shown at once, rows
+   * read while revealed are dropped, then the state is read again. The open
+   * vault is left alone: `lockSecondLock` does not close it natively, so it
+   * must not flicker closed (and refetch every list twice) on the way.
+   */
+  function endReveal(): Promise<void> {
+    if (current.current.revealed) dropCachedRows();
+    applyLocal({ revealed: false });
+    return refresh();
+  }
+
   /** Runs a call; ERR_LOCKED shows the lock screen. Rejects with any error. */
   async function call<T>(action: () => Promise<T>): Promise<T> {
     try {
@@ -139,7 +163,22 @@ function useLockSessionState() {
     } catch {
       // Shown closed anyway; the refresh reads the real state.
     }
-    await endSession();
+    await endReveal();
+  }
+
+  /**
+   * Closes the invisible vault: the open editor's saves first (bounded), so
+   * the last edit of an invisible entry is not refused. Never rejects.
+   */
+  async function closeVault(): Promise<void> {
+    await flushAll(RELOCK_FLUSH_MS);
+    try {
+      // Infallible natively, even while the vault is locked.
+      await MemloreCore.closeInvisibleVault();
+    } catch {
+      // Shown closed anyway; the refresh reads the real state.
+    }
+    await endVault();
   }
 
   useEffect(() => {
@@ -176,6 +215,21 @@ function useLockSessionState() {
     timer = setTimeout(check, interval);
     return () => clearTimeout(timer);
   }, [state.revealed, state.autoLockMinutes]);
+
+  // The invisible vault's inactivity close, the same way, while it is open.
+  useEffect(() => {
+    if (!state.vaultOpen || state.invisibleAutoLockMinutes === 0) return;
+    const interval = state.invisibleAutoLockMinutes * 60_000;
+    noteActivity();
+    let timer: ReturnType<typeof setTimeout>;
+    const check = () => {
+      const idle = Date.now() - lastActivity;
+      if (idle >= interval) void closeVault();
+      else timer = setTimeout(check, interval - idle);
+    };
+    timer = setTimeout(check, interval);
+    return () => clearTimeout(timer);
+  }, [state.vaultOpen, state.invisibleAutoLockMinutes]);
 
   /** Resolves true and reveals for the right password; false changes nothing. */
   async function reveal(password: string): Promise<boolean> {
@@ -221,6 +275,44 @@ function useLockSessionState() {
     }
   }
 
+  /**
+   * Opens the vault this password opens, or an empty new one: the same
+   * answer either way. Rejects with ERR_FORMAT or ERR_IO (never says why).
+   */
+  async function openVault(password: string): Promise<void> {
+    await call(() => MemloreCore.openInvisibleVault(password));
+    await refresh();
+  }
+
+  /**
+   * Re-keys the open vault, merging it into the vault the new password opens.
+   * A merge keeps `vaultOpen` true but shows other rows: lists refetch.
+   */
+  async function changeVaultPassword(oldPassword: string, newPassword: string): Promise<void> {
+    await call(() => MemloreCore.changeInvisibleVaultPassword(oldPassword, newPassword));
+    setGeneration((g) => g + 1);
+    await refresh();
+  }
+
+  /** Deletes every empty vault; the open one closes natively if it was removed. */
+  async function removeEmptyVaults(): Promise<void> {
+    await call(() => MemloreCore.removeEmptyInvisibleVaults());
+    await refresh();
+  }
+
+  /**
+   * Shown at once; the read after the call puts back what was stored. With no
+   * vault open only a shorter interval is accepted (ERR_IO otherwise).
+   */
+  async function setInvisibleAutoLockMinutes(minutes: RelockMinutes): Promise<void> {
+    applyLocal({ invisibleAutoLockMinutes: minutes });
+    try {
+      await call(() => MemloreCore.setInvisibleAutoLockMinutes(minutes));
+    } finally {
+      await refresh();
+    }
+  }
+
   return {
     ...state,
     generation,
@@ -233,5 +325,10 @@ function useLockSessionState() {
     disable,
     setShowExistence,
     setAutoLockMinutes,
+    openVault,
+    closeVault,
+    changeVaultPassword,
+    removeEmptyVaults,
+    setInvisibleAutoLockMinutes,
   };
 }

@@ -34,6 +34,11 @@ const SPINNER_DELAY_MS = 150;
  * any menu action on it asks for the reveal first and runs after a
  * successful one; a call refused with ERR_SECOND_LOCK_REQUIRED does the same
  * and is tried once more.
+ *
+ * Invisible vault: a long press also adds the journal to the open vault or
+ * removes it, with its entries, after a confirmation that says so (and that a
+ * locked journal loses its second lock). Adding with no vault open asks for a
+ * vault password first. Any refusal is the generic "Unable to update".
  */
 export default function JournalsScreen() {
   const router = useRouter();
@@ -44,11 +49,14 @@ export default function JournalsScreen() {
   const [revealOpen, setRevealOpen] = useState(false);
   const afterReveal = useRef<(() => void) | null>(null);
   const revealed = useRef(false);
+  // The vault password sheet is open; `afterReveal` runs once a vault opened.
+  const [vaultSheet, setVaultSheet] = useState(false);
   // Under Hidden (show existence off) the next read omits a locked journal;
-  // until then it is left out.
+  // until then it is left out. So is an invisible one once its vault closed.
+  const listed = list.journals.filter((journal) => !journal.isInvisible || session.vaultOpen);
   const shown = session.showExistence
-    ? list.journals
-    : list.journals.filter((journal) => !journal.isLocked || session.revealed);
+    ? listed
+    : listed.filter((journal) => !journal.isLocked || session.revealed);
   const showSpinner = useDelayed(list.loading && shown.length === 0, SPINNER_DELAY_MS);
 
   /** Shows the reveal sheet at once; `then` runs after a successful reveal. */
@@ -74,6 +82,21 @@ export default function JournalsScreen() {
     const then = afterReveal.current;
     afterReveal.current = null;
     if (then) then();
+  }
+
+  /** Shows the vault password sheet at once; `then` runs after a vault opened. */
+  function askVault(then: () => void) {
+    afterReveal.current = then;
+    revealed.current = false;
+    setVaultSheet(true);
+  }
+
+  /** Like `closeReveal`, for the vault sheet. */
+  function closeVaultSheet() {
+    if (!revealed.current) afterReveal.current = null;
+    revealed.current = false;
+    setVaultSheet(false);
+    if (Platform.OS !== 'ios') runAfterReveal();
   }
 
   /** Runs `action` at once, or after a reveal for a locked journal not revealed. */
@@ -102,6 +125,36 @@ export default function JournalsScreen() {
         return;
       }
       Alert.alert(t('mobile.journal_lock.failed'));
+    }
+  }
+
+  /** Adding needs an open vault: the vault sheet first, then the move continues. */
+  function startInvisible(journal: Journal, invisible: boolean) {
+    if (invisible && !session.vaultOpen) askVault(() => confirmInvisible(journal, true));
+    else confirmInvisible(journal, invisible);
+  }
+
+  /** The move takes every entry of the journal with it: the confirmation says so. */
+  function confirmInvisible(journal: Journal, invisible: boolean) {
+    const label = invisibleLabel(invisible);
+    let body = invisible
+      ? t('mobile.invisible.journal_move_in')
+      : t('mobile.invisible.journal_move_out');
+    if (invisible && journal.isLocked) body += `\n\n${t('mobile.invisible.journal_lock_removed')}`;
+    Alert.alert(journal.name, body, [
+      { text: t('settings:journals_section.form.cancel'), style: 'cancel' },
+      { text: label, onPress: () => void changeInvisible(journal, invisible) },
+    ]);
+  }
+
+  async function changeInvisible(journal: Journal, invisible: boolean) {
+    try {
+      await list.setInvisible(journal.id, invisible);
+    } catch (e) {
+      const code = errorCode(e);
+      // The lock screen shows, or the journal is gone (the list reloaded).
+      if (code === 'ERR_LOCKED' || code === 'ERR_NOT_FOUND') return;
+      Alert.alert(t('editor:entry_context.invisible_mark_error'));
     }
   }
 
@@ -195,15 +248,19 @@ export default function JournalsScreen() {
 
   /**
    * Rename, Delete (then its confirmation), Lock journal / Unlock journal
-   * (index 2, when `lockLabel`), Cancel. On a locked journal not revealed,
-   * each asks for the reveal first.
+   * (index 2, when `lockLabel`), Add to invisible vault / Remove from
+   * invisible (index 3 after the lock item, else 2), Cancel. On a locked
+   * journal not revealed, each asks for the reveal first.
    */
   function openMenu(journal: Journal) {
     const lock = lockLabel(journal);
     // Decided now, as the menu shows it: a refresh before the tap never flips it.
     const wantLock = !journal.isLocked;
+    const wantInvisible = !journal.isInvisible;
     const options = [t('mobile.journal.rename'), t('settings:journals_section.delete')];
     if (lock !== null) options.push(lock);
+    const invisibleIndex = options.length;
+    options.push(invisibleLabel(wantInvisible));
     options.push(t('settings:journals_section.form.cancel'));
     ActionSheetIOS.showActionSheetWithOptions(
       {
@@ -217,6 +274,8 @@ export default function JournalsScreen() {
         else if (index === 1) gated(journal, () => void confirmDelete(journal));
         else if (index === 2 && lock !== null) {
           gated(journal, () => void changeLock(journal, wantLock));
+        } else if (index === invisibleIndex) {
+          gated(journal, () => startInvisible(journal, wantInvisible));
         }
       },
     );
@@ -255,6 +314,7 @@ export default function JournalsScreen() {
                 { name: 'rename', label: t('mobile.journal.rename') },
                 { name: 'delete', label: t('settings:journals_section.delete') },
                 ...(lock !== null ? [{ name: 'lock', label: lock }] : []),
+                { name: 'invisible', label: invisibleLabel(!item.isInvisible) },
               ]}
               onAccessibilityAction={(event) => {
                 const action = event.nativeEvent.actionName;
@@ -263,6 +323,9 @@ export default function JournalsScreen() {
                 else if (action === 'lock') {
                   const wantLock = !item.isLocked;
                   gated(item, () => void changeLock(item, wantLock));
+                } else if (action === 'invisible') {
+                  const wantInvisible = !item.isInvisible;
+                  gated(item, () => startInvisible(item, wantInvisible));
                 }
               }}
               onPress={() => openJournal(item)}
@@ -300,8 +363,30 @@ export default function JournalsScreen() {
         onClose={closeReveal}
         onDismissed={runAfterReveal}
       />
+      {/* Opens the vault the password opens, or silently an empty new one. */}
+      <PasswordSheet
+        visible={vaultSheet}
+        title={t('settings:security.invisible_lock.open_title')}
+        description={t('settings:security.invisible_lock.open_description')}
+        placeholder={t('settings:security.invisible_lock.open_placeholder')}
+        submitLabel={t('settings:security.invisible_lock.open_button')}
+        failedMessage={t('editor:entry_context.invisible_mark_error')}
+        onSubmit={async (password) => {
+          await session.openVault(password);
+          revealed.current = true;
+        }}
+        onClose={closeVaultSheet}
+        onDismissed={runAfterReveal}
+      />
     </View>
   );
+}
+
+/** Add to invisible vault (`invisible`) or Remove from invisible. */
+function invisibleLabel(invisible: boolean): string {
+  return invisible
+    ? t('editor:entry_context.add_to_invisible_vault')
+    : t('editor:entry_context.remove_invisible');
 }
 
 /** `on`, but only once it has stayed true for `ms`. */

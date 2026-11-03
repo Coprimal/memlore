@@ -39,9 +39,11 @@ export default function TrashScreen() {
   const [changeFailed, setChangeFailed] = useState(false);
   // A locked row while not revealed shows redacted (Covered). Under Hidden
   // (show existence off) the next read omits it; until then it is left out.
+  // So is an invisible row once its vault closed.
+  const listed = trash.rows.filter((row) => !row.isInvisible || session.vaultOpen);
   const shown = session.showExistence
-    ? trash.rows
-    : trash.rows.filter((row) => !row.isLocked || session.revealed);
+    ? listed
+    : listed.filter((row) => !row.isLocked || session.revealed);
   // The rows Empty trash deletes: the engine skips covered ones.
   const deletable = shown.filter((row) => !isCovered(row));
   const showSpinner = useDelayed(trash.loading && shown.length === 0, SPINNER_DELAY_MS);

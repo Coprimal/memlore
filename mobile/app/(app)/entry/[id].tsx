@@ -28,7 +28,12 @@ import { EntryMeta, META_ROW_HEIGHT } from '@/src/components/EntryMeta';
 import { EntryPlaceholder, placeholderBody } from '@/src/components/EntryPlaceholder';
 import { ErrorText } from '@/src/components/ErrorText';
 import { PasswordSheet } from '@/src/components/PasswordSheet';
-import { getCachedRow, useEntryActions, useEntryDetail } from '@/src/hooks/useEntries';
+import {
+  type EntryFlags,
+  getCachedRow,
+  useEntryActions,
+  useEntryDetail,
+} from '@/src/hooks/useEntries';
 import { useEntryDoc } from '@/src/hooks/useEntryDoc';
 import { noteActivity, useLockSession } from '@/src/hooks/useLockSession';
 import { useTemplateLookup } from '@/src/hooks/useTemplates';
@@ -92,6 +97,14 @@ function lockFailedMessage(e: unknown): string {
  * entry) shows the reveal sheet and reads once more after a reveal; a cancel,
  * or a second refusal, leaves. A locked entry while not revealed (a re-lock,
  * or a lock while not revealed) shows nothing and leaves without saving.
+ *
+ * Invisible vault: Add to invisible vault / Remove from invisible (header
+ * menu). Adding with no vault open asks for a vault password first (open or
+ * silently create) and continues after; on a locked entry a confirmation says
+ * its second lock is removed (engine rule). The entry stays shown while its
+ * vault is open; once the vault closes it shows nothing and leaves without
+ * saving, like a hidden locked entry. Any refusal is the generic "Unable to
+ * update".
  */
 export default function EntryScreen() {
   const params = useLocalSearchParams<{ id: string; template?: string | string[] }>();
@@ -117,12 +130,18 @@ export default function EntryScreen() {
   // From a lock change here (the stored state, its journal's lock included).
   const [lockedNow, setLockedNow] = useState<boolean | null>(null);
   const locked = lockedNow ?? entry.detail?.isLocked ?? false;
-  // Hidden again: nothing of it may show, and the screen leaves.
-  const hidden = locked && !session.revealed;
+  // The same for a vault move here (its journal's invisibility included).
+  const [invisibleNow, setInvisibleNow] = useState<boolean | null>(null);
+  const invisible = invisibleNow ?? entry.detail?.isInvisible ?? false;
+  // Hidden again (a re-lock, or its vault closed): nothing of it may show, and the screen leaves.
+  const hidden = (locked && !session.revealed) || (invisible && !session.vaultOpen);
   // The reveal sheet is open, and for what; `revealed` says the reveal succeeded.
   const [revealFor, setRevealFor] = useState<RevealFor | null>(null);
   const revealed = useRef(false);
-  // The lock change to retry once the sheet has slid away after a reveal.
+  // The vault password sheet is open; `vaultOpened` says a vault opened.
+  const [vaultSheet, setVaultSheet] = useState(false);
+  const vaultOpened = useRef(false);
+  // The change to run once a sheet has slid away after a reveal or a vault open.
   const afterReveal = useRef<(() => void) | null>(null);
   // The reads already ran once more after a reveal.
   const readRetried = useRef(false);
@@ -465,14 +484,17 @@ export default function EntryScreen() {
     // Hidden only for an entry known to be read-only; before onReady the restore is
     // parked and refused there if the editor opens read-only.
     const canRestore = editableRef.current === false ? '0' : '1';
-    // Lets history leave at once on a re-lock; left out while not read yet.
+    // Lets history leave at once on a re-lock or a vault close; left out while not read yet.
     const known = lockedNow ?? entry.detail?.isLocked;
     const lockedParam = known === undefined ? {} : { locked: known ? '1' : '0' };
+    const knownInvisible = invisibleNow ?? entry.detail?.isInvisible;
+    const invisibleParam =
+      knownInvisible === undefined ? {} : { invisible: knownInvisible ? '1' : '0' };
     router.push({
       pathname: '/history/[id]',
-      params: { id, editable: canRestore, ...lockedParam },
+      params: { id, editable: canRestore, ...lockedParam, ...invisibleParam },
     });
-  }, [flushEntry, id, router, lockedNow, entry.detail]);
+  }, [flushEntry, id, router, lockedNow, invisibleNow, entry.detail]);
 
   /**
    * Locks or unlocks the entry. A refusal for want of the reveal shows the
@@ -501,21 +523,94 @@ export default function EntryScreen() {
   );
 
   /**
-   * `actions.move`, then the stored lock read back: a move into a locked
+   * The flags read back after a change: what the screen hides on. A read that
+   * failed counts as locked and invisible (fail closed), after the open edits
+   * are saved: a hide never saves.
+   */
+  const applyFlags = useCallback(
+    async (flags: EntryFlags | null) => {
+      if (flags === null) await flushEntry();
+      if (!mounted.current) return;
+      setLockedNow(flags?.locked ?? true);
+      setInvisibleNow(flags?.invisible ?? true);
+    },
+    [flushEntry],
+  );
+
+  /**
+   * `actions.move`, then the stored flags read back: a move into a locked
    * journal locks the entry with it (the screen then leaves on the next
-   * re-lock), a move out of one unlocks it. A read back that failed counts as
-   * locked (fail closed), after the open edits are saved: a hide never saves.
+   * re-lock), a move out of one unlocks it; the same for a vault journal and
+   * the vault's close.
    */
   const move = useCallback(
     async (journalId: string) => {
       const moved = await actions.move(journalId);
       if (!moved) return false;
-      const nowLocked = await actions.readLocked();
-      if (nowLocked === null) await flushEntry();
-      if (mounted.current) setLockedNow(nowLocked ?? true);
+      await applyFlags(await actions.readFlags());
       return true;
     },
-    [actions.move, actions.readLocked, flushEntry],
+    [actions.move, actions.readFlags, applyFlags],
+  );
+
+  /** Moves the entry into the open vault or out of it; a refusal shows the generic text. */
+  const changeInvisible = useCallback(
+    async (invisible: boolean) => {
+      let flags: EntryFlags | null;
+      try {
+        flags = await actions.setInvisible(invisible);
+      } catch (e) {
+        if (!mounted.current) return;
+        const code = errorCode(e);
+        // The lock screen or "Entry not found" already says so.
+        if (code === 'ERR_LOCKED' || code === 'ERR_NOT_FOUND') return;
+        Alert.alert(t('editor:entry_context.invisible_mark_error'));
+        return;
+      }
+      await applyFlags(flags);
+    },
+    [actions.setInvisible, applyFlags],
+  );
+
+  /** Moving in: on a locked entry, a confirmation that its second lock goes first. */
+  const confirmInvisible = useCallback(
+    (invisible: boolean, wasLocked: boolean) => {
+      if (!invisible || !wasLocked) {
+        void changeInvisible(invisible);
+        return;
+      }
+      Alert.alert(
+        t('editor:entry_context.add_to_invisible_vault'),
+        t('mobile.invisible.entry_lock_removed'),
+        [
+          { text: t('common:confirm_dialog.cancel'), style: 'cancel' },
+          {
+            text: t('editor:entry_context.add_to_invisible_vault'),
+            onPress: () => void changeInvisible(true),
+          },
+        ],
+      );
+    },
+    [changeInvisible],
+  );
+
+  /**
+   * The menu's vault item. Moving in needs an open vault: without one, the
+   * vault password sheet shows at once and the move continues once it has
+   * slid away after a vault opened (an Alert shown while it is still
+   * dismissing may never appear).
+   */
+  const startInvisible = useCallback(
+    (invisible: boolean, wasLocked: boolean) => {
+      if (invisible && !session.vaultOpen) {
+        afterReveal.current = () => confirmInvisible(true, wasLocked);
+        vaultOpened.current = false;
+        setVaultSheet(true);
+        return;
+      }
+      confirmInvisible(invisible, wasLocked);
+    },
+    [session.vaultOpen, confirmInvisible],
   );
 
   function runAfterReveal() {
@@ -548,12 +643,24 @@ export default function EntryScreen() {
     }
   }, [revealFor, leaveHidden, changeLock]);
 
+  /** The vault sheet closed: the move continues only after a vault opened. */
+  function closeVaultSheet() {
+    if (!vaultOpened.current) afterReveal.current = null;
+    vaultOpened.current = false;
+    setVaultSheet(false);
+    if (Platform.OS !== 'ios') runAfterReveal();
+  }
+
   // Shown once the entry is read and only while a second-lock password is set.
   const canLock = session.enabled && entry.detail !== null;
+  // Shown once the entry is read.
+  const canMoveInvisible = entry.detail !== null;
 
   /**
    * The header menu: Version history; Move to Trash, then its confirmation
-   * (decision 7); then Lock entry / Unlock entry when `canLock` (index 2).
+   * (decision 7); then Lock entry / Unlock entry when `canLock` (index 2);
+   * then Add to invisible vault / Remove from invisible once the entry is
+   * read (index 3 after the lock item, else 2).
    */
   const openMenu = useCallback(() => {
     const options = [
@@ -561,6 +668,16 @@ export default function EntryScreen() {
       t('editor:entry_card.delete_title'),
     ];
     if (canLock) options.push(locked ? t('mobile.entry_lock.unlock') : t('mobile.entry_lock.lock'));
+    const invisibleIndex = canMoveInvisible ? options.length : -1;
+    // Decided now, as the menu shows it: a refresh before the tap never flips it.
+    const wantInvisible = !invisible;
+    if (canMoveInvisible) {
+      options.push(
+        invisible
+          ? t('editor:entry_context.remove_invisible')
+          : t('editor:entry_context.add_to_invisible_vault'),
+      );
+    }
     options.push(t('common:confirm_dialog.cancel'));
     ActionSheetIOS.showActionSheetWithOptions(
       {
@@ -577,6 +694,10 @@ export default function EntryScreen() {
           void changeLock(!locked);
           return;
         }
+        if (index === invisibleIndex) {
+          startInvisible(wantInvisible, locked);
+          return;
+        }
         if (index !== 1) return;
         Alert.alert(t('editor:entry_card.delete_title'), t('mobile.trash_confirm_body'), [
           { text: t('editor:entry_card.delete_cancel'), style: 'cancel' },
@@ -588,7 +709,16 @@ export default function EntryScreen() {
         ]);
       },
     );
-  }, [moveToTrash, openHistory, canLock, locked, changeLock]);
+  }, [
+    moveToTrash,
+    openHistory,
+    canLock,
+    locked,
+    changeLock,
+    canMoveInvisible,
+    invisible,
+    startInvisible,
+  ]);
 
   const onChangeTitle = (value: string) => {
     // Keys are not touches: typing the title keeps the second lock's reveal.
@@ -634,6 +764,24 @@ export default function EntryScreen() {
         return true;
       }}
       onClose={closeReveal}
+      onDismissed={runAfterReveal}
+    />
+  );
+
+  // Opens the vault the password opens, or silently an empty new one.
+  const vaultPasswordSheet = (
+    <PasswordSheet
+      visible={vaultSheet}
+      title={t('settings:security.invisible_lock.open_title')}
+      description={t('settings:security.invisible_lock.open_description')}
+      placeholder={t('settings:security.invisible_lock.open_placeholder')}
+      submitLabel={t('settings:security.invisible_lock.open_button')}
+      failedMessage={t('editor:entry_context.invisible_mark_error')}
+      onSubmit={async (password) => {
+        await session.openVault(password);
+        vaultOpened.current = true;
+      }}
+      onClose={closeVaultSheet}
       onDismissed={runAfterReveal}
     />
   );
@@ -730,8 +878,9 @@ export default function EntryScreen() {
           ) : null}
         </>
       )}
-      {/* No ScrollView above it here, so its first tap is never taken. */}
+      {/* No ScrollView above them here, so their first tap is never taken. */}
       {revealSheet}
+      {vaultPasswordSheet}
     </View>
   );
 }
