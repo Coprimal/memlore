@@ -44,8 +44,14 @@ export type PasswordSheetProps = {
   onSubmit: (password: string, current: string) => Promise<boolean | void>;
   /** Shown when the call rejects with an unexpected error; default `mobile.error`. */
   failedMessage?: string;
-  /** Cancel, the sheet swiped down, or a successful submit. */
+  /** Cancel or a successful submit (no swipe down: `allowSwipeDismissal` stays off). */
   onClose: () => void;
+  /**
+   * iOS only: the sheet finished sliding away. A follow-up that hides an
+   * outer Modal waits for this, or UIKit drops that dismissal mid-transition
+   * and leaves a blank sheet on screen.
+   */
+  onDismissed?: () => void;
 };
 
 /**
@@ -130,6 +136,7 @@ export function PasswordSheet(props: PasswordSheetProps) {
       animationType="slide"
       presentationStyle="pageSheet"
       onRequestClose={close}
+      onDismiss={props.onDismissed}
     >
       {/* Belt and braces: harmless if the root capture already sees these touches. */}
       <View testID="password-sheet" style={styles.sheet} onTouchStartCapture={noteActivity}>

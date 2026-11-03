@@ -15,6 +15,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import EntryEditorDom from '@/editor/EntryEditorDom';
 import type { Version } from '@/modules/memlore-core';
 import { ErrorText } from '@/src/components/ErrorText';
+import { useLockSession } from '@/src/hooks/useLockSession';
 import { setPendingRestore, useVersions } from '@/src/hooks/useVersions';
 import { activeLocale, t } from '@/src/i18n';
 
@@ -61,15 +62,36 @@ function versionLabel(version: Version, now: Date): string {
  * An entry's saved versions, newest first. A tap previews one read-only in a
  * sheet; Restore (hidden when the entry opened read-only, `editable=0`) asks
  * first, then leaves the restore for the entry screen and goes back to it.
+ *
+ * Second lock: a locked entry (`locked=1` from the entry screen, its journal's
+ * lock included) while not revealed shows nothing and goes back at once; the
+ * entry screen below then leaves too, without saving. Absent `locked` (the
+ * entry was not read yet), the hook's read after a re-lock says so. Any reveal
+ * or re-lock closes the preview and drops its document.
  */
 export default function VersionHistoryScreen() {
-  const params = useLocalSearchParams<{ id: string; editable?: string | string[] }>();
+  const params = useLocalSearchParams<{
+    id: string;
+    editable?: string | string[];
+    locked?: string | string[];
+  }>();
   const id = params.id;
   const canRestore = params.editable !== '0';
   const router = useRouter();
+  const session = useLockSession();
   const history = useVersions(id);
-  // The version previewed in the sheet; set on the tap's frame.
-  const [selected, setSelected] = useState<Version | null>(null);
+  const hidden = (params.locked === '1' && !session.revealed) || history.lockRequired;
+  // The same, for a confirmation answered after a re-lock.
+  const hiddenRef = useRef(hidden);
+  hiddenRef.current = hidden;
+  // Once: a second back would pop the screen below.
+  const left = useRef(false);
+  // The version previewed in the sheet, set on the tap's frame, with the lock
+  // generation it was picked in (a reveal or re-lock closes it).
+  const [selected, setSelected] = useState<{ version: Version; generation: number } | null>(
+    null,
+  );
+  const previewed = selected?.generation === session.generation ? selected.version : null;
   const showSpinner = useDelayed(
     history.loading && history.versions.length === 0,
     SPINNER_DELAY_MS,
@@ -81,6 +103,14 @@ export default function VersionHistoryScreen() {
     const timer = setTimeout(() => void history.refresh(), AFTER_SAVE_REFRESH_MS);
     return () => clearTimeout(timer);
   }, [history.refresh]);
+
+  useEffect(() => {
+    if (!hidden || left.current) return;
+    left.current = true;
+    setSelected(null);
+    if (router.canGoBack()) router.back();
+    else router.replace('/');
+  }, [hidden, router]);
 
   useEffect(() => {
     if (!history.notFound) return;
@@ -101,12 +131,24 @@ export default function VersionHistoryScreen() {
           text: t('editor:versionHistory.restore'),
           style: 'destructive',
           onPress: () => {
+            // Hidden meanwhile (locked and not revealed): no restore; this
+            // screen goes back, or already did.
+            if (left.current || hiddenRef.current) return;
             setPendingRestore({ entryId: id, versionId: version.id });
             setSelected(null);
             router.back();
           },
         },
       ],
+    );
+  }
+
+  if (hidden) {
+    // Nothing of a hidden entry shows while the screen leaves.
+    return (
+      <View style={styles.screen}>
+        <Stack.Screen options={{ title: '' }} />
+      </View>
     );
   }
 
@@ -132,7 +174,7 @@ export default function VersionHistoryScreen() {
           <Pressable
             testID={`version-row-${index}`}
             accessibilityRole="button"
-            onPress={() => setSelected(item)}
+            onPress={() => setSelected({ version: item, generation: session.generation })}
             style={styles.row}
           >
             <Text style={styles.rowLabel}>{versionLabel(item, now)}</Text>
@@ -153,9 +195,11 @@ export default function VersionHistoryScreen() {
           )
         }
       />
+      {/* A new instance per lock generation: no document read before it stays. */}
       <VersionPreview
-        version={selected}
-        label={selected ? versionLabel(selected, now) : ''}
+        key={session.generation}
+        version={previewed}
+        label={previewed ? versionLabel(previewed, now) : ''}
         canRestore={canRestore}
         content={history.content}
         onRestore={confirmRestore}

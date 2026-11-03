@@ -1,9 +1,11 @@
 import { SymbolView } from 'expo-symbols';
-import { useEffect } from 'react';
-import { FlatList, Modal, Pressable, Text, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { FlatList, Modal, Platform, Pressable, Text, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { ErrorText } from '@/src/components/ErrorText';
+import { PasswordSheet } from '@/src/components/PasswordSheet';
+import { useLockSession } from '@/src/hooks/useLockSession';
 import { useJournals } from '@/src/hooks/useOrganize';
 import { t } from '@/src/i18n';
 
@@ -21,16 +23,51 @@ type Props = {
 };
 
 /**
- * A page sheet listing the journals (visible, unlocked) with a checkmark on
- * the selected one: the Entries filter and the entry's move use it. The list
- * reloads each time the sheet opens.
+ * A page sheet listing the journals with a checkmark on the selected one: the
+ * Entries filter, the search filter and the entry's move use it. The list
+ * reloads each time the sheet opens. A locked journal shows a lock; choosing
+ * it while not revealed (Covered) asks for the second-lock password first and
+ * selects it only after a successful reveal.
  */
 export function JournalPicker(props: Props) {
   const { journals, error, refresh } = useJournals();
+  const session = useLockSession();
+  // The covered journal whose reveal sheet is open; the one selected once revealed.
+  const [revealFor, setRevealFor] = useState<string | null>(null);
+  const selectAfterReveal = useRef<string | null>(null);
 
   useEffect(() => {
     if (props.visible) void refresh();
   }, [props.visible, refresh]);
+
+  // A reveal left open when the picker hides is not shown again on the next open.
+  useEffect(() => {
+    if (props.visible) return;
+    selectAfterReveal.current = null;
+    setRevealFor(null);
+  }, [props.visible]);
+
+  // Under Hidden (show existence off) the next read omits a locked journal;
+  // until then it is left out.
+  const shown = session.showExistence
+    ? journals
+    : journals.filter((journal) => !journal.isLocked || session.revealed);
+
+  /**
+   * The sheet closes: after a successful reveal, the journal is selected once
+   * it has slid away (iOS). Selecting may hide this picker, and hiding it while
+   * the sheet inside it is still dismissing leaves a stuck blank sheet.
+   */
+  function closeReveal() {
+    setRevealFor(null);
+    if (Platform.OS !== 'ios') selectRevealed();
+  }
+
+  function selectRevealed() {
+    const id = selectAfterReveal.current;
+    selectAfterReveal.current = null;
+    if (id !== null) props.onSelect(id);
+  }
 
   return (
     <Modal
@@ -50,7 +87,7 @@ export function JournalPicker(props: Props) {
         </View>
         <ErrorText message={error ? t('mobile.error') : null} />
         <FlatList
-          data={journals}
+          data={shown}
           keyExtractor={(journal) => journal.id}
           ListHeaderComponent={
             props.includeAll ? (
@@ -66,26 +103,58 @@ export function JournalPicker(props: Props) {
             <Option
               testID={`journal-option-${index}`}
               label={item.name}
+              locked={item.isLocked}
               checked={props.selectedId === item.id}
-              onPress={() => props.onSelect(item.id)}
+              // The reveal sheet shows at once (no data needed).
+              onPress={() =>
+                item.isLocked && !session.revealed
+                  ? setRevealFor(item.id)
+                  : props.onSelect(item.id)
+              }
             />
           )}
+        />
+        {/* Outside the list: a list ancestor would take the sheet's first tap. */}
+        <PasswordSheet
+          visible={revealFor !== null}
+          title={t('nav:sidebar.unlock_second_lock')}
+          description={t('nav:sidebar.unlock_second_lock_description')}
+          placeholder={t('editor:second_lock_prompt.password_placeholder')}
+          submitLabel={t('editor:second_lock_prompt.unlock')}
+          onSubmit={async (password) => {
+            if (!(await session.reveal(password))) return false;
+            selectAfterReveal.current = revealFor;
+            return true;
+          }}
+          onClose={closeReveal}
+          onDismissed={selectRevealed}
         />
       </View>
     </Modal>
   );
 }
 
-function Option(props: { testID: string; label: string; checked: boolean; onPress: () => void }) {
+function Option(props: {
+  testID: string;
+  label: string;
+  /** Second-locked: a lock shows before the name. */
+  locked?: boolean;
+  checked: boolean;
+  onPress: () => void;
+}) {
   const { theme } = useUnistyles();
   return (
     <Pressable
       testID={props.testID}
       accessibilityRole="button"
       accessibilityState={{ selected: props.checked }}
+      accessibilityValue={props.locked ? { text: t('nav:media_gallery.badge.locked') } : undefined}
       onPress={props.onPress}
       style={styles.row}
     >
+      {props.locked ? (
+        <SymbolView name="lock.fill" tintColor={theme.colors.fgMuted} size={14} />
+      ) : null}
       <Text style={styles.label} numberOfLines={1}>
         {props.label}
       </Text>

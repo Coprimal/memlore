@@ -1,14 +1,24 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Animated, Pressable, SectionList, Text, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Animated,
+  Platform,
+  Pressable,
+  SectionList,
+  Text,
+  View,
+} from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import type { EntryRow, Template } from '@/modules/memlore-core';
 import { ErrorText } from '@/src/components/ErrorText';
 import { JournalPicker } from '@/src/components/JournalPicker';
+import { PasswordSheet } from '@/src/components/PasswordSheet';
 import { TemplatePicker } from '@/src/components/TemplatePicker';
 import { useEntries } from '@/src/hooks/useEntries';
+import { useLockSession } from '@/src/hooks/useLockSession';
 import { useJournals } from '@/src/hooks/useOrganize';
 import { activeLocale, t } from '@/src/i18n';
 import { type DayKey, groupByDay } from '@/src/lib/dayGroups';
@@ -47,17 +57,25 @@ export default function EntriesScreen() {
   // '' (the picker's "All journals") and a missing param both mean no filter.
   const journalId = typeof params.journal === 'string' && params.journal ? params.journal : null;
   const list = useEntries(journalId);
-  const journalList = useJournals();
-  const { journals } = journalList;
+  const { journals } = useJournals();
+  const session = useLockSession();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
   // Both new-entry buttons dim at once while `createEntry` runs.
   const [creating, setCreating] = useState(false);
+  // The covered row whose reveal sheet is open; the entry it opens once revealed.
+  const [revealFor, setRevealFor] = useState<string | null>(null);
+  const openAfterReveal = useRef<string | null>(null);
   const showSpinner = useDelayed(list.loading && list.rows.length === 0, SPINNER_DELAY_MS);
 
   const now = new Date();
+  // A locked row while not revealed is redacted by the engine (Covered). Under
+  // Hidden (show existence off) the next read omits it; until then it is left out.
+  const shown = session.showExistence
+    ? list.rows
+    : list.rows.filter((row) => !row.isLocked || session.revealed);
   let index = 0;
-  const sections = groupByDay(list.rows, now).map((group) => ({
+  const sections = groupByDay(shown, now).map((group) => ({
     key: group.key,
     title: dayLabel(group.key, now),
     // The flat index across sections, for `entry-row-<index>`.
@@ -66,28 +84,29 @@ export default function EntriesScreen() {
 
   // The journal the list last started loading, so an older failure never counts.
   const loadingFor = useRef<string | null | undefined>(undefined);
-  // A filter journal that is gone (deleted, or locked on the desktop) shows All
-  // journals: the list read for it failed and the journal list, read on the
-  // same focus, no longer has it. (useEntries reports a failure, not its code;
-  // its ERR_NOT_FOUND means the same: the journal is not listed.)
+  // A filter journal that is gone (deleted), or locked and not revealed (a
+  // re-lock, or locked here or on the desktop) shows All journals: its list
+  // read answered ERR_NOT_FOUND (Hidden, or gone) or ERR_SECOND_LOCK_REQUIRED
+  // (Covered). The new param reloads the list.
   useEffect(() => {
     if (list.loading) {
       loadingFor.current = journalId;
       return;
     }
-    const gone =
+    const unreadable =
       journalId !== null &&
       loadingFor.current === journalId &&
-      list.error &&
-      !journalList.loading &&
-      !journalList.error &&
-      !journals.some((journal) => journal.id === journalId);
-    if (gone) router.setParams({ journal: '' });
-  }, [journalId, list.loading, list.error, journalList.loading, journalList.error, journals]);
+      (list.failure === 'ERR_SECOND_LOCK_REQUIRED' || list.failure === 'ERR_NOT_FOUND');
+    if (unreadable) router.setParams({ journal: '' });
+  }, [journalId, list.loading, list.failure]);
 
   // The filtered journal's name; "All journals" too until the list knows it.
+  // A locked journal left out under Hidden never lends its name.
+  const listedJournals = session.showExistence
+    ? journals
+    : journals.filter((journal) => !journal.isLocked || session.revealed);
   const filterLabel =
-    journals.find((journal) => journal.id === journalId)?.name ??
+    listedJournals.find((journal) => journal.id === journalId)?.name ??
     t('nav:entry_list.filter.journal.all');
 
   function selectJournal(id: string | null) {
@@ -98,6 +117,27 @@ export default function EntriesScreen() {
   // The tap navigates in the same frame; the entry screen shows the cached row.
   function open(id: string) {
     router.push({ pathname: '/entry/[id]', params: { id } });
+  }
+
+  /** A covered row: its sheet opens; no earlier reveal's entry is left to open. */
+  function askReveal(id: string) {
+    openAfterReveal.current = null;
+    setRevealFor(id);
+  }
+
+  /**
+   * The sheet closes: after a successful reveal, the entry opens once the
+   * sheet has slid away (iOS); a push while it is still dismissing may be lost.
+   */
+  function closeReveal() {
+    setRevealFor(null);
+    if (Platform.OS !== 'ios') openRevealed();
+  }
+
+  function openRevealed() {
+    const id = openAfterReveal.current;
+    openAfterReveal.current = null;
+    if (id !== null) open(id);
   }
 
   async function newEntry() {
@@ -186,9 +226,14 @@ export default function EntriesScreen() {
       <SectionList
         sections={sections}
         keyExtractor={(item) => item.row.id}
-        renderItem={({ item }) => (
-          <EntryListRow row={item.row} index={item.index} onPress={() => open(item.row.id)} />
-        )}
+        renderItem={({ item }) => {
+          const { row } = item;
+          if (row.isLocked && !session.revealed) {
+            // The tap shows the reveal sheet at once (no data needed).
+            return <CoveredRow row={row} onPress={() => askReveal(row.id)} />;
+          }
+          return <EntryListRow row={row} index={item.index} onPress={() => open(row.id)} />;
+        }}
         renderSectionHeader={({ section }) => (
           <Text style={styles.sectionHeader}>{section.title}</Text>
         )}
@@ -216,6 +261,21 @@ export default function EntriesScreen() {
         visible={templatePickerOpen}
         onSelect={(template) => void newEntryFromTemplate(template)}
         onClose={() => setTemplatePickerOpen(false)}
+      />
+      {/* Outside the list: a list ancestor would take the sheet's first tap. */}
+      <PasswordSheet
+        visible={revealFor !== null}
+        title={t('nav:sidebar.unlock_second_lock')}
+        description={t('nav:sidebar.unlock_second_lock_description')}
+        placeholder={t('editor:second_lock_prompt.password_placeholder')}
+        submitLabel={t('editor:second_lock_prompt.unlock')}
+        onSubmit={async (password) => {
+          if (!(await session.reveal(password))) return false;
+          openAfterReveal.current = revealFor;
+          return true;
+        }}
+        onClose={closeReveal}
+        onDismissed={openRevealed}
       />
     </View>
   );
@@ -285,6 +345,27 @@ function EntryListRow(props: { row: EntryRow; index: number; onPress: () => void
           {row.previewText}
         </Text>
       ) : null}
+    </Pressable>
+  );
+}
+
+/** A locked entry shown redacted (Covered): a lock and its time, nothing else. */
+function CoveredRow(props: { row: EntryRow; onPress: () => void }) {
+  const { theme } = useUnistyles();
+  return (
+    <Pressable
+      testID="entry-row-locked"
+      accessibilityRole="button"
+      onPress={props.onPress}
+      style={styles.row}
+    >
+      <View style={styles.rowTop}>
+        <SymbolView name="lock.fill" tintColor={theme.colors.fgMuted} size={14} />
+        <Text style={styles.lockedTitle} numberOfLines={1}>
+          {t('editor:entry_card.locked_entry')}
+        </Text>
+        <Text style={styles.time}>{timeFormat.format(props.row.entryDate * 1000)}</Text>
+      </View>
     </Pressable>
   );
 }
@@ -393,6 +474,12 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: 17,
     fontWeight: '600',
     color: theme.colors.fg,
+  },
+  lockedTitle: {
+    flex: 1,
+    fontSize: 17,
+    fontWeight: '600',
+    color: theme.colors.fgMuted,
   },
   dot: {
     width: theme.space(2.5),

@@ -19,6 +19,8 @@ const SAVE_DEBOUNCE_MS = 1500
 const PREVIEW_LENGTH = 150
 /** At most one `onFormatState` per this interval while typing or moving the caret. */
 const FORMAT_STATE_THROTTLE_MS = 100
+/** At most one `onActivity` per this interval while the document changes. */
+const ACTIVITY_THROTTLE_MS = 10_000
 
 // Before the editor mounts and renders any media node (see contentPolicy.ts).
 installContentPolicy()
@@ -109,6 +111,12 @@ interface Props {
    * then unchanged. Read-only modes never answer: native checks `editable`.
    */
   onRestored: (ok: boolean) => Promise<void>
+  /**
+   * The document changed (editable mode): at once, then at most every 10 s,
+   * so typing with no pause still counts as activity for the second lock's
+   * idle re-lock (the save runs only after a pause).
+   */
+  onActivity?: () => Promise<void>
   readOnly: boolean
   ref?: Ref<EntryEditorHandle>
   dom?: DOMProps
@@ -136,6 +144,7 @@ export default function EntryEditorDom({
   onFormatState,
   onLinkPress,
   onRestored,
+  onActivity,
   readOnly,
   ref,
 }: Props) {
@@ -152,6 +161,8 @@ export default function EntryEditorDom({
   onLinkPressRef.current = onLinkPress
   const onRestoredRef = useRef(onRestored)
   onRestoredRef.current = onRestored
+  const onActivityRef = useRef(onActivity)
+  onActivityRef.current = onActivity
   /** Saves now what the debounce would save later; a no-op when read-only. */
   const flushRef = useRef<() => Promise<void>>(() => Promise.resolve())
   /** Runs a toolbar command; a no-op until the editable editor exists. */
@@ -265,9 +276,16 @@ export default function EntryEditorDom({
       save()
       await inFlight
     }
+    // Leading-edge throttle for `onActivity`.
+    let lastActivity = 0
     const onDocUpdate = () => {
       if (timer) clearTimeout(timer)
       timer = setTimeout(save, SAVE_DEBOUNCE_MS)
+      const now = Date.now()
+      if (now - lastActivity >= ACTIVITY_THROTTLE_MS) {
+        lastActivity = now
+        void onActivityRef.current?.()
+      }
     }
     // Backgrounding the app: start the save now. It cannot be awaited, so
     // a kill right after may still lose it.

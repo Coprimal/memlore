@@ -1,0 +1,268 @@
+# Second lock (M3c task 4.5): set the password, lock an entry from the entry
+# menu, re-lock (Hidden: the entry leaves the list), show existence (Covered:
+# a redacted row), reveal from the row (a wrong password is refused), the
+# native re-lock on background with version history open (both screens leave
+# and nothing of the entry shows), then disable (no covered row remains).
+#
+# Runs against the Release simulator build (see vault-create-unlock.yaml):
+#   pnpm mobile:ios:release
+#   pnpm mobile:e2e
+# clearState wipes the app's container, so the flow creates its own vault.
+# The second-lock password below is a test-only value.
+appId: app.memlore.mobile
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible:
+      id: backup-notice
+    timeout: 15000
+- tapOn:
+    id: password-input
+- inputText: "12345678"
+- tapOn:
+    id: confirm-password-input
+- inputText: "12345678"
+- tapOn:
+    id: create-vault-button
+- extendedWaitUntil:
+    visible:
+      id: recovery-phrase
+    timeout: 30000
+- tapOn:
+    id: phrase-saved-button
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+    timeout: 15000
+
+# 1. An entry with a unique title and a body (so a later session keeps a
+# version of it).
+- tapOn:
+    id: new-entry-button
+# The placeholder covers the title field until the editor is ready.
+- extendedWaitUntil:
+    notVisible:
+      id: entry-placeholder
+    timeout: 15000
+- tapOn:
+    id: entry-title-input
+- inputText: "Locked 4.5"
+- tapOn:
+    point: "50%,40%"
+- inputText: "first body"
+- tapOn:
+    point: "10%,7%"
+- extendedWaitUntil:
+    visible:
+      text: ".*Locked 4.5.*"
+    timeout: 10000
+- assertVisible:
+    id: entry-count
+    text: "1 entry"
+
+# Set the second-lock password (this also reveals).
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: second-lock-set
+    direction: DOWN
+- tapOn:
+    id: second-lock-set
+- extendedWaitUntil:
+    visible:
+      id: password-sheet-confirm
+    timeout: 5000
+- tapOn:
+    id: password-sheet-input
+- inputText: "lockpw45"
+- tapOn:
+    id: password-sheet-confirm
+- inputText: "lockpw45"
+- tapOn:
+    id: password-sheet-submit
+- extendedWaitUntil:
+    visible:
+      id: second-lock-lock-now
+    timeout: 10000
+
+# Lock the entry from its menu (2: Lock entry), then go back.
+- tapOn:
+    id: entries-tab
+- tapOn:
+    text: ".*Locked 4.5.*"
+- extendedWaitUntil:
+    notVisible:
+      id: entry-placeholder
+    timeout: 15000
+- tapOn:
+    id: entry-menu
+- tapOn: "Lock entry"
+- tapOn:
+    point: "10%,7%"
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+    timeout: 10000
+
+# Re-lock: the entry leaves the list (Hidden) and the count drops.
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: second-lock-lock-now
+    direction: DOWN
+- tapOn:
+    id: second-lock-lock-now
+- extendedWaitUntil:
+    visible:
+      id: second-lock-reveal
+    timeout: 10000
+- tapOn:
+    id: entries-tab
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+      text: "0 entries"
+    timeout: 10000
+- assertNotVisible:
+    text: ".*Locked 4.5.*"
+- assertNotVisible:
+    id: entry-row-locked
+
+# 2. Show existence needs the reveal: the panel asks for it, then turns it on.
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: second-lock-existence-toggle
+    direction: DOWN
+- tapOn:
+    id: second-lock-existence-toggle
+- extendedWaitUntil:
+    visible:
+      id: password-sheet-input
+    timeout: 5000
+- tapOn:
+    id: password-sheet-input
+- inputText: "lockpw45"
+- tapOn:
+    id: password-sheet-submit
+- extendedWaitUntil:
+    visible:
+      id: second-lock-lock-now
+    timeout: 10000
+- tapOn:
+    id: second-lock-lock-now
+- extendedWaitUntil:
+    visible:
+      id: second-lock-reveal
+    timeout: 10000
+
+# Covered: a redacted row, no title.
+- tapOn:
+    id: entries-tab
+- extendedWaitUntil:
+    visible:
+      id: entry-row-locked
+    timeout: 10000
+- assertNotVisible:
+    text: ".*Locked 4.5.*"
+
+# 3. The covered row asks for the password: a wrong one is refused inline,
+# the right one opens the entry.
+- tapOn:
+    id: entry-row-locked
+- extendedWaitUntil:
+    visible:
+      id: password-sheet-input
+    timeout: 5000
+- tapOn:
+    id: password-sheet-input
+- inputText: "wrongpw45"
+- tapOn:
+    id: password-sheet-submit
+- extendedWaitUntil:
+    visible: "Incorrect password."
+    timeout: 10000
+- tapOn:
+    id: password-sheet-input
+- inputText: "lockpw45"
+- tapOn:
+    id: password-sheet-submit
+- extendedWaitUntil:
+    visible:
+      id: entry-menu
+    timeout: 15000
+- extendedWaitUntil:
+    notVisible:
+      id: entry-placeholder
+    timeout: 15000
+- assertVisible:
+    text: ".*Locked 4.5.*"
+
+# 4. An edit (this session's first save keeps "first body" as a version),
+# then version history, then background and return: native ends the reveal on
+# every background, while the vault itself stays open at the 1-minute default
+# (so this is the second lock's own re-lock, not the app lock). History and
+# the entry both leave without saving; the list shows the covered row only.
+- tapOn:
+    point: "50%,60%"
+- inputText: " more"
+- tapOn:
+    id: entry-menu
+- tapOn: "Version history"
+- extendedWaitUntil:
+    visible:
+      id: version-row-0
+    timeout: 10000
+- pressKey: Home
+- launchApp:
+    stopApp: false
+- extendedWaitUntil:
+    visible:
+      id: entry-row-locked
+    timeout: 15000
+- assertNotVisible:
+    id: unlock-button
+- assertNotVisible:
+    id: version-row-0
+- assertNotVisible:
+    id: version-preview
+- assertNotVisible:
+    text: ".*Locked 4.5.*"
+
+# 5. Disable the second lock: every lock flag is cleared, the entry is plain.
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: second-lock-disable
+    direction: DOWN
+- tapOn:
+    id: second-lock-disable
+- extendedWaitUntil:
+    visible:
+      id: password-sheet-input
+    timeout: 5000
+- tapOn:
+    id: password-sheet-input
+- inputText: "lockpw45"
+- tapOn:
+    id: password-sheet-submit
+- extendedWaitUntil:
+    visible:
+      id: second-lock-set
+    timeout: 10000
+- tapOn:
+    id: entries-tab
+- extendedWaitUntil:
+    visible:
+      text: ".*Locked 4.5.*"
+    timeout: 10000
+- assertNotVisible:
+    id: entry-row-locked
+- assertVisible:
+    id: entry-count
+    text: "1 entry"

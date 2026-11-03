@@ -6,7 +6,7 @@ import { errorCode, useVault } from '@/src/hooks/useVault';
 import { getCachedRow, putCachedRow } from '@/src/lib/rowCache';
 import { createVersionSession } from '@/src/lib/versionSession';
 
-export type EntryDocStatus = 'loading' | 'ready' | 'notFound' | 'failed';
+export type EntryDocStatus = 'loading' | 'ready' | 'notFound' | 'lockRequired' | 'failed';
 
 /** A version's Yjs document (base64), or why it could not be read. */
 export type VersionRead = { b64: string } | { error: MemloreErrorCode };
@@ -16,8 +16,9 @@ export type VersionRead = { b64: string } | { error: MemloreErrorCode };
  * (base64), the save the editor calls with its full state, and the title
  * save. The body save goes through the engine's merged save, like the
  * desktop editor. ERR_LOCKED shows the lock screen; ERR_NOT_FOUND (the entry
- * is gone, locked or invisible) sets `status` to 'notFound'. Components use
- * this, never the native module.
+ * is gone, locked or invisible) sets `status` to 'notFound'; a load refused
+ * with ERR_SECOND_LOCK_REQUIRED sets 'lockRequired' (reveal, then bump
+ * `attempt` to load again). Components use this, never the native module.
  *
  * Version history, like the desktop: the first content save of a session
  * keeps the STORED doc as a version before it saves. A session is one load of
@@ -26,7 +27,7 @@ export type VersionRead = { b64: string } | { error: MemloreErrorCode };
  * `snapshot` and `versionContent` are the restore's two reads, and
  * `lastSaveError` says whether the body on screen is stored (null) first.
  */
-export function useEntryDoc(id: string) {
+export function useEntryDoc(id: string, attempt = 0) {
   const vault = useVault();
   const [stateB64, setStateB64] = useState<string | null>(null);
   const [status, setStatus] = useState<EntryDocStatus>('loading');
@@ -58,13 +59,15 @@ export function useEntryDoc(id: string) {
       })
       .catch((e: unknown) => {
         if (cancelled) return;
-        setStatus('failed');
+        // Only the load asks for the reveal: a save refused by a re-lock
+        // leaves `status` alone (the screen leaves on the re-lock).
+        setStatus(errorCode(e) === 'ERR_SECOND_LOCK_REQUIRED' ? 'lockRequired' : 'failed');
         onError(e);
       });
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, attempt]);
 
   /** Rejects when the save failed, so the editor retries on its next edit. */
   const save = useCallback(
@@ -128,6 +131,15 @@ export function useEntryDoc(id: string) {
     if (row) putCachedRow({ ...row, title: title === '' ? null : title });
   }, []);
 
+  /**
+   * Drops the document read (the entry's other read was refused by a re-lock
+   * meanwhile): the editor unmounts until `attempt` loads it again.
+   */
+  const discard = useCallback(() => {
+    setStateB64(null);
+    setStatus('loading');
+  }, []);
+
   const markSnapshotTaken = useCallback(() => sessionRef.current.markTaken(Date.now()), []);
 
   /** Why the last body save failed, or null when it succeeded (or none ran). */
@@ -169,6 +181,7 @@ export function useEntryDoc(id: string) {
     status,
     save,
     saveTitle,
+    discard,
     markSnapshotTaken,
     lastSaveError,
     snapshot,

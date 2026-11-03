@@ -13,6 +13,7 @@ import {
   Alert,
   KeyboardAvoidingView,
   Linking,
+  Platform,
   Pressable,
   TextInput,
   View,
@@ -26,14 +27,16 @@ import { EditorToolbar } from '@/src/components/EditorToolbar';
 import { EntryMeta, META_ROW_HEIGHT } from '@/src/components/EntryMeta';
 import { EntryPlaceholder, placeholderBody } from '@/src/components/EntryPlaceholder';
 import { ErrorText } from '@/src/components/ErrorText';
+import { PasswordSheet } from '@/src/components/PasswordSheet';
 import { getCachedRow, useEntryActions, useEntryDetail } from '@/src/hooks/useEntries';
 import { useEntryDoc } from '@/src/hooks/useEntryDoc';
-import { noteActivity } from '@/src/hooks/useLockSession';
+import { noteActivity, useLockSession } from '@/src/hooks/useLockSession';
 import { useTemplateLookup } from '@/src/hooks/useTemplates';
 import { errorCode, useVault } from '@/src/hooks/useVault';
 import { type PendingRestore, takePendingRestore } from '@/src/hooks/useVersions';
 import { t } from '@/src/i18n';
 import { registerFlusher } from '@/src/lib/flushRegistry';
+import { clearPendingRestore } from '@/src/lib/pendingRestore';
 
 /** How long "Entry not found" stays readable before the screen goes back. */
 const NOT_FOUND_BACK_MS = 1000;
@@ -45,6 +48,11 @@ const TITLE_SAVE_DEBOUNCE_MS = 800;
 const FLUSH_CAP_MS = 3000;
 /** The DOM side only reports these; checked again before handing a URL to iOS. */
 const EXTERNAL_URL = /^(https?:|mailto:)/i;
+/** The engine's refusal to lock an entry in Trash (desktop `trashedEntryError.ts`). */
+const TRASHED_ENTRY_MESSAGE = 'entry is in Trash; restore it to edit';
+
+/** What a successful reveal retries: both reads, or the lock change that was refused. */
+type RevealFor = 'read' | 'lock' | 'unlock';
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -54,6 +62,16 @@ function delay(ms: number): Promise<void> {
 function restoreFailed(code: MemloreErrorCode | null = null) {
   if (code === 'ERR_LOCKED') return;
   Alert.alert(t('editor:versionHistory.restore_failed'));
+}
+
+/** "In Trash" for the engine's refusal of an entry in Trash, else the generic error. */
+function lockFailedMessage(e: unknown): string {
+  const message =
+    typeof e === 'object' && e !== null && 'message' in e && typeof e.message === 'string'
+      ? e.message
+      : '';
+  if (message.includes(TRASHED_ENTRY_MESSAGE)) return t('editor:panel.trashed_banner');
+  return t('mobile.error');
 }
 
 /**
@@ -68,6 +86,12 @@ function restoreFailed(code: MemloreErrorCode | null = null) {
  * history (header menu) opens at once while it saves; a restore confirmed
  * there runs here on return, after a snapshot of the current content (desktop
  * EditorPanel).
+ *
+ * Second lock: Lock entry / Unlock entry (header menu, only while a second-lock
+ * password is set). A read refused with ERR_SECOND_LOCK_REQUIRED (a covered
+ * entry) shows the reveal sheet and reads once more after a reveal; a cancel,
+ * or a second refusal, leaves. A locked entry while not revealed (a re-lock,
+ * or a lock while not revealed) shows nothing and leaves without saving.
  */
 export default function EntryScreen() {
   const params = useLocalSearchParams<{ id: string; template?: string | string[] }>();
@@ -79,13 +103,29 @@ export default function EntryScreen() {
   const { theme } = useUnistyles();
   // The keyboard's frame is in window coordinates; this screen starts below the header.
   const headerHeight = useHeaderHeight();
+  const session = useLockSession();
   const row = getCachedRow(id);
+  // Bumped after a reveal: both reads run once more.
+  const [attempt, setAttempt] = useState(0);
   // Both reads start in the same frame and run in parallel.
-  const entry = useEntryDetail(id);
-  const doc = useEntryDoc(id);
+  const entry = useEntryDetail(id, attempt);
+  const doc = useEntryDoc(id, attempt);
   const actions = useEntryActions(id, entry.detail);
   const notFound = entry.notFound || doc.status === 'notFound' || actions.notFound;
-  const failed = !notFound && (entry.failed || doc.status === 'failed');
+  const lockRequired = !notFound && (entry.lockRequired || doc.status === 'lockRequired');
+  const failed = !notFound && !lockRequired && (entry.failed || doc.status === 'failed');
+  // From a lock change here (the stored state, its journal's lock included).
+  const [lockedNow, setLockedNow] = useState<boolean | null>(null);
+  const locked = lockedNow ?? entry.detail?.isLocked ?? false;
+  // Hidden again: nothing of it may show, and the screen leaves.
+  const hidden = locked && !session.revealed;
+  // The reveal sheet is open, and for what; `revealed` says the reveal succeeded.
+  const [revealFor, setRevealFor] = useState<RevealFor | null>(null);
+  const revealed = useRef(false);
+  // The lock change to retry once the sheet has slid away after a reveal.
+  const afterReveal = useRef<(() => void) | null>(null);
+  // The reads already ran once more after a reveal.
+  const readRetried = useRef(false);
 
   const editorRef = useRef<EntryEditorHandle>(null);
   const [overlay, setOverlay] = useState(true);
@@ -118,6 +158,8 @@ export default function EntryScreen() {
   const flushing = useRef(false);
   // Moved to Trash: the leave must not save (the entry is gone).
   const trashed = useRef(false);
+  // Hidden by the second lock: the leave must not save (the gate refuses it).
+  const gone = useRef(false);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -129,10 +171,51 @@ export default function EntryScreen() {
     return () => clearTimeout(timer);
   }, [notFound, router]);
 
+  // Again for each read after a reveal.
   useEffect(() => {
+    setOverlay(true);
     const timer = setTimeout(() => setOverlay(false), OVERLAY_FALLBACK_MS);
     return () => clearTimeout(timer);
-  }, []);
+  }, [attempt]);
+
+  /** Leaves at once, without saving: the entry is hidden by the second lock. */
+  const leaveHidden = useCallback(() => {
+    // Once: a second back would pop the screen below.
+    if (gone.current) return;
+    gone.current = true;
+    // A restore confirmed for it must not run on a later open.
+    clearPendingRestore(id);
+    setLeaving(true);
+    if (router.canGoBack()) router.back();
+    else router.replace('/');
+  }, [id, router]);
+
+  // Only while focused: with version history on top, a back would pop that
+  // screen instead; this one then leaves when it gets the focus back.
+  useFocusEffect(
+    useCallback(() => {
+      if (hidden) leaveHidden();
+    }, [hidden, leaveHidden]),
+  );
+
+  // A covered entry: ask for the reveal, then read once more. A second
+  // refusal after a reveal leaves (one retry). Not keyed on `attempt`: the
+  // retry's first render still carries the old refusal.
+  useEffect(() => {
+    if (!lockRequired) return;
+    if (readRetried.current) {
+      leaveHidden();
+      return;
+    }
+    revealed.current = false;
+    setRevealFor('read');
+  }, [lockRequired, leaveHidden]);
+
+  // A body read before the detail read was refused (a re-lock in between)
+  // must not stay held: the retry after a reveal reads it again.
+  useEffect(() => {
+    if (entry.lockRequired) doc.discard();
+  }, [entry.lockRequired, doc.discard]);
 
   useEffect(() => {
     if (!entry.detail) return;
@@ -220,9 +303,9 @@ export default function EntryScreen() {
 
   /** Title and body saved (or the cap passed). */
   const flushEntry = useCallback(
-    // A trashed entry is never saved again (the engine refuses it anyway).
+    // A trashed or hidden entry is never saved again (the engine refuses it anyway).
     () =>
-      trashed.current
+      trashed.current || gone.current
         ? Promise.resolve()
         : Promise.race([Promise.all([flushTitle(), flushEditor()]), delay(FLUSH_CAP_MS)]),
     [flushTitle, flushEditor],
@@ -240,8 +323,8 @@ export default function EntryScreen() {
   // Back and swipe back wait for the saves. Never while locked: the lock's
   // removal of this screen must go through at once.
   usePreventRemove(vault.status === 'unlocked' && !leaving && !notFound, ({ repeat }) => {
-    // `leaving` from a trash may not have rendered yet: let the pop through.
-    if (trashed.current) {
+    // `leaving` from a trash or a hide may not have rendered yet: let the pop through.
+    if (trashed.current || gone.current) {
       repeat();
       return;
     }
@@ -343,6 +426,9 @@ export default function EntryScreen() {
 
   const onFormatState = useCallback(async (state: FormatState) => setFormat(state), []);
 
+  // Typing is activity for the second lock's idle re-lock (throttled by the editor).
+  const onEditorActivity = useCallback(async () => noteActivity(), []);
+
   const exec = useCallback<EntryEditorHandle['exec']>((cmd, arg) => {
     editorRef.current?.exec?.(cmd, arg);
   }, []);
@@ -379,24 +465,116 @@ export default function EntryScreen() {
     // Hidden only for an entry known to be read-only; before onReady the restore is
     // parked and refused there if the editor opens read-only.
     const canRestore = editableRef.current === false ? '0' : '1';
-    router.push({ pathname: '/history/[id]', params: { id, editable: canRestore } });
-  }, [flushEntry, id, router]);
+    // Lets history leave at once on a re-lock; left out while not read yet.
+    const known = lockedNow ?? entry.detail?.isLocked;
+    const lockedParam = known === undefined ? {} : { locked: known ? '1' : '0' };
+    router.push({
+      pathname: '/history/[id]',
+      params: { id, editable: canRestore, ...lockedParam },
+    });
+  }, [flushEntry, id, router, lockedNow, entry.detail]);
 
-  /** The header menu: Version history; Move to Trash, then its confirmation (decision 7). */
+  /**
+   * Locks or unlocks the entry. A refusal for want of the reveal shows the
+   * sheet and tries once more after a reveal; locking while not revealed
+   * hides the entry, so the screen leaves.
+   */
+  const changeLock = useCallback(
+    async (lock: boolean, retried = false) => {
+      try {
+        const nowLocked = await actions.setLocked(lock);
+        if (mounted.current) setLockedNow(nowLocked);
+      } catch (e) {
+        if (!mounted.current) return;
+        const code = errorCode(e);
+        // The lock screen or "Entry not found" already says so.
+        if (code === 'ERR_LOCKED' || code === 'ERR_NOT_FOUND') return;
+        if (code === 'ERR_SECOND_LOCK_REQUIRED' && !retried) {
+          revealed.current = false;
+          setRevealFor(lock ? 'lock' : 'unlock');
+          return;
+        }
+        Alert.alert(t('mobile.entry_lock.failed'), lockFailedMessage(e));
+      }
+    },
+    [actions.setLocked],
+  );
+
+  /**
+   * `actions.move`, then the stored lock read back: a move into a locked
+   * journal locks the entry with it (the screen then leaves on the next
+   * re-lock), a move out of one unlocks it. A read back that failed counts as
+   * locked (fail closed), after the open edits are saved: a hide never saves.
+   */
+  const move = useCallback(
+    async (journalId: string) => {
+      const moved = await actions.move(journalId);
+      if (!moved) return false;
+      const nowLocked = await actions.readLocked();
+      if (nowLocked === null) await flushEntry();
+      if (mounted.current) setLockedNow(nowLocked ?? true);
+      return true;
+    },
+    [actions.move, actions.readLocked, flushEntry],
+  );
+
+  function runAfterReveal() {
+    const then = afterReveal.current;
+    afterReveal.current = null;
+    if (then) then();
+  }
+
+  /**
+   * The reveal sheet closed: retry what it was for after a reveal, else leave
+   * a covered entry. A lock change runs once the sheet has slid away (iOS): an
+   * Alert shown while the sheet is still dismissing may never appear.
+   */
+  const closeReveal = useCallback(() => {
+    const why = revealFor;
+    const ok = revealed.current;
+    revealed.current = false;
+    afterReveal.current = null;
+    setRevealFor(null);
+    if (why === 'read') {
+      if (!ok) {
+        leaveHidden();
+        return;
+      }
+      readRetried.current = true;
+      setAttempt((n) => n + 1);
+    } else if (why !== null && ok) {
+      afterReveal.current = () => void changeLock(why === 'lock', true);
+      if (Platform.OS !== 'ios') runAfterReveal();
+    }
+  }, [revealFor, leaveHidden, changeLock]);
+
+  // Shown once the entry is read and only while a second-lock password is set.
+  const canLock = session.enabled && entry.detail !== null;
+
+  /**
+   * The header menu: Version history; Move to Trash, then its confirmation
+   * (decision 7); then Lock entry / Unlock entry when `canLock` (index 2).
+   */
   const openMenu = useCallback(() => {
+    const options = [
+      t('editor:entry_context.version_history'),
+      t('editor:entry_card.delete_title'),
+    ];
+    if (canLock) options.push(locked ? t('mobile.entry_lock.unlock') : t('mobile.entry_lock.lock'));
+    options.push(t('common:confirm_dialog.cancel'));
     ActionSheetIOS.showActionSheetWithOptions(
       {
-        options: [
-          t('editor:entry_context.version_history'),
-          t('editor:entry_card.delete_title'),
-          t('common:confirm_dialog.cancel'),
-        ],
+        options,
         destructiveButtonIndex: 1,
-        cancelButtonIndex: 2,
+        cancelButtonIndex: options.length - 1,
       },
       (index) => {
         if (index === 0) {
           openHistory();
+          return;
+        }
+        if (index === 2 && canLock) {
+          void changeLock(!locked);
           return;
         }
         if (index !== 1) return;
@@ -410,7 +588,7 @@ export default function EntryScreen() {
         ]);
       },
     );
-  }, [moveToTrash, openHistory]);
+  }, [moveToTrash, openHistory, canLock, locked, changeLock]);
 
   const onChangeTitle = (value: string) => {
     // Keys are not touches: typing the title keeps the second lock's reveal.
@@ -420,6 +598,15 @@ export default function EntryScreen() {
     if (titleTimer.current) clearTimeout(titleTimer.current);
     titleTimer.current = setTimeout(() => void flushTitle(), TITLE_SAVE_DEBOUNCE_MS);
   };
+
+  if (hidden) {
+    // Nothing of a hidden entry shows while the screen leaves.
+    return (
+      <View style={styles.screen}>
+        <Stack.Screen options={{ headerTitle: '', headerRight: () => null }} />
+      </View>
+    );
+  }
 
   if (notFound || failed) {
     return (
@@ -432,79 +619,119 @@ export default function EntryScreen() {
     );
   }
 
+  // The reveal sheet is all that shows of a refused read, even if the other
+  // read succeeded first (a re-lock between them): no title, meta or body.
+  const revealSheet = (
+    <PasswordSheet
+      visible={revealFor !== null}
+      title={t('nav:sidebar.unlock_second_lock')}
+      description={t('nav:sidebar.unlock_second_lock_description')}
+      placeholder={t('editor:second_lock_prompt.password_placeholder')}
+      submitLabel={t('editor:second_lock_prompt.unlock')}
+      onSubmit={async (password) => {
+        if (!(await session.reveal(password))) return false;
+        revealed.current = true;
+        return true;
+      }}
+      onClose={closeReveal}
+      onDismissed={runAfterReveal}
+    />
+  );
+
   const placeholderTitle = (entry.detail ?? row)?.title ?? null;
   // Once the entry is read, its own text (even empty) replaces the preview.
   const body = entry.detail
     ? placeholderBody(entry.detail.contentText ?? '')
     : (row?.previewText ?? null);
 
+  // One sheet for both: the read after a reveal swaps the content above it,
+  // never the sliding sheet itself.
   return (
     <View style={styles.screen}>
-      <Stack.Screen
-        options={{
-          headerTitle: '',
-          headerRight: () => (
-            <Pressable
-              testID="entry-menu"
-              accessibilityRole="button"
-              accessibilityLabel={t('editor:pills.more_aria')}
-              hitSlop={8}
-              onPress={openMenu}
-            >
-              <SymbolView name="ellipsis.circle" tintColor={theme.colors.accentText} size={24} />
-            </Pressable>
-          ),
-        }}
-      />
-      {/* The WebView frame ends at the toolbar, which sits right above the keyboard. */}
-      <KeyboardAvoidingView
-        style={styles.screen}
-        behavior="padding"
-        keyboardVerticalOffset={headerHeight}
-      >
-        <TextInput
-          testID="entry-title-input"
-          style={styles.title}
-          value={title ?? placeholderTitle ?? ''}
-          onChangeText={onChangeTitle}
-          onBlur={() => void flushTitle()}
-          onSubmitEditing={() => void flushTitle()}
-          editable={title !== null && editable !== false}
-          placeholder={t('nav:media_gallery.untitled')}
-          placeholderTextColor={theme.colors.fgMuted}
-          returnKeyType="done"
-        />
-        <EntryMeta meta={actions.meta} actions={actions} canAddTags={entry.detail !== null} />
-        <View style={styles.editor}>
-          {doc.status === 'ready' && doc.stateB64 !== null ? (
-            <EntryEditorDom
-              key={id}
-              ref={editorRef}
-              initialStateB64={doc.stateB64}
-              onUpdate={doc.save}
-              onFlushed={onFlushed}
-              onReady={onReady}
-              onFormatState={onFormatState}
-              onLinkPress={onLinkPress}
-              onRestored={onRestored}
-              readOnly={false}
-              dom={{ style: { flex: 1 }, hideKeyboardAccessoryView: true }}
+      {lockRequired ? (
+        <Stack.Screen options={{ headerTitle: '', headerRight: () => null }} />
+      ) : (
+        <>
+          <Stack.Screen
+            options={{
+              headerTitle: '',
+              headerRight: () => (
+                <Pressable
+                  testID="entry-menu"
+                  accessibilityRole="button"
+                  accessibilityLabel={t('editor:pills.more_aria')}
+                  hitSlop={8}
+                  onPress={openMenu}
+                >
+                  <SymbolView
+                    name="ellipsis.circle"
+                    tintColor={theme.colors.accentText}
+                    size={24}
+                  />
+                </Pressable>
+              ),
+            }}
+          />
+          {/* The WebView frame ends at the toolbar, which sits right above the keyboard. */}
+          <KeyboardAvoidingView
+            style={styles.screen}
+            behavior="padding"
+            keyboardVerticalOffset={headerHeight}
+          >
+            <TextInput
+              testID="entry-title-input"
+              style={styles.title}
+              value={title ?? placeholderTitle ?? ''}
+              onChangeText={onChangeTitle}
+              onBlur={() => void flushTitle()}
+              onSubmitEditing={() => void flushTitle()}
+              editable={title !== null && editable !== false}
+              placeholder={t('nav:media_gallery.untitled')}
+              placeholderTextColor={theme.colors.fgMuted}
+              returnKeyType="done"
+            />
+            <EntryMeta
+              meta={actions.meta}
+              actions={{ ...actions, move }}
+              canAddTags={entry.detail !== null}
+            />
+            <View style={styles.editor}>
+              {doc.status === 'ready' && doc.stateB64 !== null ? (
+                <EntryEditorDom
+                  key={id}
+                  ref={editorRef}
+                  initialStateB64={doc.stateB64}
+                  onUpdate={doc.save}
+                  onFlushed={onFlushed}
+                  onReady={onReady}
+                  onFormatState={onFormatState}
+                  onLinkPress={onLinkPress}
+                  onRestored={onRestored}
+                  onActivity={onEditorActivity}
+                  readOnly={false}
+                  dom={{ style: { flex: 1 }, hideKeyboardAccessoryView: true }}
+                />
+              ) : null}
+            </View>
+            {editable === true && format?.focused ? (
+              <EditorToolbar state={format} exec={exec} />
+            ) : null}
+          </KeyboardAvoidingView>
+          {overlay ? (
+            <EntryPlaceholder
+              title={placeholderTitle}
+              body={body}
+              style={StyleSheet.absoluteFill}
+              spacerHeight={META_ROW_HEIGHT}
+              onPress={() => {
+                pendingFocus.current = true;
+              }}
             />
           ) : null}
-        </View>
-        {editable === true && format?.focused ? <EditorToolbar state={format} exec={exec} /> : null}
-      </KeyboardAvoidingView>
-      {overlay ? (
-        <EntryPlaceholder
-          title={placeholderTitle}
-          body={body}
-          style={StyleSheet.absoluteFill}
-          spacerHeight={META_ROW_HEIGHT}
-          onPress={() => {
-            pendingFocus.current = true;
-          }}
-        />
-      ) : null}
+        </>
+      )}
+      {/* No ScrollView above it here, so its first tap is never taken. */}
+      {revealSheet}
     </View>
   );
 }
