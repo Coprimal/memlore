@@ -6,6 +6,7 @@ import {
   Animated,
   Platform,
   Pressable,
+  RefreshControl,
   SectionList,
   Text,
   View,
@@ -19,6 +20,7 @@ import { PasswordSheet } from '@/src/components/PasswordSheet';
 import { TemplatePicker } from '@/src/components/TemplatePicker';
 import { useEntries } from '@/src/hooks/useEntries';
 import { useLockSession } from '@/src/hooks/useLockSession';
+import { useSync, useSyncRefresh } from '@/src/hooks/useSync';
 import { useJournals } from '@/src/hooks/useOrganize';
 import { activeLocale, t } from '@/src/i18n';
 import { type DayKey, groupByDay } from '@/src/lib/dayGroups';
@@ -61,6 +63,9 @@ export default function EntriesScreen() {
   const list = useEntries(journalId);
   const { journals } = useJournals();
   const session = useLockSession();
+  const sync = useSync();
+  const pull = useSyncRefresh();
+  const { theme } = useUnistyles();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
   // Both new-entry buttons dim at once while `createEntry` runs.
@@ -68,7 +73,10 @@ export default function EntriesScreen() {
   // The covered row whose reveal sheet is open; the entry it opens once revealed.
   const [revealFor, setRevealFor] = useState<string | null>(null);
   const openAfterReveal = useRef<string | null>(null);
-  const showSpinner = useDelayed(list.loading && list.rows.length === 0, SPINNER_DELAY_MS);
+  // The first sync after onboarding may still bring the entries: the empty
+  // list shows the loading placeholder, not "no entries".
+  const waiting = list.loading || sync.awaitingFirstSync;
+  const showSpinner = useDelayed(waiting && list.rows.length === 0, SPINNER_DELAY_MS);
   // The vault indicator was tapped: it and the vault's rows go in the tap's
   // frame, while the close saves the open edits first.
   const [closingVault, setClosingVault] = useState(false);
@@ -272,8 +280,15 @@ export default function EntriesScreen() {
         stickySectionHeadersEnabled
         onEndReached={() => void list.loadMore()}
         onEndReachedThreshold={0.5}
+        refreshControl={
+          <RefreshControl
+            refreshing={pull.refreshing}
+            onRefresh={pull.onRefresh}
+            tintColor={theme.colors.fgMuted}
+          />
+        }
         ListEmptyComponent={
-          list.loading ? (
+          waiting ? (
             <FadeIn visible={showSpinner} />
           ) : list.error ? undefined : (
             <Text style={styles.empty}>{t('nav:entry_list.empty.no_entries')}</Text>

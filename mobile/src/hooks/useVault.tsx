@@ -5,6 +5,7 @@ import MemloreCore, {
   type AutoLockSeconds,
   type BiometricKind,
   type MemloreErrorCode,
+  type StartupMode,
 } from '@/modules/memlore-core';
 import { flushAll } from '@/src/lib/flushRegistry';
 import { clearPendingRestore } from '@/src/lib/pendingRestore';
@@ -345,6 +346,59 @@ function useVaultState() {
       void refreshAutoLock();
     });
 
+  /**
+   * Onboarding joined the cloud vault: the engine is already unlocked (and
+   * native has started the first sync), so the app switches to it.
+   */
+  function markOnboarded() {
+    enterUnlocked();
+  }
+
+  /**
+   * This phone's vault was deleted (`deleteVault`): native is at first
+   * launch, with no vault, Face ID key or Google sign-in left, so the app
+   * shows the create screen.
+   */
+  function markDeleted() {
+    showLocked();
+    setRecoveryPhrase(null);
+    setAutoPromptPending(false);
+    setBiometric((current) => ({ ...current, enabled: false }));
+    setStatus('first_launch');
+    void refreshBiometric();
+  }
+
+  /**
+   * A `deleteVault` that failed may still have locked the vault (or removed
+   * it): reads the real state, so an unlocked screen never stays over a
+   * locked or deleted vault. A vault that is still unlocked stays shown.
+   */
+  async function resyncVaultState(): Promise<void> {
+    let mode: StartupMode;
+    try {
+      mode = await MemloreCore.startupMode();
+    } catch {
+      showLocked();
+      setStatus('error');
+      return;
+    }
+    if (mode === 'first_launch') {
+      markDeleted();
+      return;
+    }
+    if (mode === 'boot_file_corrupt') {
+      showLocked();
+      setStatus('boot_file_corrupt');
+      return;
+    }
+    try {
+      // Rejects with ERR_LOCKED unless the vault is still unlocked.
+      await MemloreCore.autoLockSeconds();
+    } catch (e) {
+      if (errorCode(e) === 'ERR_LOCKED') markLocked();
+    }
+  }
+
   /** The vault is already unlocked after creation: go straight to it. */
   function confirmPhraseSaved() {
     enableRowCache();
@@ -427,6 +481,10 @@ function useVaultState() {
     biometric,
     autoLockSeconds,
     createVault,
+    markOnboarded,
+    markDeleted,
+    resyncVaultState,
+    refreshBiometric,
     confirmPhraseSaved,
     unlock,
     unlockWithBiometric,

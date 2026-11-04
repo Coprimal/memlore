@@ -7,11 +7,12 @@ import { ActionButton } from '@/src/components/ActionButton';
 import { InvisibleVaultPanel } from '@/src/components/InvisibleVaultPanel';
 import { SecondLockPanel } from '@/src/components/SecondLockPanel';
 import { SecurityPanel } from '@/src/components/SecurityPanel';
+import { SyncPanel } from '@/src/components/SyncPanel';
 import { useVault } from '@/src/hooks/useVault';
 import { t } from '@/src/i18n';
 
 /**
- * Security (Face ID, auto-lock), Second lock, Invisible lock, Tags, Templates,
+ * Security (Face ID, auto-lock), Sync (Google Drive), Second lock, Invisible lock, Tags, Templates,
  * Recently deleted and the manual Lock.
  */
 export default function SettingsScreen() {
@@ -19,10 +20,12 @@ export default function SettingsScreen() {
   const router = useRouter();
   const { theme } = useUnistyles();
   return (
-    // "handled": the lock panels' password sheets are Modals, but still React children of this
-    // ScrollView, so with "never" its first tap on Submit/Cancel only dismissed the keyboard.
+    // "handled": the lock panels' password sheets and the sync panel's re-pair sheet are Modals,
+    // but still React children of this ScrollView, so with "never" its first tap on Submit/Cancel
+    // only dismissed the keyboard.
     <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       <SecurityPanel vault={vault} />
+      <SyncPanel />
       <SecondLockPanel />
       <InvisibleVaultPanel />
       <Pressable

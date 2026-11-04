@@ -8,6 +8,7 @@ import {
   FlatList,
   Platform,
   Pressable,
+  RefreshControl,
   Text,
   View,
 } from 'react-native';
@@ -18,6 +19,7 @@ import { ErrorText } from '@/src/components/ErrorText';
 import { PasswordSheet } from '@/src/components/PasswordSheet';
 import { useLockSession } from '@/src/hooks/useLockSession';
 import { useJournals } from '@/src/hooks/useOrganize';
+import { useSync, useSyncRefresh } from '@/src/hooks/useSync';
 import { errorCode } from '@/src/hooks/useVault';
 import { t } from '@/src/i18n';
 
@@ -45,6 +47,8 @@ export default function JournalsScreen() {
   const { theme } = useUnistyles();
   const list = useJournals();
   const session = useLockSession();
+  const sync = useSync();
+  const pull = useSyncRefresh();
   // The reveal sheet is open; what runs once it closed after a successful reveal.
   const [revealOpen, setRevealOpen] = useState(false);
   const afterReveal = useRef<(() => void) | null>(null);
@@ -57,7 +61,11 @@ export default function JournalsScreen() {
   const shown = session.showExistence
     ? listed
     : listed.filter((journal) => !journal.isLocked || session.revealed);
-  const showSpinner = useDelayed(list.loading && shown.length === 0, SPINNER_DELAY_MS);
+  // The first sync after onboarding may still bring the journals.
+  const showSpinner = useDelayed(
+    (list.loading || sync.awaitingFirstSync) && shown.length === 0,
+    SPINNER_DELAY_MS,
+  );
 
   /** Shows the reveal sheet at once; `then` runs after a successful reveal. */
   function askReveal(then: () => void) {
@@ -342,6 +350,13 @@ export default function JournalsScreen() {
             </Pressable>
           );
         }}
+        refreshControl={
+          <RefreshControl
+            refreshing={pull.refreshing}
+            onRefresh={pull.onRefresh}
+            tintColor={theme.colors.fgMuted}
+          />
+        }
         ListEmptyComponent={
           showSpinner ? (
             <ActivityIndicator style={styles.spinner} color={theme.colors.fgMuted} />

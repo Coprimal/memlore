@@ -20,7 +20,7 @@ export default function RootLayout() {
 }
 
 /**
- * Only `vault` exists while the vault is not unlocked, and only the app (and
+ * Only `vault` (and `onboard`) exists while the vault is not unlocked, and only the app (and
  * the dev spikes) while it is: a lock removes every protected screen, so the
  * swipe back cannot return to them. The explicit redirects keep the fallback
  * off the route sort order, which puts groups before `vault`.
@@ -49,6 +49,9 @@ function RootStack() {
       </Stack.Protected>
       <Stack.Protected guard={!unlocked} redirectTo="/">
         <Stack.Screen name="vault" options={{ animation: 'none' }} />
+        {/* First launch, "I already use Memlore": joins the cloud vault. No swipe back: a
+            sign-in in flight must land on this screen, which drops an unused session. */}
+        <Stack.Screen name="onboard" options={{ gestureEnabled: false }} />
       </Stack.Protected>
     </Stack>
   );
