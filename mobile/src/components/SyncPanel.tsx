@@ -185,6 +185,7 @@ export function SyncPanel() {
   const blocked = sync.status?.blocked ?? null;
   const lastSyncMs = sync.status?.lastSyncMs ?? drive.lastSyncMs;
   const pendingCount = drive.pendingCount;
+  const failed = !running && sync.status?.phase === 'error';
   // A reconnect notice brings its own button.
   const showConnect = !drive.connected && blocked?.kind !== 'needs_reconnect';
 
@@ -223,15 +224,25 @@ export function SyncPanel() {
             <Text style={styles.statusLine}>
               {`${t('settings:gdrive.last_sync')} ${lastSyncLabel(lastSyncMs, now)}`}
             </Text>
-            <Text style={styles.statusLine}>
-              {pendingCount > 0
-                ? t('nav:sync.pending', { count: pendingCount })
-                : t('nav:sync.up_to_date')}
-            </Text>
+            {pendingCount > 0 || !failed ? (
+              <Text style={styles.statusLine}>
+                {pendingCount > 0
+                  ? t('nav:sync.pending', { count: pendingCount })
+                  : t('nav:sync.up_to_date')}
+              </Text>
+            ) : null}
             {running ? (
               <Text style={styles.statusLine}>{progressLabel(sync.progress)}</Text>
-            ) : sync.status?.phase === 'error' ? (
-              <Text style={styles.errorLine}>{t('nav:sync.error')}</Text>
+            ) : failed ? (
+              <>
+                <Text style={styles.errorLine}>{t('nav:sync.error')}</Text>
+                {/* The backend's reason, as the desktop status tooltip shows it. */}
+                {sync.status?.error ? (
+                  <Text testID="sync-error-reason" style={styles.errorReason} numberOfLines={3}>
+                    {sync.status.error}
+                  </Text>
+                ) : null}
+              </>
             ) : null}
           </View>
           <ActionButton
@@ -432,6 +443,10 @@ const styles = StyleSheet.create((theme) => ({
   errorLine: {
     fontSize: 15,
     color: theme.colors.dangerText,
+  },
+  errorReason: {
+    fontSize: 13,
+    color: theme.colors.fgSecondary,
   },
   dangerButton: {
     alignItems: 'center',
