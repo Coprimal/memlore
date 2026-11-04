@@ -10,6 +10,8 @@
 #[doc(hidden)]
 pub mod cloud_config;
 pub mod cloud_provider;
+#[doc(hidden)]
+pub mod cycle;
 pub mod embedding_sync;
 pub mod engine;
 pub mod entry_sync;
@@ -33,10 +35,14 @@ pub mod metadata;
 pub mod outbox_import;
 #[doc(hidden)]
 pub mod pending_session;
+#[doc(hidden)]
+pub mod platform;
 pub mod provider;
 pub mod recovery;
 pub mod rotation;
 pub mod safety;
+#[doc(hidden)]
+pub mod schedule;
 #[doc(hidden)]
 pub mod stall_guard;
 pub mod sync_control;

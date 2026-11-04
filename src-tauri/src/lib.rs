@@ -1,5 +1,4 @@
 use std::fs;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{AboutMetadata, MenuBuilder, MenuItem, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Listener, Manager};
@@ -25,50 +24,7 @@ pub use memlore_engine::{
     yjs_doc, AppState,
 };
 
-// ─── LastEditState ───────────────────────────────────────────────────────────
-
-/// Shared "when did the last entry-write land" timestamp, in unix
-/// milliseconds. Used by the Chunk 5 scheduler to implement a debounced
-/// on-save sync: after every entry mutation, `mark_now()` is stamped; the
-/// scheduler waits until `now - last_edit` exceeds the debounce window
-/// (default 30 s) before firing a push. A burst of auto-saves therefore
-/// collapses into exactly one sync tick instead of one per keystroke.
-///
-/// `AtomicI64` + `Ordering::Relaxed` is sufficient — the value is
-/// advisory, not a correctness dependency of any data operation.
-pub struct LastEditState(AtomicI64);
-
-impl LastEditState {
-    pub fn new() -> Self {
-        Self(AtomicI64::new(0))
-    }
-
-    pub fn mark_now(&self) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        self.0.store(now_ms, Ordering::Relaxed);
-    }
-
-    pub fn get_ms(&self) -> i64 {
-        self.0.load(Ordering::Relaxed)
-    }
-
-    /// Test-only: set the timestamp directly. Used to simulate clock
-    /// skew (e.g. NTP adjustments) or to make debounce tests
-    /// deterministic without sleeping. Not exposed outside `#[cfg(test)]`.
-    #[cfg(test)]
-    pub fn set_ms_for_test(&self, ms: i64) {
-        self.0.store(ms, Ordering::Relaxed);
-    }
-}
-
-impl Default for LastEditState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use memlore_engine::sync::schedule::LastEditState;
 
 // ─── GDriveSessionState ──────────────────────────────────────────────────────
 
