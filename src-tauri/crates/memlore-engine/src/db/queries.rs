@@ -9746,6 +9746,12 @@ pub fn count_deleted_entries(conn: &Connection) -> Result<i64> {
     )
 }
 
+/// Every entry row, trashed ones included. Mobile onboarding refuses to
+/// replace a phone vault while this is above zero.
+pub fn count_all_entries(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+}
+
 /// Update the `storage_path` of a media row after a successful local cache write.
 /// Returns `QueryReturnedNoRows` when `id` does not exist.
 pub fn update_media_storage_path(conn: &Connection, id: &str, storage_path: &str) -> Result<()> {

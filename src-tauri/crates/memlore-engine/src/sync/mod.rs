@@ -11,6 +11,8 @@
 pub mod cloud_config;
 pub mod cloud_provider;
 #[doc(hidden)]
+pub mod connect;
+#[doc(hidden)]
 pub mod cycle;
 pub mod embedding_sync;
 pub mod engine;

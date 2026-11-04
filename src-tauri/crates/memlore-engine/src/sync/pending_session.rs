@@ -165,14 +165,15 @@ pub fn reset() {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use zeroize::Zeroizing;
 
-    /// The map is process-global, so these tests run one at a time.
+    /// The map is process-global, so these tests (and the connect tests that
+    /// stash into it) run one at a time.
     static SERIAL: Mutex<()> = Mutex::new(());
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(|p| p.into_inner())
     }
 

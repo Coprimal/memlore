@@ -30,8 +30,14 @@ pub struct GDriveClientConfig {
 ///
 /// Every method takes the caller's connection (or transaction) so the
 /// desktop, which keeps the token in a settings row, stays atomic with the
-/// rest of the caller's writes. A store that keeps the token elsewhere may
-/// ignore `conn`.
+/// rest of the caller's writes. A store that keeps the token elsewhere (the
+/// iOS Keychain) may ignore `conn`, and then its writes are NOT part of the
+/// caller's transaction: a rolled-back connect can leave a stored token
+/// behind and a rolled-back clear has already deleted it. Such a store must
+/// keep that harmless on its own: a token without `sync_provider = gdrive`
+/// is never used. The connect flow clears it on most failure paths, but not
+/// all (e.g. a failed `persist_connect_settings` transaction), so the store
+/// must not rely on that.
 #[doc(hidden)]
 pub trait CloudCredentialStore: Send + Sync {
     /// Resolve the OAuth client id and secret.

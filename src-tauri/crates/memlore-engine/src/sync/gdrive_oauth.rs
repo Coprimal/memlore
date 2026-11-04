@@ -126,6 +126,65 @@ pub struct AuthCallback {
     pub state: String,
 }
 
+/// Parse the one-time redirect a mobile OAuth session hands back
+/// (`com.googleusercontent.apps.<id>:/oauth2redirect?state=...&code=...`) and
+/// return the authorization code.
+///
+/// Refuses anything that is not exactly one well-formed callback for
+/// `expected_redirect` with exactly one `state` equal to `expected_state`,
+/// no `error`, and exactly one non-empty `code`. Error messages are fixed
+/// strings: they never echo the URL or any value the provider sent, and the
+/// URL is never logged (it carries the one-time code).
+#[doc(hidden)]
+pub fn parse_redirect_callback(
+    callback_url: &str,
+    expected_state: &str,
+    expected_redirect: &str,
+) -> Result<String, String> {
+    const INVALID: &str = "Invalid sign-in callback";
+    let expected = Url::parse(expected_redirect).map_err(|_| INVALID.to_string())?;
+    let url = Url::parse(callback_url).map_err(|_| INVALID.to_string())?;
+    if url.scheme() != expected.scheme()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str() != expected.host_str()
+        || url.port() != expected.port()
+        || url.path() != expected.path()
+        || url.fragment().is_some()
+    {
+        return Err(INVALID.to_string());
+    }
+
+    let mut state: Option<String> = None;
+    let mut code: Option<String> = None;
+    let mut error = false;
+    for (key, value) in url.query_pairs() {
+        let slot = match key.as_ref() {
+            "error" => {
+                error = true;
+                continue;
+            }
+            "state" => &mut state,
+            "code" => &mut code,
+            _ => continue,
+        };
+        if slot.replace(value.into_owned()).is_some() {
+            return Err(INVALID.to_string());
+        }
+    }
+    // State first: a callback that is not ours never gets a specific answer.
+    if state.as_deref() != Some(expected_state) {
+        return Err(INVALID.to_string());
+    }
+    if error {
+        return Err("Google sign-in was cancelled or refused".to_string());
+    }
+    match code {
+        Some(code) if !code.is_empty() => Ok(code),
+        _ => Err(INVALID.to_string()),
+    }
+}
+
 /// Bind a TCP listener on `127.0.0.1:0` and return it along with the
 /// OS-assigned port. Split from `await_callback` so the caller can know the
 /// port (for building the redirect URI) before the blocking accept loop.
@@ -487,6 +546,68 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ─── Mobile redirect callback (hostile input) ──────────────────────────
+
+    #[test]
+    fn redirect_callback_accepts_only_one_well_formed_callback() {
+        let redirect = "com.googleusercontent.apps.test:/oauth2redirect";
+        let ok = parse_redirect_callback(
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&code=c1&scope=x",
+            "s1",
+            redirect,
+        );
+        assert_eq!(ok.as_deref(), Ok("c1"));
+
+        let refused = [
+            // state mismatch
+            "com.googleusercontent.apps.test:/oauth2redirect?state=other&code=c1",
+            // missing state
+            "com.googleusercontent.apps.test:/oauth2redirect?code=c1",
+            // user cancelled / Google refused
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&error=access_denied",
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&code=c1&error=x",
+            // missing or empty code
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1",
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&code=",
+            // duplicate parameters
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&code=c1&code=c2",
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&state=s1&code=c1",
+            // foreign scheme, host or path
+            "com.googleusercontent.apps.evil:/oauth2redirect?state=s1&code=c1",
+            "memlore://oauth2redirect?state=s1&code=c1",
+            "com.googleusercontent.apps.test:/other?state=s1&code=c1",
+            "https://example.com/oauth2redirect?state=s1&code=c1",
+            // fragment, userinfo, explicit port
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1#code=c1",
+            "com.googleusercontent.apps.test://user@/oauth2redirect?state=s1&code=c1",
+            "com.googleusercontent.apps.test://host:1/oauth2redirect?state=s1&code=c1",
+            // an error with a foreign state gets no specific answer
+            "com.googleusercontent.apps.test:/oauth2redirect?state=other&error=access_denied",
+            // not a URL
+            "not a url",
+        ];
+        for url in refused {
+            let err = parse_redirect_callback(url, "s1", redirect)
+                .expect_err(&format!("must refuse {url}"));
+            // Never echo provider-supplied text back to the caller.
+            assert!(!err.contains("access_denied"), "{err}");
+            assert!(!err.contains("c1") && !err.contains("other"), "{err}");
+        }
+        let foreign = parse_redirect_callback(
+            "com.googleusercontent.apps.test:/oauth2redirect?state=other&error=access_denied",
+            "s1",
+            redirect,
+        );
+        assert_eq!(foreign, Err("Invalid sign-in callback".to_string()));
+        // Percent-encoding is decoded before the comparison.
+        let encoded = parse_redirect_callback(
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s%31&code=c%2F1",
+            "s1",
+            redirect,
+        );
+        assert_eq!(encoded.as_deref(), Ok("c/1"));
+    }
 
     // ─── PKCE tests ─────────────────────────────────────────────────────────
 

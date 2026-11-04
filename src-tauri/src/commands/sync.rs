@@ -17,6 +17,7 @@ pub(crate) use crate::sync::guard::SYNC_GUARD_TEST_LOCK;
 pub use crate::sync::guard::SYNC_IN_PROGRESS_ERR;
 pub(crate) use crate::sync::guard::{is_sync_in_progress, SyncInProgressGuard, SYNC_IN_PROGRESS};
 use crate::sync::outbox_import::{OutboxBridgeEvent, OutboxEventSink};
+use crate::sync::platform::CloudConnectHooks;
 use crate::sync::platform::SyncPlatformHooks;
 use crate::sync::{CloudProvider, SyncEngine, SyncProvider, SyncSummary, SyncTrigger};
 use crate::{AppState, EncryptionKeyState};
@@ -45,12 +46,8 @@ pub const SYNC_CATCHUP_PROGRESS_EVENT: &str = "sync:catchup-progress";
 /// `gdrive_scope_upgrade_required` settings flag and renders the banner.
 pub const SYNC_SCOPE_UPGRADE_EVENT: &str = "sync:scope-upgrade-required";
 
-/// Settings key persisted when an automatic scope-mismatch disconnect runs.
-/// The frontend renders the reconnect banner while this is true; clearing
-/// it is the responsibility of `gdrive_complete_connect` (on successful
-/// reconnect) or of the user dismissing the banner via
-/// `clear_sync_scope_upgrade_required`.
-pub const GDRIVE_SCOPE_UPGRADE_REQUIRED_KEY: &str = "gdrive_scope_upgrade_required";
+/// Settings key of the scope-upgrade banner flag; lives in the engine.
+pub use crate::sync::connect::GDRIVE_SCOPE_UPGRADE_REQUIRED_KEY;
 
 /// Production [`ProgressReporter`] that forwards every progress event to the
 /// Tauri frontend via [`SYNC_PROGRESS_EVENT`].  Emit failures are logged and
@@ -666,6 +663,21 @@ impl SyncPlatformHooks for DesktopSyncHooks<'_> {
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join("media")
     }
+}
+
+impl CloudConnectHooks for DesktopSyncHooks<'_> {
+    fn on_connect_progress(&self, session_id: &str, step: &str) {
+        crate::commands::gdrive::emit_connect_progress(self.app, session_id, step);
+    }
+
+    fn set_live_session(&self, session: Option<crate::sync::gdrive_provider::GDriveSession>) {
+        use tauri::Manager;
+        let session_state = self.app.state::<crate::GDriveSessionState>();
+        match session {
+            Some(session) => session_state.set(session),
+            None => session_state.clear(),
+        }
+    }
 
     fn credentials(&self) -> &dyn CloudCredentialStore {
         &DesktopCredentialStore
@@ -741,15 +753,9 @@ impl<'a> OutboxEventSink for TauriOutboxSink<'a> {
 
 // ─── Sync reset ─────────────────────────────────────────────────────────────
 
-/// Counts of rows flipped from synced/uploaded → pending.
-/// camelCase via serde so the TS bindings get `entries`, `media`, `journals`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResetCounts {
-    pub entries: u64,
-    pub media: u64,
-    pub journals: u64,
-}
+/// Counts of rows flipped from synced/uploaded → pending; lives in the
+/// engine with [`reset_local_sync_state`].
+pub use crate::sync::connect::ResetCounts;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -776,43 +782,8 @@ struct ForceRePairPayload {
     reason: String,
 }
 
-/// Reset all locally-marked-synced rows back to pending so the next sync
-/// cycle re-uploads them. Runs in a single transaction — partial reset is
-/// worse than no reset. Only flips `synced` rows; leaves `conflict` and
-/// `error` rows alone (they need user resolution, not silent reset). Media:
-/// every `uploaded` row that still has a local original, own or downloaded
-/// from a peer, is flipped, so a cloud wipe never leaves the last copy
-/// evictable. Rows without a local original have nothing to upload and stay.
-///
-/// **Why a single transaction is load-bearing.** Without it, the sync
-/// engine could interleave a write between the three UPDATEs, leaving
-/// entries marked `pending` but media still `uploaded`. The next sync
-/// would then push entries referencing media files whose remote copy is
-/// gone, producing a cascade of "missing media" errors on every peer.
-pub(crate) fn reset_local_sync_state(conn: &rusqlite::Connection) -> rusqlite::Result<ResetCounts> {
-    let tx = conn.unchecked_transaction()?;
-    let entries = tx.execute(
-        "UPDATE sync_state SET sync_status='pending', local_version=local_version+1 WHERE sync_status='synced'",
-        [],
-    )? as u64;
-    let journals = tx.execute(
-        "UPDATE journal_sync_state SET sync_status='pending', local_version=local_version+1 WHERE sync_status='synced'",
-        [],
-    )? as u64;
-    let media = db::reset_uploaded_media_with_local_original_to_pending(&tx)? as u64;
-    // Surface hashes are stale after any bulk requeue — cloud content may be
-    // gone or re-keyed. Absent hash ⇒ default-dirty (full surface re-push).
-    // Also re-arm Automatic reconcile so DeviceRoot self-heal runs again.
-    db::clear_all_surface_push_hashes(&tx)?;
-    db::clear_all_pull_revisions(&tx)?;
-    tx.commit()?;
-    crate::sync::engine::reset_session_own_cloud_reconciled();
-    Ok(ResetCounts {
-        entries,
-        media,
-        journals,
-    })
-}
+/// Reset every synced row back to pending; lives in the engine.
+pub(crate) use crate::sync::connect::reset_local_sync_state;
 
 fn queue_repair_if_sync_in_progress() -> Option<SyncMaintenanceResult<RepairCounts>> {
     if !is_sync_in_progress() {
@@ -1542,34 +1513,11 @@ mod tests {
         );
     }
 
-    // ─── reset_local_sync_state tests ────────────────────────────────────────
-
     /// Helper: insert a sync_state row with given status.
     fn insert_sync_state(conn: &Connection, entry_id: &str, status: &str) {
         conn.execute(
             "INSERT INTO sync_state (entry_id, local_version, sync_status) VALUES (?1, 1, ?2)",
             rusqlite::params![entry_id, status],
-        )
-        .unwrap();
-    }
-
-    /// Helper: upsert a journal_sync_state row with given status.
-    /// Uses INSERT OR REPLACE so it works even when migrate() already seeded
-    /// a pending row for the default journal.
-    fn insert_journal_sync_state(conn: &Connection, journal_id: &str, status: &str) {
-        conn.execute(
-            "INSERT OR REPLACE INTO journal_sync_state (journal_id, local_version, sync_status) VALUES (?1, 1, ?2)",
-            rusqlite::params![journal_id, status],
-        )
-        .unwrap();
-    }
-
-    /// Helper: insert a media row with given upload_status.
-    fn insert_media(conn: &Connection, media_id: &str, entry_id: &str, upload_status: &str) {
-        conn.execute(
-            "INSERT INTO media (id, entry_id, file_name, file_type, storage_provider, storage_path, upload_status, sort_order, created_at) \
-             VALUES (?1, ?2, 'test.jpg', 'image', 'local', '/tmp/test.jpg', ?3, 0, 0)",
-            rusqlite::params![media_id, entry_id, upload_status],
         )
         .unwrap();
     }
@@ -1617,174 +1565,6 @@ mod tests {
         );
     }
 
-    /// Test 1 (happy path): synced rows flip to pending, pending rows stay
-    /// pending, and returned counts reflect only what was actually flipped.
-    #[test]
-    fn reset_flips_synced_to_pending_and_returns_correct_counts() {
-        let state = make_state();
-        let conn = state.lock().unwrap();
-
-        // Get journal id from the default journal seeded by migrate.
-        let jid: String = conn
-            .query_row("SELECT id FROM journals LIMIT 1", [], |r| r.get(0))
-            .unwrap();
-
-        // Entries: 2 synced + 1 pending.
-        let e1 = db::create_entry(
-            &conn,
-            db::CreateEntryParams {
-                journal_id: &jid,
-                title: None,
-                content_text: None,
-                preview_text: None,
-                entry_date: 1_700_000_001,
-            },
-        )
-        .unwrap();
-        let e2 = db::create_entry(
-            &conn,
-            db::CreateEntryParams {
-                journal_id: &jid,
-                title: None,
-                content_text: None,
-                preview_text: None,
-                entry_date: 1_700_000_002,
-            },
-        )
-        .unwrap();
-        let e3 = db::create_entry(
-            &conn,
-            db::CreateEntryParams {
-                journal_id: &jid,
-                title: None,
-                content_text: None,
-                preview_text: None,
-                entry_date: 1_700_000_003,
-            },
-        )
-        .unwrap();
-        insert_sync_state(&conn, &e1.id, "synced");
-        insert_sync_state(&conn, &e2.id, "synced");
-        insert_sync_state(&conn, &e3.id, "pending");
-
-        // Journals: 1 synced + 1 pending.
-        insert_journal_sync_state(&conn, &jid, "synced");
-        // A second fake journal id for the pending row.
-        let fake_journal_id = "00000000-0000-0000-0000-000000000001";
-        conn.execute(
-            "INSERT INTO journals (id, name, color, sort_order, created_at, updated_at) VALUES (?1, 'J2', '#ff0000', 1, 0, 0)",
-            rusqlite::params![fake_journal_id],
-        )
-        .unwrap();
-        insert_journal_sync_state(&conn, fake_journal_id, "pending");
-
-        // Media: 2 uploaded + 1 pending.
-        insert_media(&conn, "m1", &e1.id, "uploaded");
-        insert_media(&conn, "m2", &e2.id, "uploaded");
-        insert_media(&conn, "m3", &e3.id, "pending");
-
-        let counts = reset_local_sync_state(&conn).unwrap();
-
-        assert_eq!(counts.entries, 2, "should flip 2 synced entries");
-        assert_eq!(counts.journals, 1, "should flip 1 synced journal");
-        assert_eq!(counts.media, 2, "should flip 2 uploaded media");
-
-        // Verify all are now pending.
-        let pending_entries: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sync_state WHERE sync_status='pending'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(pending_entries, 3, "all 3 entry rows should be pending");
-
-        let pending_media: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM media WHERE upload_status='pending'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(pending_media, 3, "all 3 media rows should be pending");
-    }
-
-    /// Test 2 (conflict preservation): a sync_state row with status='conflict'
-    /// must NOT be flipped by reset — it needs user resolution.
-    #[test]
-    fn reset_leaves_conflict_rows_untouched() {
-        let state = make_state();
-        let conn = state.lock().unwrap();
-
-        let jid: String = conn
-            .query_row("SELECT id FROM journals LIMIT 1", [], |r| r.get(0))
-            .unwrap();
-        let entry = db::create_entry(
-            &conn,
-            db::CreateEntryParams {
-                journal_id: &jid,
-                title: None,
-                content_text: None,
-                preview_text: None,
-                entry_date: 1_700_000_010,
-            },
-        )
-        .unwrap();
-        insert_sync_state(&conn, &entry.id, "conflict");
-
-        let counts = reset_local_sync_state(&conn).unwrap();
-
-        // Conflict entry must not be counted as flipped.
-        assert_eq!(counts.entries, 0, "conflict row must not be counted");
-
-        // Status must still be conflict.
-        let status: String = conn
-            .query_row(
-                "SELECT sync_status FROM sync_state WHERE entry_id = ?1",
-                rusqlite::params![entry.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "conflict", "conflict row must remain conflict");
-    }
-
-    /// Test 3 (error media preservation): a media row with upload_status='error'
-    /// must NOT be flipped by reset — those errors need user resolution.
-    #[test]
-    fn reset_leaves_error_media_untouched() {
-        let state = make_state();
-        let conn = state.lock().unwrap();
-
-        let jid: String = conn
-            .query_row("SELECT id FROM journals LIMIT 1", [], |r| r.get(0))
-            .unwrap();
-        let entry = db::create_entry(
-            &conn,
-            db::CreateEntryParams {
-                journal_id: &jid,
-                title: None,
-                content_text: None,
-                preview_text: None,
-                entry_date: 1_700_000_020,
-            },
-        )
-        .unwrap();
-        insert_media(&conn, "me1", &entry.id, "error");
-
-        let counts = reset_local_sync_state(&conn).unwrap();
-
-        assert_eq!(counts.media, 0, "error media must not be counted");
-
-        let status: String = conn
-            .query_row(
-                "SELECT upload_status FROM media WHERE id = 'me1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "error", "error media must remain error");
-    }
-
     /// Seed three `'uploaded'` media rows on one entry: `own` (this device's
     /// folder, local original), `peer` (pulled from a peer, no original) and
     /// `evicted` (this device's folder, original evicted from the cache).
@@ -1830,59 +1610,6 @@ mod tests {
         assert_eq!(status("own"), "pending", "own row with original re-uploads");
         assert_eq!(status("peer"), "uploaded", "peer row has no original");
         assert_eq!(status("evicted"), "uploaded", "evicted row has no original");
-    }
-
-    /// Every caller is user-triggered and the cloud-wipe flows use it, so a
-    /// downloaded peer original (maybe the last copy) must re-upload rather
-    /// than stay `'uploaded'` and evictable. Originless rows stay put.
-    #[test]
-    fn reset_local_sync_state_requeues_downloaded_peer_originals() {
-        let state = make_state();
-        let conn = state.lock().unwrap();
-        seed_media_ownership_mix(&conn);
-        let entry_id: String = conn
-            .query_row("SELECT entry_id FROM media WHERE id = 'own'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        conn.execute(
-            "INSERT INTO media (id, entry_id, file_name, file_type, storage_provider, \
-             storage_path, upload_status, cloud_path, sort_order, created_at) \
-             VALUES ('downloaded', ?1, 'a.jpg', 'image/jpeg', 'local', \
-             '/tmp/downloaded.jpg', 'uploaded', 'dev-peer/media/downloaded', 0, 0)",
-            [&entry_id],
-        )
-        .unwrap();
-        assert!(
-            db::list_evictable_media(&conn)
-                .unwrap()
-                .iter()
-                .any(|m| m.id == "downloaded"),
-            "seed: the downloaded original starts evictable"
-        );
-
-        let counts = reset_local_sync_state(&conn).unwrap();
-
-        assert_eq!(counts.media, 2);
-        let status = |id: &str| -> String {
-            conn.query_row("SELECT upload_status FROM media WHERE id = ?1", [id], |r| {
-                r.get(0)
-            })
-            .unwrap()
-        };
-        assert_eq!(status("own"), "pending", "own row with original re-uploads");
-        assert_eq!(
-            status("downloaded"),
-            "pending",
-            "downloaded peer original re-uploads to this device's folder"
-        );
-        assert_eq!(status("peer"), "uploaded", "peer row has no original");
-        assert_eq!(status("evicted"), "uploaded", "evicted row has no original");
-        let evictable = db::list_evictable_media(&conn).unwrap();
-        assert!(
-            !evictable.iter().any(|m| m.id == "downloaded"),
-            "a requeued downloaded original must not be evictable"
-        );
     }
 
     #[test]
@@ -1975,19 +1702,6 @@ mod tests {
             pull_count, 0,
             "sync_pull_state must clear with sync_push_state after bulk reset/repair"
         );
-    }
-
-    /// After a local reset (manual cloud wipe / wipe-cloud), every surface
-    /// hash must be cleared so the next push re-uploads all 8 surfaces.
-    #[test]
-    fn reset_local_sync_state_clears_all_surface_push_hashes() {
-        let state = make_state();
-        let conn = state.lock().unwrap();
-        seed_all_surface_push_hashes(&conn);
-
-        reset_local_sync_state(&conn).unwrap();
-
-        assert_all_surface_push_hashes_cleared(&conn);
     }
 
     /// Repair-from-this-device must clear surface hashes in the same

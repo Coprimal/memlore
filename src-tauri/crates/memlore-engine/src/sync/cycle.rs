@@ -1091,6 +1091,7 @@ pub async fn run_cloud_content_migration(
 mod tests {
     use super::*;
     use crate::db::schema::migrate;
+    use crate::sync::platform::CloudConnectHooks;
     use rusqlite::Connection;
 
     fn make_state() -> AppState {
@@ -1662,6 +1663,11 @@ mod tests {
         fn media_dir(&self) -> std::path::PathBuf {
             std::path::PathBuf::from("media")
         }
+    }
+
+    impl CloudConnectHooks for NoopHooks {
+        fn on_connect_progress(&self, _session_id: &str, _step: &str) {}
+        fn set_live_session(&self, _session: Option<crate::sync::gdrive_provider::GDriveSession>) {}
         fn credentials(&self) -> &dyn CloudCredentialStore {
             &NoCredentials
         }

@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use super::cloud_config::CloudCredentialStore;
 use super::engine::ProgressReporter;
+use super::gdrive_provider::GDriveSession;
 use super::outbox_import::OutboxEventSink;
 use super::SyncSummary;
 use crate::AppState;
@@ -37,12 +38,32 @@ pub enum SyncPhase {
     Error,
 }
 
+/// Side effects of the cloud connect flow
+/// ([`crate::sync::connect::complete_cloud_connect`]) and of the other
+/// helpers that read or clear the Drive credentials.
+///
+/// Split from [`SyncPlatformHooks`] (its supertrait) so the desktop folder
+/// connect, which is generic over the Tauri runtime, can supply these
+/// without the cycle's hooks.
+pub trait CloudConnectHooks: Send + Sync {
+    /// Best-effort progress hint for the connect `session_id`. `step` is a
+    /// stable machine key: `exchanging_token` | `establishing_root` |
+    /// `finalizing`. Must never fail the connect.
+    fn on_connect_progress(&self, session_id: &str, step: &str);
+
+    /// Replace the platform's in-memory Drive session (`None` clears it).
+    fn set_live_session(&self, session: Option<GDriveSession>);
+
+    /// Where the Drive OAuth client and refresh token come from.
+    fn credentials(&self) -> &dyn CloudCredentialStore;
+}
+
 /// Side effects a sync cycle hands to the platform.
 ///
 /// Hooks run inside the cycle's future. On desktop that future is driven by
 /// `block_on` on a blocking thread, so a hook that blocks on a future itself
 /// must leave the runtime context first (`tokio::task::block_in_place`).
-pub trait SyncPlatformHooks: Send + Sync {
+pub trait SyncPlatformHooks: CloudConnectHooks {
     /// The reporter for engine progress events. The cycle wraps it in
     /// [`super::stall_guard::StallTrackingReporter`].
     fn progress_reporter(&self) -> Arc<dyn ProgressReporter>;
@@ -71,7 +92,4 @@ pub trait SyncPlatformHooks: Send + Sync {
 
     /// The directory that holds the vault's media files.
     fn media_dir(&self) -> PathBuf;
-
-    /// Where the Drive OAuth client and refresh token come from.
-    fn credentials(&self) -> &dyn CloudCredentialStore;
 }
