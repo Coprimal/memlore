@@ -528,7 +528,7 @@ fn reconstruct_session_from_conn(
         expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
         refresh_token: zeroize::Zeroizing::new(refresh_token),
         client_id,
-        client_secret,
+        client_secret: Some(client_secret),
     }))
 }
 

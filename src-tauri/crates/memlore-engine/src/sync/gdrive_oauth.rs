@@ -1,8 +1,8 @@
 //! Google OAuth 2.0 PKCE helpers for the Google Drive sync provider.
 //!
-//! Desktop apps (macOS) use the PKCE flow with a loopback redirect URI.
-//! No `client_secret` is used — per Google documentation, installed/desktop
-//! apps must omit `client_secret` from token requests.
+//! Desktop apps (macOS) use the PKCE flow with a loopback redirect URI and
+//! send a `client_secret` (see `PLACEHOLDER_CLIENT_SECRET`). Google's
+//! installed-app clients (iOS) have no secret and omit the field.
 //!
 //! # Client ID provisioning
 //!
@@ -339,12 +339,12 @@ fn ensure_appdata_scope(scope: Option<&str>) -> Result<(), String> {
 /// `token_url` is parameterized for testing (wiremock).
 ///
 /// `client_secret` is required by Google's Desktop-app OAuth flow — see
-/// the `PLACEHOLDER_CLIENT_SECRET` doc comment for why. Pass an empty
-/// string only if you know your client type doesn't need one (Android, iOS,
-/// Chrome apps — not applicable to Memlore).
+/// the `PLACEHOLDER_CLIENT_SECRET` doc comment for why — so desktop passes
+/// `Some`. Google's installed-app clients (iOS) have no secret: pass `None`
+/// and the `client_secret` field is left out of the form body.
 pub async fn exchange_code(
     client_id: &str,
-    client_secret: &str,
+    client_secret: Option<&str>,
     code: &str,
     verifier: &PkceVerifier,
     redirect_uri: &str,
@@ -355,14 +355,16 @@ pub async fn exchange_code(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let params = [
+    let mut params = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("client_id", client_id),
-        ("client_secret", client_secret),
-        ("code_verifier", &verifier.0),
-        ("redirect_uri", redirect_uri),
     ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
+    params.push(("code_verifier", &verifier.0));
+    params.push(("redirect_uri", redirect_uri));
 
     let resp = client
         .post(&config.token_url)
@@ -394,12 +396,14 @@ pub async fn exchange_code(
 /// Refresh an access token using a refresh token.
 ///
 /// Desktop app OAuth clients on Google must send `client_secret` — see
-/// `PLACEHOLDER_CLIENT_SECRET` doc comment. (Google's docs list Android /
-/// iOS / Chrome as exempt from this requirement, but Desktop is NOT in the
-/// exempt list.)
+/// `PLACEHOLDER_CLIENT_SECRET` doc comment — so desktop passes `Some`.
+/// (Google's docs list Android / iOS / Chrome as exempt from this
+/// requirement, but Desktop is NOT in the exempt list.) Google's
+/// installed-app clients (iOS) have no secret: pass `None` and the
+/// `client_secret` field is left out of the form body.
 pub async fn refresh_access_token(
     client_id: &str,
-    client_secret: &str,
+    client_secret: Option<&str>,
     refresh_token: &str,
     config: &GoogleOAuthConfig,
 ) -> Result<TokenResponse, String> {
@@ -408,12 +412,14 @@ pub async fn refresh_access_token(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let params = [
+    let mut params = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", client_id),
-        ("client_secret", client_secret),
     ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
 
     let resp = client
         .post(&config.token_url)
@@ -708,7 +714,7 @@ mod tests {
         let (verifier, _) = generate_pkce();
         let result = exchange_code(
             "test-client-id",
-            "test-client-secret",
+            Some("test-client-secret"),
             "testcode123",
             &verifier,
             "http://127.0.0.1:54321",
@@ -744,7 +750,7 @@ mod tests {
         let (verifier, _) = generate_pkce();
         let err = exchange_code(
             "cid",
-            "sec",
+            Some("sec"),
             "code",
             &verifier,
             "http://127.0.0.1:1",
@@ -782,9 +788,14 @@ mod tests {
             revoke_url: format!("{}/revoke", mock_server.uri()),
         };
 
-        let result = refresh_access_token("test-client", "test-secret", "myrefreshtoken", &config)
-            .await
-            .unwrap();
+        let result = refresh_access_token(
+            "test-client",
+            Some("test-secret"),
+            "myrefreshtoken",
+            &config,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.access_token, "ya29.refreshed");
         assert!(
             result.refresh_token.is_none(),
@@ -808,7 +819,7 @@ mod tests {
             revoke_url: format!("{}/revoke", mock_server.uri()),
         };
 
-        let err = refresh_access_token("cid", "sec", "bad-refresh-token", &config)
+        let err = refresh_access_token("cid", Some("sec"), "bad-refresh-token", &config)
             .await
             .unwrap_err();
         assert!(err.contains("Auth:"), "expected Auth error, got: {err}");
@@ -841,7 +852,7 @@ mod tests {
             revoke_url: format!("{}/revoke", mock_server.uri()),
         };
 
-        let err = refresh_access_token("cid", "sec", "revoked-refresh-token", &config)
+        let err = refresh_access_token("cid", Some("sec"), "revoked-refresh-token", &config)
             .await
             .unwrap_err();
         assert!(
@@ -852,6 +863,70 @@ mod tests {
             err.contains("Reconnect to Google Drive"),
             "expected user-facing action hint, got: {err}"
         );
+    }
+
+    // ─── exact token-request form bodies ─────────────────────────────────────
+
+    /// Pins the exact urlencoded body of both token requests. The desktop
+    /// body (with a secret) is frozen: shipped desktop OAuth clients send it
+    /// byte for byte. Installed-app clients (iOS) have no secret, so `None`
+    /// must omit the `client_secret` key entirely.
+    #[tokio::test]
+    async fn token_requests_send_exact_form_body() {
+        let cases: [(Option<&str>, &str, &str); 2] = [
+            (
+                Some("test-client-secret"),
+                "grant_type=authorization_code&code=testcode123&client_id=test-client-id&client_secret=test-client-secret&code_verifier=fixed-verifier&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321",
+                "grant_type=refresh_token&refresh_token=myrefreshtoken&client_id=test-client-id&client_secret=test-client-secret",
+            ),
+            (
+                None,
+                "grant_type=authorization_code&code=testcode123&client_id=test-client-id&code_verifier=fixed-verifier&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321",
+                "grant_type=refresh_token&refresh_token=myrefreshtoken&client_id=test-client-id",
+            ),
+        ];
+        for (secret, want_exchange, want_refresh) in cases {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "ya29.test-access-token",
+                    "refresh_token": "1//test-refresh-token",
+                    "expires_in": 3600,
+                    "scope": DRIVE_APPDATA_SCOPE,
+                    "token_type": "Bearer"
+                })))
+                .mount(&mock_server)
+                .await;
+            let config = GoogleOAuthConfig {
+                auth_url: format!("{}/auth", mock_server.uri()),
+                token_url: format!("{}/token", mock_server.uri()),
+                revoke_url: format!("{}/revoke", mock_server.uri()),
+            };
+
+            exchange_code(
+                "test-client-id",
+                secret,
+                "testcode123",
+                &PkceVerifier("fixed-verifier".to_string()),
+                "http://127.0.0.1:54321",
+                &config,
+            )
+            .await
+            .unwrap();
+            refresh_access_token("test-client-id", secret, "myrefreshtoken", &config)
+                .await
+                .unwrap();
+
+            let bodies: Vec<String> = mock_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| String::from_utf8(r.body.clone()).unwrap())
+                .collect();
+            assert_eq!(bodies, [want_exchange, want_refresh]);
+        }
     }
 
     // ─── revoke_token ────────────────────────────────────────────────────────
@@ -987,7 +1062,7 @@ mod tests {
         let (verifier, _) = generate_pkce();
         let err = exchange_code(
             "cid",
-            "sec",
+            Some("sec"),
             "code",
             &verifier,
             "http://127.0.0.1:1",
@@ -1022,7 +1097,7 @@ mod tests {
             revoke_url: format!("{}/revoke", mock_server.uri()),
         };
 
-        let err = refresh_access_token("cid", "sec", "old-refresh", &config)
+        let err = refresh_access_token("cid", Some("sec"), "old-refresh", &config)
             .await
             .unwrap_err();
         assert!(

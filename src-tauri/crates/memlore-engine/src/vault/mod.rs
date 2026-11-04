@@ -11,6 +11,7 @@ use crate::utils::encryption::SALT_SIZE;
 use crate::AppState;
 
 pub mod biometric;
+pub mod onboard;
 pub mod setup;
 pub mod startup;
 pub mod unlock;

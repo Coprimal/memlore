@@ -867,7 +867,8 @@ mod tests {
         // ...but feeding it into the EXISTING cloud validation path must fail
         // the same way a typed wrong phrase does — no second, weaker route.
         let result =
-            crate::commands::crypto::onboard_validate_passphrase_inner(&provider, &decoded).await;
+            memlore_engine::vault::onboard::onboard_validate_passphrase_inner(&provider, &decoded)
+                .await;
         assert!(
             result.is_err(),
             "a different vault's valid phrase must fail fingerprint verification"

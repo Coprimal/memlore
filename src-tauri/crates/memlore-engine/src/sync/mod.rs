@@ -25,6 +25,8 @@ pub mod media_cache;
 pub mod media_sync;
 pub mod metadata;
 pub mod outbox_import;
+#[doc(hidden)]
+pub mod pending_session;
 pub mod provider;
 pub mod recovery;
 pub mod rotation;

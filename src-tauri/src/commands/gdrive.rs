@@ -723,7 +723,7 @@ pub async fn gdrive_complete_connect(
     // Exchange code → tokens.
     let token_resp = exchange_code(
         &pending_oauth.client_id,
-        &pending_oauth.client_secret,
+        Some(&pending_oauth.client_secret),
         &callback.code,
         &pending_oauth.verifier,
         &pending_oauth.redirect_uri,
@@ -744,7 +744,7 @@ pub async fn gdrive_complete_connect(
         expires_at,
         refresh_token: zeroize::Zeroizing::new(refresh_token),
         client_id: pending_oauth.client_id,
-        client_secret: pending_oauth.client_secret,
+        client_secret: Some(pending_oauth.client_secret),
     };
 
     complete_cloud_connect(
@@ -2957,7 +2957,7 @@ pub fn reconstruct_session(state: &AppState) -> Result<Option<GDriveSession>, St
         expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
         refresh_token: zeroize::Zeroizing::new(refresh_token),
         client_id,
-        client_secret,
+        client_secret: Some(client_secret),
     }))
 }
 
@@ -4947,7 +4947,7 @@ mod tests {
                 expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
                 refresh_token: zeroize::Zeroizing::new(refresh_token.to_string()),
                 client_id: "cid_test".to_string(),
-                client_secret: "cs_test".to_string(),
+                client_secret: Some("cs_test".to_string()),
             },
             root_folder_id: "root_test".to_string(),
         }
@@ -5185,7 +5185,7 @@ mod tests {
             access_token: "tok".to_string(),
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
             refresh_token: zeroize::Zeroizing::new("refresh".to_string()),
-            client_secret: "sec".to_string(),
+            client_secret: Some("sec".to_string()),
             client_id: "cid".to_string(),
         };
         ss.set(session);
@@ -6222,7 +6222,7 @@ mod tests {
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
             refresh_token: zeroize::Zeroizing::new(format!("rt_{tag}")),
             client_id: format!("cid_{tag}"),
-            client_secret: format!("cs_{tag}"),
+            client_secret: Some(format!("cs_{tag}")),
         }
     }
 

@@ -31,16 +31,17 @@ const APPDATA_FOLDER: &str = "appDataFolder";
 /// In-memory OAuth session. Access token stays in memory only — never written
 /// to disk. Refresh token is `Zeroizing` to wipe bytes on drop.
 ///
-/// `client_secret` is included for Google's Desktop-app OAuth flow, which
+/// `client_secret` is `Some` for Google's Desktop-app OAuth flow, which
 /// requires it on token exchange / refresh. It is NOT a cryptographic secret
 /// — see `gdrive_oauth::PLACEHOLDER_CLIENT_SECRET` for the rationale.
+/// Google's installed-app clients (iOS) have no secret and use `None`.
 #[derive(Debug, Clone)]
 pub struct GDriveSession {
     pub access_token: String,
     pub expires_at: std::time::Instant,
     pub refresh_token: Zeroizing<String>,
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: Option<String>,
 }
 
 /// Google Drive sync provider.
@@ -761,20 +762,24 @@ impl GDriveProvider {
                 revoke_url: String::new(),
             };
 
-            let token_resp =
-                refresh_access_token(&client_id, &client_secret, &refresh_token, &config)
-                    .await
-                    .map_err(|e| {
-                        // The OAuth helper returns a string error; distinguish
-                        // the appdata-scope-mismatch case so the engine can
-                        // trigger the reconnect banner instead of a generic
-                        // re-auth flow.
-                        if e.contains("drive.appdata") {
-                            SyncError::ScopeMismatch(e)
-                        } else {
-                            SyncError::Auth(e)
-                        }
-                    })?;
+            let token_resp = refresh_access_token(
+                &client_id,
+                client_secret.as_deref(),
+                &refresh_token,
+                &config,
+            )
+            .await
+            .map_err(|e| {
+                // The OAuth helper returns a string error; distinguish
+                // the appdata-scope-mismatch case so the engine can
+                // trigger the reconnect banner instead of a generic
+                // re-auth flow.
+                if e.contains("drive.appdata") {
+                    SyncError::ScopeMismatch(e)
+                } else {
+                    SyncError::Auth(e)
+                }
+            })?;
 
             let new_expires_at = std::time::Instant::now()
                 + std::time::Duration::from_secs(token_resp.expires_in.saturating_sub(60));
@@ -3184,7 +3189,7 @@ mod tests {
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
             refresh_token: Zeroizing::new("dummy-refresh".to_string()),
             client_id: "test-client-id".to_string(),
-            client_secret: "test-client-secret".to_string(),
+            client_secret: Some("test-client-secret".to_string()),
         }
     }
 
