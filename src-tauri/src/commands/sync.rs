@@ -8,18 +8,17 @@ use zeroize::Zeroizing;
 
 use crate::commands::entries::maybe_mark_entry_embedding_dirty_after_save;
 use crate::db;
+use crate::sync::cloud_config::{CloudCredentialStore, GDriveClientConfig};
 use crate::sync::engine::{
     CatchupProgressEvent, PeerOwnedIds, ProgressReporter, SyncProgressEvent, SyncProgressPhase,
 };
-use crate::sync::gdrive_provider::GDriveProvider;
 #[cfg(test)]
 pub(crate) use crate::sync::guard::SYNC_GUARD_TEST_LOCK;
 pub use crate::sync::guard::SYNC_IN_PROGRESS_ERR;
 pub(crate) use crate::sync::guard::{is_sync_in_progress, SyncInProgressGuard, SYNC_IN_PROGRESS};
 use crate::sync::outbox_import::{OutboxBridgeEvent, OutboxEventSink};
-use crate::sync::{
-    CloudProvider, LocalSyncProvider, SyncEngine, SyncProvider, SyncSummary, SyncTrigger,
-};
+use crate::sync::stall_guard::{retry_with_stall_guard, stall_reason_text, StallTrackingReporter};
+use crate::sync::{CloudProvider, SyncEngine, SyncProvider, SyncSummary, SyncTrigger};
 use crate::{AppState, EncryptionKeyState};
 
 /// Tauri event name broadcast whenever sync state changes (start, end,
@@ -70,164 +69,6 @@ impl ProgressReporter for TauriProgressReporter {
     fn report_catchup_progress(&self, event: CatchupProgressEvent) {
         if let Err(e) = self.app.emit(SYNC_CATCHUP_PROGRESS_EVENT, event) {
             log::warn!("TauriProgressReporter: failed to emit {SYNC_CATCHUP_PROGRESS_EVENT}: {e}");
-        }
-    }
-}
-
-/// Wraps another [`ProgressReporter`] and stamps `last_progress_ms` on every
-/// `report()` and `heartbeat()` call before forwarding to the inner
-/// reporter (`report()`) or doing nothing further (`heartbeat()`, which has
-/// no IPC-facing counterpart). `run_sync_now`'s stall guard reads
-/// `last_progress_ms` to tell "slow because there is a lot of legitimate
-/// work" apart from "hung" — see [`with_stall_guard`].
-struct StallTrackingReporter {
-    inner: Arc<dyn ProgressReporter>,
-    last_progress_ms: Arc<AtomicU64>,
-    baseline: std::time::Instant,
-}
-
-impl StallTrackingReporter {
-    fn stamp(&self) {
-        let now = self.baseline.elapsed().as_millis() as u64;
-        self.last_progress_ms.store(now, Ordering::SeqCst);
-    }
-}
-
-impl ProgressReporter for StallTrackingReporter {
-    fn report(&self, event: SyncProgressEvent) {
-        self.stamp();
-        self.inner.report(event);
-    }
-
-    fn report_catchup_progress(&self, event: CatchupProgressEvent) {
-        self.stamp();
-        self.inner.report_catchup_progress(event);
-    }
-
-    fn heartbeat(&self) {
-        self.stamp();
-    }
-}
-
-/// Returned by [`with_stall_guard`] / [`retry_with_stall_guard`] when the
-/// guarded future was aborted before completing — distinct from "still
-/// working, just slow."
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SyncStalled {
-    /// No progress signal (`report`/`heartbeat`, via [`StallTrackingReporter`])
-    /// was recorded for the full stall window — the engine appears to have
-    /// gone silent.
-    NoProgress,
-    /// The attempt ran past the hard cap even though progress kept
-    /// flowing. A backstop against a workload that keeps the stall check
-    /// satisfied forever (e.g. an endless stream of cheap items over a slow
-    /// link) — durable per-item progress (pull commits per chunk, push
-    /// marks each entry synced) makes killing the attempt here safe.
-    HardCapExceeded,
-}
-
-/// Human-readable reason text shared between the retry-boundary log line
-/// and the final user-facing error string, so the two can never drift.
-fn stall_reason_text(reason: SyncStalled, stall: Duration, hard_cap: Duration) -> String {
-    match reason {
-        SyncStalled::NoProgress => format!("no progress for {}s", stall.as_secs()),
-        SyncStalled::HardCapExceeded => {
-            format!("exceeded the {}-minute hard cap", hard_cap.as_secs() / 60)
-        }
-    }
-}
-
-/// Race `fut` against a stall (inactivity) timeout AND an absolute hard cap:
-/// every 5s tick the guard checks (a) how long it's been since
-/// `last_progress_ms` last advanced (per `now_ms`) — if that gap exceeds
-/// `stall`, the guard aborts with [`SyncStalled::NoProgress`] even though
-/// `fut` is still running; (b) how long the attempt has run in total — if
-/// that exceeds `hard_cap`, the guard aborts with
-/// [`SyncStalled::HardCapExceeded`] regardless of how recently progress was
-/// stamped. A future that keeps stamping `last_progress_ms` — via a
-/// [`StallTrackingReporter`]'s `report`/`heartbeat` calls — can run for as
-/// long as `hard_cap` without tripping the stall check, but never longer.
-///
-/// `last_progress_ms` is stamped to `now_ms()` once at guard start (also
-/// used as the hard-cap's `attempt_start`), so a future whose first
-/// progress signal doesn't arrive until partway through its work is still
-/// measured from a sane baseline.
-///
-/// `now_ms` is injected (rather than reading `SystemTime`/`Instant`
-/// directly) so tests can drive a `tokio::time::Instant`-based clock under
-/// `#[tokio::test(start_paused = true)]` and advance it deterministically
-/// with `tokio::time::advance` — production passes a real-time clock based
-/// on `std::time::Instant`.
-pub(crate) async fn with_stall_guard<T>(
-    fut: impl std::future::Future<Output = T>,
-    last_progress_ms: Arc<AtomicU64>,
-    now_ms: impl Fn() -> u64,
-    stall: Duration,
-    hard_cap: Duration,
-) -> Result<T, SyncStalled> {
-    let attempt_start = now_ms();
-    last_progress_ms.store(attempt_start, Ordering::SeqCst);
-    tokio::pin!(fut);
-    let mut ticker = tokio::time::interval(Duration::from_secs(5));
-    // `interval`'s first tick fires immediately; consume it up front so the
-    // first real stall check happens after a full interval has elapsed, not
-    // instantly at guard start.
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            result = &mut fut => return Ok(result),
-            _ = ticker.tick() => {
-                let now = now_ms();
-                let last = last_progress_ms.load(Ordering::SeqCst);
-                if now.saturating_sub(last) > stall.as_millis() as u64 {
-                    return Err(SyncStalled::NoProgress);
-                }
-                if now.saturating_sub(attempt_start) > hard_cap.as_millis() as u64 {
-                    return Err(SyncStalled::HardCapExceeded);
-                }
-            }
-        }
-    }
-}
-
-/// Drive [`with_stall_guard`] across up to `max_attempts` attempts, calling
-/// `make_attempt()` fresh each time — the same retry semantics
-/// `run_sync_now` had inline, extracted so the attempt/retry glue itself is
-/// unit-testable without a real Tauri `AppHandle`.
-///
-/// `on_retry(attempt, reason)` fires after every non-final aborted attempt
-/// (never after the last) — callers use it to log and re-arm the frontend
-/// watchdog. Returns `Ok(T)` from whichever attempt completes, or
-/// `Err(reason)` from the final attempt if every attempt was aborted.
-pub(crate) async fn retry_with_stall_guard<T, Fut>(
-    mut make_attempt: impl FnMut() -> Fut,
-    last_progress_ms: Arc<AtomicU64>,
-    now_ms: impl Fn() -> u64,
-    stall: Duration,
-    hard_cap: Duration,
-    max_attempts: u32,
-    mut on_retry: impl FnMut(u32, SyncStalled),
-) -> Result<T, SyncStalled>
-where
-    Fut: std::future::Future<Output = T>,
-{
-    let mut attempt: u32 = 1;
-    loop {
-        match with_stall_guard(
-            make_attempt(),
-            last_progress_ms.clone(),
-            &now_ms,
-            stall,
-            hard_cap,
-        )
-        .await
-        {
-            Ok(res) => return Ok(res),
-            Err(reason) if attempt < max_attempts => {
-                on_retry(attempt, reason);
-                attempt += 1;
-            }
-            Err(reason) => return Err(reason),
         }
     }
 }
@@ -427,109 +268,64 @@ pub fn set_sync_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(),
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
-/// JSON shape persisted in `settings.sync_config_json` for the `local`
-/// provider. Today it's just a root path; Chunk 4's provider will have a
-/// richer shape and we'll discriminate on `settings.sync_provider`.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-struct LocalConfig {
-    root_path: String,
+/// Desktop [`CloudCredentialStore`]: the Drive refresh token lives in the
+/// `gdrive_refresh_token` setting; the OAuth client resolves settings
+/// override → compile-time env → placeholder.
+pub(crate) struct DesktopCredentialStore;
+
+impl CloudCredentialStore for DesktopCredentialStore {
+    fn client_config(&self, conn: &rusqlite::Connection) -> Result<GDriveClientConfig, String> {
+        use crate::commands::gdrive::compiled_client_id;
+
+        // Duplicates the `resolve_client_id/secret` helpers from commands::gdrive
+        // (which are private to that module) but the logic is a 3-line lookup.
+        let client_id = db::get_setting(conn, "gdrive_client_id")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| compiled_client_id().to_string());
+        let client_secret = db::get_setting(conn, "gdrive_client_secret")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| crate::commands::gdrive::compiled_client_secret().to_string());
+        Ok(GDriveClientConfig {
+            client_id,
+            client_secret: Some(client_secret),
+        })
+    }
+
+    fn load_refresh_token(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<Option<Zeroizing<String>>, String> {
+        match db::get_setting(conn, "gdrive_refresh_token").map_err(|e| e.to_string())? {
+            Some(h) if !h.is_empty() => Ok(Some(Zeroizing::new(h))),
+            _ => Ok(None),
+        }
+    }
+
+    fn store_refresh_token(&self, conn: &rusqlite::Connection, token: &str) -> Result<(), String> {
+        db::set_setting(conn, "gdrive_refresh_token", token).map_err(|e| e.to_string())
+    }
+
+    fn clear_refresh_token(&self, conn: &rusqlite::Connection) -> Result<(), String> {
+        db::delete_setting(conn, "gdrive_refresh_token").map_err(|e| e.to_string())
+    }
 }
 
 // ─── Sync operations ────────────────────────────────────────────────────────
 
-/// Build the configured provider. Returns `None` when sync is disabled or
-/// unconfigured — the caller should surface a clear error instead of
-/// silently succeeding with a no-op.
-///
-/// The supported providers carry their config in different places:
-/// - `local` and `icloud` store a root path in the `sync_config_json` setting row.
-/// - `gdrive` stores its encrypted refresh token in `gdrive_refresh_token`
-///   plus companion rows (`gdrive_root_folder_id`, `gdrive_email`). It does
-///   not use `sync_config_json` — requiring that row for every provider
-///   was the bug that left "Sync now" reporting "Sync is disabled or not
-///   configured" even after a successful Google Drive connect.
+/// Desktop wrapper of [`crate::sync::cloud_config::configured_cloud_provider`]
+/// reading credentials through [`DesktopCredentialStore`].
 pub(crate) fn configured_cloud_provider(
     conn: &rusqlite::Connection,
 ) -> Result<Option<CloudProvider>, String> {
-    let enabled = db::get_sync_enabled(conn).map_err(|e| e.to_string())?;
-    if !enabled {
-        return Ok(None);
-    }
-    let provider = match db::get_sync_provider(conn).map_err(|e| e.to_string())? {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    match provider.as_str() {
-        "local" | "icloud" => {
-            let json = match db::get_sync_config_json(conn).map_err(|e| e.to_string())? {
-                Some(j) => j,
-                None => return Ok(None),
-            };
-            let cfg: LocalConfig = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-            let generation = db::get_sync_recovery_generation(conn).map_err(|e| e.to_string())?;
-            Ok(Some(CloudProvider::Folder(
-                LocalSyncProvider::new(cfg.root_path).with_recovery_fence(generation, None),
-            )))
-        }
-        "gdrive" => {
-            // Rebuild the session on every sync — the in-memory
-            // `GDriveSessionState` may be empty after an app restart and
-            // `GDriveProvider::ensure_fresh_token` will refresh the token
-            // itself on first use (the reconstructed session is stamped
-            // as expired on purpose).
-            let session = match reconstruct_session_from_conn(conn)? {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            let generation = db::get_sync_recovery_generation(conn).map_err(|e| e.to_string())?;
-            let gdrive = GDriveProvider::new_live(session)?.with_recovery_fence(generation, None);
-            Ok(Some(CloudProvider::GDrive(gdrive)))
-        }
-        other => Err(format!("Unknown sync provider: {other}")),
-    }
+    crate::sync::cloud_config::configured_cloud_provider(conn, &DesktopCredentialStore)
 }
 
-/// Thin wrapper around [`configured_cloud_provider`] for callers that only
-/// need the [`SyncProvider`] trait object.
+/// Desktop wrapper of [`crate::sync::cloud_config::make_configured_provider`]
+/// reading credentials through [`DesktopCredentialStore`].
 pub(crate) fn make_configured_provider(
     conn: &rusqlite::Connection,
 ) -> Result<Option<Arc<dyn SyncProvider>>, String> {
-    Ok(configured_cloud_provider(conn)?.map(|cloud| Arc::new(cloud) as Arc<dyn SyncProvider>))
-}
-
-/// Mirror of `commands::gdrive::reconstruct_session` that operates on a
-/// borrowed connection instead of re-locking the `AppState` mutex. The
-/// caller of `make_configured_provider` already holds the lock, so calling
-/// the original would deadlock.
-fn reconstruct_session_from_conn(
-    conn: &rusqlite::Connection,
-) -> Result<Option<crate::sync::gdrive_provider::GDriveSession>, String> {
-    use crate::commands::gdrive::compiled_client_id;
-
-    let refresh_token =
-        match db::get_setting(conn, "gdrive_refresh_token").map_err(|e| e.to_string())? {
-            Some(h) if !h.is_empty() => h,
-            _ => return Ok(None),
-        };
-
-    // Client id/secret: settings override → compile-time env → placeholder.
-    // Duplicates the `resolve_client_id/secret` helpers from commands::gdrive
-    // (which are private to that module) but the logic is a 3-line lookup.
-    let client_id = db::get_setting(conn, "gdrive_client_id")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| compiled_client_id().to_string());
-    let client_secret = db::get_setting(conn, "gdrive_client_secret")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| crate::commands::gdrive::compiled_client_secret().to_string());
-
-    Ok(Some(crate::sync::gdrive_provider::GDriveSession {
-        access_token: String::new(),
-        // Past expiry → `ensure_fresh_token` refreshes on first API call.
-        expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
-        refresh_token: zeroize::Zeroizing::new(refresh_token),
-        client_id,
-        client_secret: Some(client_secret),
-    }))
+    crate::sync::cloud_config::make_configured_provider(conn, &DesktopCredentialStore)
 }
 
 /// Run an async engine method synchronously using `tauri::async_runtime::block_on`.
@@ -962,7 +758,9 @@ fn run_sync_now_holding(
             }
             block_on(
                 crate::commands::gdrive::try_reupload_keyring_and_update_dirty_flag(
-                    state, key_state,
+                    state,
+                    key_state,
+                    &DesktopCredentialStore,
                 ),
             );
         }
@@ -2308,95 +2106,31 @@ async fn run_cloud_content_migration(
     Ok(())
 }
 
-/// Unified guard for all sync write paths.
-///
-/// Checks both conditions that must be clear before pushing any envelope to
-/// the cloud:
-///
-/// 1. **Force-re-pair**: another device rotated the vault and this device must
-///    re-pair before syncing. Detected via the persisted `FORCE_RE_PAIR_REQUIRED`
-///    setting.
-/// 2. **Active rotation job**: a rotation is in progress or paused (e.g. after
-///    the retry-abort path in `reencrypt_items`). Pushing K_old envelopes over
-///    files already encrypted with K_new causes permanent data loss. The
-///    persistent `rotation_jobs` table catches this even after the in-memory
-///    `SyncInProgressGuard` has been dropped.
-///
-/// Called at the earliest possible point in every push entry path
-/// (`run_push_entry`, `run_sync_now`) before any I/O is performed.
-pub(crate) fn ensure_safe_to_push_with_recovery_permit(
-    state: &AppState,
-    permit: Option<&crate::sync::recovery::RecoveryOwnerPermit>,
-) -> Result<(), String> {
-    let conn = state.lock()?;
-    // Force-re-pair check (cheaper — single settings row read).
-    if db::get_setting(&conn, db::FORCE_RE_PAIR_REQUIRED)
-        .map_err(|e| e.to_string())?
-        .as_deref()
-        == Some("1")
-    {
-        let reason_raw = db::get_setting(&conn, db::FORCE_RE_PAIR_REASON)
-            .unwrap_or(None)
-            .unwrap_or_default();
-        let (reason_class, human_msg) = if reason_raw == "keyring_check_inconclusive" {
-            ("inconclusive", "The cloud keyring could not be verified")
-        } else {
-            ("rotated", "The vault was rotated on another device")
-        };
-        log::warn!("ensure_safe_to_push: blocked — force_re_pair_required=1 reason={reason_raw}");
-        return Err(format!(
-            "FORCE_RE_PAIR_REQUIRED reason={reason_class}: {human_msg}. Re-pair before syncing."
-        ));
-    }
-    // Persistent rotation-job check (catches paused/aborted-with-resume jobs
-    // where the in-memory SyncInProgressGuard was already dropped).
-    if db::has_active_rotation_job(&conn).map_err(|e| e.to_string())? {
-        log::warn!(
-            "ensure_safe_to_push: blocked — active rotation job exists (paused or in-flight)"
-        );
-        return Err("A vault rotation is in progress or needs to resume. \
-             Wait for it to finish or click Resume in Settings."
-            .to_string());
-    }
-    if let Some(job) = db::find_active_sync_recovery_job(&conn).map_err(|e| e.to_string())? {
-        let allowed = permit.is_some_and(|permit| {
-            let local_device_id = db::get_or_create_device_id(&conn).ok();
-            permit.job_id == job.id
-                && permit.operation == job.operation
-                && i64::try_from(permit.recovery_generation).ok() == Some(job.recovery_generation)
-                && local_device_id.as_deref() == Some(permit.owner_device_id.as_str())
-        });
-        if !allowed {
-            return Err("authoritative_recovery_in_progress".to_string());
-        }
-    }
-    Ok(())
-}
+// Push guards and the pull-leg keyring check live in the engine
+// (`sync::force_re_pair`).
+pub(crate) use crate::sync::force_re_pair::{
+    ensure_safe_to_push, persist_pull_leg_check, PullLegKeyringCheck,
+};
 
-pub(crate) fn ensure_safe_to_push(state: &AppState) -> Result<(), String> {
-    ensure_safe_to_push_with_recovery_permit(state, None)
-}
-
+/// Desktop wrapper of [`crate::sync::force_re_pair::ensure_remote_recovery_push_allowed`]
+/// reading credentials through [`DesktopCredentialStore`].
 pub(crate) fn ensure_remote_recovery_push_allowed(
     state: &AppState,
     permit: Option<&crate::sync::recovery::RecoveryOwnerPermit>,
 ) -> Result<(), String> {
-    let (provider, local_generation) = {
-        let conn = state.lock()?;
-        let Some(provider) = configured_cloud_provider(&conn)? else {
-            return Ok(());
-        };
-        (
-            provider,
-            db::get_sync_recovery_generation(&conn).map_err(|e| e.to_string())?,
-        )
-    };
-    block_on(crate::sync::recovery::check_provider_recovery_push(
-        &provider,
-        local_generation,
-        permit,
-    ))
-    .map_err(|e| e.to_string())
+    block_on(
+        crate::sync::force_re_pair::ensure_remote_recovery_push_allowed(
+            state,
+            permit,
+            &DesktopCredentialStore,
+        ),
+    )
+}
+
+/// Desktop wrapper of [`crate::sync::force_re_pair::check_force_re_pair_sync`]
+/// reading credentials through [`DesktopCredentialStore`].
+async fn check_force_re_pair_sync(state: &AppState) -> PullLegKeyringCheck {
+    crate::sync::force_re_pair::check_force_re_pair_sync(state, &DesktopCredentialStore).await
 }
 
 /// Pre-flight checks for a single-entry push. Mirrors the beginning of
@@ -2447,84 +2181,6 @@ pub(crate) fn run_push_entry(
     result
 }
 
-// ─── Force re-pair detection helper ──────────────────────────────────────────
-
-/// Outcome of the pull-leg keyring check in [`check_force_re_pair_sync`].
-pub(crate) enum PullLegKeyringCheck {
-    /// Cloud vault was rotated by another device — caller must persist the
-    /// force-re-pair flag and abort the sync.
-    Mismatch(crate::commands::gdrive::ForceRePairMismatch),
-    /// `_meta.json` exists but is corrupt/unparseable — a positive integrity
-    /// signal, not a transient failure. Caller must fail closed.
-    Corrupt(String),
-    /// Verified, skipped, or a transient session/network failure — nothing for
-    /// the pull leg to act on. Transient errors stay best-effort by policy:
-    /// failing closed here would block push on every dropped connection during
-    /// a background sync.
-    Clean,
-}
-
-/// Persist the fail-closed verdict of the pull-leg keyring check.
-///
-/// `Mismatch` records the rotation; `Corrupt` fails closed via
-/// `apply_inconclusive_force_re_pair` — a corrupt `_meta.json` means the vault
-/// cannot be verified, so pushing would write on top of unverifiable state.
-///
-/// Split from `run_sync_now` so the fail-closed wiring is unit-testable:
-/// re-routing `Corrupt` to the swallow path (or dropping the flag write) must
-/// break a test, not just silently re-open the fail-open this fixed.
-pub(crate) fn persist_pull_leg_check(
-    conn: &rusqlite::Connection,
-    check: &PullLegKeyringCheck,
-) -> Result<(), String> {
-    match check {
-        PullLegKeyringCheck::Mismatch(mismatch) => {
-            crate::commands::gdrive::set_force_re_pair_flags(conn, &mismatch.reason)
-        }
-        PullLegKeyringCheck::Corrupt(_) => {
-            crate::commands::gdrive::apply_inconclusive_force_re_pair(
-                conn,
-                "keyring_check_inconclusive",
-            )
-        }
-        PullLegKeyringCheck::Clean => Ok(()),
-    }
-}
-
-/// Attempt to detect a force re-pair condition at sync time.
-///
-/// Builds the configured cloud backend (`local` / `icloud` / `gdrive`) via
-/// [`configured_cloud_provider`] so a folder vault is checked the same way as
-/// Drive. Session/auth/network problems are swallowed (`Clean`) — the
-/// unlock-time reconcile and the connect flow own fail-closed handling for
-/// those. Missing/unconfigured provider is also `Clean` (not a typed
-/// NotFound): there is no vault to compare, and treating that as absence
-/// would let the dirty-keyring reupload publish over an unverified cloud.
-/// A corrupt `_meta.json` is NOT swallowed: the bytes were read successfully
-/// and do not form a valid keyring, so pushing on top of it would trust an
-/// unverifiable vault.
-async fn check_force_re_pair_sync(state: &AppState) -> PullLegKeyringCheck {
-    let provider = match state.lock() {
-        Ok(conn) => match configured_cloud_provider(&conn) {
-            Ok(Some(p)) => p,
-            // Disabled, unconfigured, or a session rebuild failure — fail
-            // open for availability. Do not map "no provider" to NotFound.
-            _ => return PullLegKeyringCheck::Clean,
-        },
-        Err(_) => return PullLegKeyringCheck::Clean,
-    };
-    match crate::commands::gdrive::detect_force_re_pair(&provider, state).await {
-        Ok(crate::commands::gdrive::ForceRePairCheck::Mismatch(m)) => {
-            PullLegKeyringCheck::Mismatch(m)
-        }
-        // Verified / Skipped → nothing to report. The pull leg never clears flags.
-        Ok(_) => PullLegKeyringCheck::Clean,
-        Err(e) if e.is_corrupt => PullLegKeyringCheck::Corrupt(e.message),
-        // Transient (network / auth / lock) — best-effort by policy.
-        Err(_) => PullLegKeyringCheck::Clean,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2534,239 +2190,6 @@ mod tests {
     #[test]
     fn catchup_progress_event_name_matches_frontend_contract() {
         assert_eq!(SYNC_CATCHUP_PROGRESS_EVENT, "sync:catchup-progress");
-    }
-
-    // ── with_stall_guard ──────────────────────────────────────────────────
-    //
-    // `start_paused = true` makes `tokio::time` (sleep/interval/advance) run
-    // on a virtual clock — no real waiting. `now_ms` is built from
-    // `tokio::time::Instant::now()` so `tokio::time::advance` moves both the
-    // guard's internal ticker and the injected clock in lockstep.
-
-    /// A hard cap so generous it never fires within these tests' windows —
-    /// used whenever a test only cares about the stall (inactivity) check.
-    fn no_effective_hard_cap() -> Duration {
-        Duration::from_secs(24 * 60 * 60)
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn with_stall_guard_completes_ok_for_a_future_that_finishes_quickly() {
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let baseline = tokio::time::Instant::now();
-        let now_ms = move || baseline.elapsed().as_millis() as u64;
-
-        let result = with_stall_guard(
-            async { 42 },
-            last_progress_ms,
-            now_ms,
-            Duration::from_secs(20),
-            no_effective_hard_cap(),
-        )
-        .await;
-
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn with_stall_guard_errs_when_no_progress_is_ever_stamped() {
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let baseline = tokio::time::Instant::now();
-        let now_ms = move || baseline.elapsed().as_millis() as u64;
-        let stall = Duration::from_secs(20);
-
-        // A future that never resolves and never stamps progress.
-        let guard = tokio::spawn(with_stall_guard(
-            std::future::pending::<()>(),
-            last_progress_ms,
-            now_ms,
-            stall,
-            no_effective_hard_cap(),
-        ));
-
-        // Advance well past the stall window; the guard's 5s ticker must
-        // notice the silence and abort before this returns.
-        tokio::time::advance(stall + Duration::from_secs(10)).await;
-
-        let result = guard.await.expect("guard task must not panic");
-        assert_eq!(
-            result,
-            Err(SyncStalled::NoProgress),
-            "expected NoProgress, got {result:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn with_stall_guard_survives_a_future_that_keeps_stamping_progress() {
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let baseline = tokio::time::Instant::now();
-        let now_ms = move || baseline.elapsed().as_millis() as u64;
-        let stall = Duration::from_secs(20);
-
-        // Runs for 3x the stall window (6 steps of 10s = 60s), but stamps
-        // progress every step — well inside the 20s stall window each time —
-        // so the guard must let it run to completion instead of aborting.
-        let progress_for_stamping = last_progress_ms.clone();
-        let slow_but_progressing = async move {
-            for _ in 0..6 {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                progress_for_stamping
-                    .store(baseline.elapsed().as_millis() as u64, Ordering::SeqCst);
-            }
-            "done"
-        };
-
-        let guard = tokio::spawn(with_stall_guard(
-            slow_but_progressing,
-            last_progress_ms,
-            now_ms,
-            stall,
-            no_effective_hard_cap(),
-        ));
-
-        tokio::time::advance(Duration::from_secs(65)).await;
-
-        let result = guard.await.expect("guard task must not panic");
-        assert_eq!(result.unwrap(), "done");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn with_stall_guard_errs_with_hard_cap_exceeded_even_with_constant_progress() {
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let baseline = tokio::time::Instant::now();
-        let now_ms = move || baseline.elapsed().as_millis() as u64;
-        // A generous stall window (never trips) paired with a short hard
-        // cap: a future that stamps progress on every tick would satisfy
-        // `with_stall_guard_survives_...` above forever, but must still be
-        // killed once the hard cap elapses.
-        let stall = Duration::from_secs(24 * 60 * 60);
-        let hard_cap = Duration::from_secs(30);
-
-        let progress_for_stamping = last_progress_ms.clone();
-        let stamps_forever: std::future::Pending<()> = {
-            // Spawn a sibling task that keeps stamping progress forever;
-            // the guarded future itself never resolves (mirrors a
-            // genuinely endless workload with a slow-but-steady trickle of
-            // progress).
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    progress_for_stamping
-                        .store(baseline.elapsed().as_millis() as u64, Ordering::SeqCst);
-                }
-            });
-            std::future::pending()
-        };
-
-        let guard = tokio::spawn(with_stall_guard(
-            stamps_forever,
-            last_progress_ms,
-            now_ms,
-            stall,
-            hard_cap,
-        ));
-
-        tokio::time::advance(hard_cap + Duration::from_secs(10)).await;
-
-        let result = guard.await.expect("guard task must not panic");
-        assert_eq!(
-            result,
-            Err(SyncStalled::HardCapExceeded),
-            "expected HardCapExceeded, got {result:?}"
-        );
-    }
-
-    // ── retry_with_stall_guard ────────────────────────────────────────────
-
-    #[tokio::test(start_paused = true)]
-    async fn retry_with_stall_guard_succeeds_after_one_stalled_attempt() {
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let baseline = tokio::time::Instant::now();
-        let now_ms = move || baseline.elapsed().as_millis() as u64;
-        let stall = Duration::from_secs(20);
-
-        // Attempt 1 never stamps progress and never resolves → stalls.
-        // Attempt 2 resolves immediately → succeeds.
-        let attempt_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let make_attempt = {
-            let attempt_count = attempt_count.clone();
-            move || {
-                let n = attempt_count.fetch_add(1, Ordering::SeqCst);
-                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + Send>> =
-                    if n == 0 {
-                        Box::pin(std::future::pending())
-                    } else {
-                        Box::pin(async { "ok" })
-                    };
-                fut
-            }
-        };
-
-        let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let on_retry = {
-            let retry_count = retry_count.clone();
-            move |_attempt: u32, _reason: SyncStalled| {
-                retry_count.fetch_add(1, Ordering::SeqCst);
-            }
-        };
-
-        let guard = tokio::spawn(retry_with_stall_guard(
-            make_attempt,
-            last_progress_ms,
-            now_ms,
-            stall,
-            no_effective_hard_cap(),
-            3,
-            on_retry,
-        ));
-
-        tokio::time::advance(stall + Duration::from_secs(10)).await;
-
-        let result = guard.await.expect("guard task must not panic");
-        assert_eq!(result.unwrap(), "ok");
-        assert_eq!(
-            retry_count.load(Ordering::SeqCst),
-            1,
-            "on_retry should fire exactly once (after the one stalled attempt)"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retry_with_stall_guard_errs_after_max_attempts_all_stall() {
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let baseline = tokio::time::Instant::now();
-        let now_ms = move || baseline.elapsed().as_millis() as u64;
-        let stall = Duration::from_secs(20);
-        let max_attempts = 3u32;
-
-        let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let on_retry = {
-            let retry_count = retry_count.clone();
-            move |_attempt: u32, _reason: SyncStalled| {
-                retry_count.fetch_add(1, Ordering::SeqCst);
-            }
-        };
-
-        let guard = tokio::spawn(retry_with_stall_guard(
-            || std::future::pending::<()>(),
-            last_progress_ms,
-            now_ms,
-            stall,
-            no_effective_hard_cap(),
-            max_attempts,
-            on_retry,
-        ));
-
-        // Every attempt gets its own fresh stall window, so the total time
-        // to exhaust all attempts is roughly max_attempts * (stall + a tick).
-        tokio::time::advance(stall * max_attempts + Duration::from_secs(30)).await;
-
-        let result = guard.await.expect("guard task must not panic");
-        assert_eq!(result, Err(SyncStalled::NoProgress));
-        assert_eq!(
-            retry_count.load(Ordering::SeqCst),
-            max_attempts - 1,
-            "on_retry must fire for every non-final attempt, never for the last"
-        );
     }
 
     // ── SyncPhase wire format ─────────────────────────────────────────────
@@ -2922,143 +2345,6 @@ mod tests {
             db::mark_entry_pending(&conn, &e.id).unwrap();
         }
         assert_eq!(db::count_pending_entries(&conn).unwrap(), 2);
-    }
-
-    fn make_key_state() -> EncryptionKeyState {
-        let ks = EncryptionKeyState::new();
-        let key = zeroize::Zeroizing::new([42u8; 32]);
-        ks.set_key(key).unwrap();
-        ks
-    }
-
-    #[test]
-    fn make_configured_provider_returns_none_when_sync_disabled() {
-        let state = make_state();
-        let _key_state = make_key_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_sync_provider(&conn, "local").unwrap();
-            db::set_sync_config_json(&conn, "{\"root_path\":\"/tmp/xj\"}").unwrap();
-            // sync_enabled stays false — disabled overrides everything else.
-        }
-        let conn = state.lock().unwrap();
-        let provider = make_configured_provider(&conn).unwrap();
-        assert!(provider.is_none());
-    }
-
-    #[test]
-    fn make_configured_provider_returns_none_when_no_provider() {
-        let state = make_state();
-        let _key_state = make_key_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_sync_enabled(&conn, true).unwrap();
-        }
-        let conn = state.lock().unwrap();
-        let provider = make_configured_provider(&conn).unwrap();
-        assert!(provider.is_none());
-    }
-
-    #[test]
-    fn make_configured_provider_builds_local_from_config_json() {
-        let state = make_state();
-        let _key_state = make_key_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_sync_provider(&conn, "local").unwrap();
-            db::set_sync_config_json(&conn, "{\"root_path\":\"/tmp/xj\"}").unwrap();
-            db::set_sync_enabled(&conn, true).unwrap();
-        }
-        let conn = state.lock().unwrap();
-        let provider = make_configured_provider(&conn).unwrap();
-        assert!(
-            provider.is_some(),
-            "local provider should build from sync_config_json"
-        );
-    }
-
-    #[test]
-    fn make_configured_provider_builds_icloud_from_config_json() {
-        let state = make_state();
-        let _key_state = make_key_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_sync_provider(&conn, "icloud").unwrap();
-            db::set_sync_config_json(&conn, "{\"root_path\":\"/tmp/xj-icloud\"}").unwrap();
-            db::set_sync_enabled(&conn, true).unwrap();
-        }
-        let conn = state.lock().unwrap();
-        let provider = make_configured_provider(&conn).unwrap();
-        assert!(
-            provider.is_some(),
-            "icloud provider should build from sync_config_json"
-        );
-    }
-
-    #[test]
-    fn make_configured_provider_returns_none_when_local_missing_config_json() {
-        let state = make_state();
-        let _key_state = make_key_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_sync_provider(&conn, "local").unwrap();
-            db::set_sync_enabled(&conn, true).unwrap();
-            // No sync_config_json.
-        }
-        let conn = state.lock().unwrap();
-        let provider = make_configured_provider(&conn).unwrap();
-        assert!(provider.is_none());
-    }
-
-    #[test]
-    fn make_configured_provider_builds_gdrive_from_refresh_token() {
-        let state = make_state();
-        let _key_state = make_key_state();
-        let refresh_token = "1//fake-refresh-token";
-        {
-            let conn = state.lock().unwrap();
-            db::set_setting(&conn, "gdrive_refresh_token", refresh_token).unwrap();
-            db::set_sync_provider(&conn, "gdrive").unwrap();
-            db::set_sync_enabled(&conn, true).unwrap();
-        }
-        let conn = state.lock().unwrap();
-        let provider = make_configured_provider(&conn).unwrap();
-        assert!(
-            provider.is_some(),
-            "gdrive provider should build without sync_config_json, using refresh token instead"
-        );
-    }
-
-    #[test]
-    fn make_configured_provider_returns_none_when_gdrive_missing_refresh_token() {
-        let state = make_state();
-        let _key_state = make_key_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_sync_provider(&conn, "gdrive").unwrap();
-            db::set_sync_enabled(&conn, true).unwrap();
-            // No gdrive_refresh_token.
-        }
-        let conn = state.lock().unwrap();
-        let provider = make_configured_provider(&conn).unwrap();
-        assert!(provider.is_none());
-    }
-
-    #[test]
-    fn make_configured_provider_errors_on_unknown_provider() {
-        let state = make_state();
-        let _key_state = make_key_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_sync_provider(&conn, "dropbox").unwrap();
-            db::set_sync_enabled(&conn, true).unwrap();
-        }
-        let conn = state.lock().unwrap();
-        let result = make_configured_provider(&conn);
-        match result {
-            Err(e) => assert!(e.contains("Unknown sync provider"), "got: {e}"),
-            Ok(_) => panic!("expected unknown-provider error"),
-        }
     }
 
     #[test]
@@ -4182,257 +3468,6 @@ mod tests {
         assert!(!read_scope_upgrade_required(&conn));
     }
 
-    // ─── ensure_safe_to_push gate (replaces ensure_not_force_re_pair) ────────
-
-    /// C1/C2: ensure_safe_to_push returns Ok on a clean DB.
-    // ─── A1: persist_pull_leg_check (fail-closed wiring of the pull leg) ─────
-
-    /// A corrupt cloud `_meta.json` must persist the fail-closed flag so that
-    /// `ensure_safe_to_push` blocks — deleting the Corrupt wiring in
-    /// `run_sync_now` (or routing it to Clean) must fail this test.
-    #[test]
-    fn persist_pull_leg_check_corrupt_blocks_push() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            persist_pull_leg_check(
-                &conn,
-                &PullLegKeyringCheck::Corrupt("_meta.json parse error".to_string()),
-            )
-            .expect("flag write must succeed");
-        }
-        let err = ensure_safe_to_push(&state).expect_err("corrupt meta must block push");
-        assert!(
-            err.contains("FORCE_RE_PAIR_REQUIRED"),
-            "push must be blocked by the persisted flag, got: {err}"
-        );
-        let conn = state.lock().unwrap();
-        assert_eq!(
-            db::get_setting(&conn, db::FORCE_RE_PAIR_REASON)
-                .unwrap()
-                .as_deref(),
-            Some("keyring_check_inconclusive"),
-            "corrupt meta uses the inconclusive provenance so an auth-recheck can still clear it"
-        );
-    }
-
-    #[test]
-    fn persist_pull_leg_check_mismatch_sets_both_flags() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            persist_pull_leg_check(
-                &conn,
-                &PullLegKeyringCheck::Mismatch(crate::commands::gdrive::ForceRePairMismatch {
-                    reason: "vault_rotated".to_string(),
-                    cloud_epoch: 5,
-                }),
-            )
-            .expect("flag write must succeed");
-        }
-        let err = ensure_safe_to_push(&state).expect_err("mismatch must block push");
-        assert!(err.contains("rotated"), "got: {err}");
-    }
-
-    #[test]
-    fn persist_pull_leg_check_clean_is_a_noop() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            persist_pull_leg_check(&conn, &PullLegKeyringCheck::Clean).unwrap();
-        }
-        assert!(
-            ensure_safe_to_push(&state).is_ok(),
-            "a clean check must not block push"
-        );
-    }
-
-    const FOLDER_REPAIR_LOCAL_FP: &str =
-        "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
-    const FOLDER_REPAIR_CLOUD_FP: &str =
-        "bb11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
-
-    fn configure_folder_sync(state: &AppState, root: &std::path::Path, leftover_drive_token: bool) {
-        let cfg = serde_json::to_string(&LocalConfig {
-            root_path: root.to_string_lossy().into_owned(),
-        })
-        .expect("serialize local sync config");
-        let conn = state.lock().unwrap();
-        db::set_sync_provider(&conn, "local").unwrap();
-        db::set_sync_config_json(&conn, &cfg).unwrap();
-        db::set_sync_enabled(&conn, true).unwrap();
-        db::set_setting(&conn, db::CLOUD_MASTER_FINGERPRINT, FOLDER_REPAIR_LOCAL_FP).unwrap();
-        db::set_setting(&conn, db::KEYRING_V2_LOCAL_EPOCH, "1").unwrap();
-        if leftover_drive_token {
-            db::set_setting(&conn, "gdrive_refresh_token", "1//leftover-drive-token").unwrap();
-        }
-    }
-
-    async fn seed_rotated_folder_meta(root: &std::path::Path) {
-        let folder = LocalSyncProvider::new(root);
-        let meta = crate::sync::keyring_v2::types::KeyringMetaV2 {
-            version: crate::sync::keyring_v2::types::KEYRING_V2_VERSION,
-            epoch: 2,
-            master_fingerprint: FOLDER_REPAIR_CLOUD_FP.to_string(),
-            content_epoch: 1,
-            recovery_generation: 0,
-            created_at: 1_700_000_000,
-            updated_at: 1_700_000_000,
-        };
-        crate::sync::keyring_v2::io::write_meta(&folder, &meta)
-            .await
-            .expect("seed folder _meta.json");
-    }
-
-    fn assert_folder_vault_rotation(check: PullLegKeyringCheck) {
-        match check {
-            PullLegKeyringCheck::Mismatch(m) => {
-                assert_eq!(m.reason, "vault_rotated");
-                assert_eq!(m.cloud_epoch, 2);
-            }
-            PullLegKeyringCheck::Clean => panic!(
-                "folder-backed rotation must run detect on the folder provider — \
-                 Clean means the check bailed (no Drive token / leftover Drive session) \
-                 instead of reading the folder vault"
-            ),
-            PullLegKeyringCheck::Corrupt(msg) => {
-                panic!("expected folder vault Mismatch, got Corrupt: {msg}")
-            }
-        }
-    }
-
-    /// A local/iCloud folder vault must run `detect_force_re_pair` even when
-    /// there is no Drive refresh token. Returning Clean here is the
-    /// reconstruct_session / GDriveProvider::new_live hole: the dirty-keyring
-    /// reupload would then publish local `_meta.json` over a peer rotation.
-    #[tokio::test]
-    async fn check_force_re_pair_sync_detects_folder_vault_rotation_without_drive_token() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let state = make_state();
-        configure_folder_sync(&state, dir.path(), false);
-        seed_rotated_folder_meta(dir.path()).await;
-
-        assert_folder_vault_rotation(check_force_re_pair_sync(&state).await);
-    }
-
-    /// A leftover Drive refresh token from a prior Drive session must not
-    /// divert this check onto Drive. Probe the configured folder; a Drive
-    /// network/auth failure would otherwise swallow the rotation as Clean.
-    #[tokio::test]
-    async fn check_force_re_pair_sync_detects_folder_vault_rotation_despite_leftover_drive_token() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let state = make_state();
-        configure_folder_sync(&state, dir.path(), true);
-        seed_rotated_folder_meta(dir.path()).await;
-
-        assert_folder_vault_rotation(check_force_re_pair_sync(&state).await);
-    }
-
-    #[test]
-    fn ensure_safe_to_push_ok_when_neither_condition_holds() {
-        let state = make_state();
-        assert!(
-            ensure_safe_to_push(&state).is_ok(),
-            "must return Ok when no rotation job and no force-re-pair flag"
-        );
-    }
-
-    /// C1/C2: ensure_safe_to_push blocks when force-re-pair is required.
-    #[test]
-    fn ensure_safe_to_push_blocks_when_force_re_pair_required() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_setting(&conn, db::FORCE_RE_PAIR_REQUIRED, "1").unwrap();
-        }
-        let result = ensure_safe_to_push(&state);
-        assert!(
-            result.is_err(),
-            "expected Err when FORCE_RE_PAIR_REQUIRED=1"
-        );
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("Re-pair before syncing"),
-            "error must mention re-pair: {msg}"
-        );
-    }
-
-    /// C1/C2: ensure_safe_to_push emits the 'inconclusive' reason class when
-    /// FORCE_RE_PAIR_REASON = keyring_check_inconclusive.
-    #[test]
-    fn ensure_safe_to_push_reason_inconclusive() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_setting(&conn, db::FORCE_RE_PAIR_REQUIRED, "1").unwrap();
-            db::set_setting(
-                &conn,
-                db::FORCE_RE_PAIR_REASON,
-                "keyring_check_inconclusive",
-            )
-            .unwrap();
-        }
-        let msg = ensure_safe_to_push(&state).unwrap_err();
-        assert!(
-            msg.contains("FORCE_RE_PAIR_REQUIRED"),
-            "must contain machine marker: {msg}"
-        );
-        assert!(
-            msg.contains("reason=inconclusive"),
-            "must encode inconclusive reason: {msg}"
-        );
-        assert!(
-            msg.contains("Re-pair before syncing"),
-            "must keep re-pair substring for existing tests: {msg}"
-        );
-    }
-
-    /// C1/C2: ensure_safe_to_push emits the 'rotated' reason class for a real
-    /// vault-rotation reason (any value other than keyring_check_inconclusive).
-    #[test]
-    fn ensure_safe_to_push_reason_rotated() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            db::set_setting(&conn, db::FORCE_RE_PAIR_REQUIRED, "1").unwrap();
-            db::set_setting(&conn, db::FORCE_RE_PAIR_REASON, "vault_rotated_on_peer").unwrap();
-        }
-        let msg = ensure_safe_to_push(&state).unwrap_err();
-        assert!(
-            msg.contains("FORCE_RE_PAIR_REQUIRED"),
-            "must contain machine marker: {msg}"
-        );
-        assert!(
-            msg.contains("reason=rotated"),
-            "must encode rotated reason: {msg}"
-        );
-        assert!(
-            msg.contains("Re-pair before syncing"),
-            "must keep re-pair substring for existing tests: {msg}"
-        );
-    }
-
-    /// C1: ensure_safe_to_push blocks when an active rotation job exists
-    /// (e.g. state = reencrypt — paused after retry-abort).
-    #[test]
-    fn ensure_safe_to_push_blocks_when_active_rotation_job_exists() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            db::insert_rotation_job(&conn, "fp-old", "fp-new", 1, 2, None).unwrap();
-        }
-        let result = ensure_safe_to_push(&state);
-        assert!(
-            result.is_err(),
-            "expected Err when active rotation job exists"
-        );
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("rotation"),
-            "error must mention rotation: {msg}"
-        );
-    }
-
     #[test]
     fn active_authoritative_recovery_must_block_normal_sync_single_flight() {
         let _lock = crate::commands::sync::SYNC_GUARD_TEST_LOCK
@@ -4452,51 +3487,6 @@ mod tests {
         assert!(
             result.is_err(),
             "normal sync must not acquire the shared single-flight slot while an authoritative recovery job is active"
-        );
-    }
-
-    /// C1: ensure_safe_to_push passes when the only rotation job is in done state.
-    #[test]
-    fn ensure_safe_to_push_ignores_done_and_aborted_rotation_jobs() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            let id = db::insert_rotation_job(&conn, "fp-old", "fp-new", 1, 2, None).unwrap();
-            db::update_rotation_job_state(&conn, id, "done").unwrap();
-        }
-        assert!(
-            ensure_safe_to_push(&state).is_ok(),
-            "done rotation job must NOT block push"
-        );
-        // Also check aborted.
-        {
-            let conn = state.lock().unwrap();
-            let id = db::insert_rotation_job(&conn, "fp-a", "fp-b", 3, 4, None).unwrap();
-            db::update_rotation_job_state(&conn, id, "aborted").unwrap();
-        }
-        assert!(
-            ensure_safe_to_push(&state).is_ok(),
-            "aborted rotation job must NOT block push"
-        );
-    }
-
-    /// C2: run_push_entry (via ensure_safe_to_push) blocks when an active
-    /// rotation job exists, independently of the force-re-pair flag.
-    ///
-    /// The full run_push_entry requires a configured provider and AppHandle —
-    /// not available in unit tests. We verify the guard directly, which is
-    /// the seam called at the top of run_push_entry.
-    #[test]
-    fn run_push_entry_blocks_when_active_rotation_job_exists() {
-        let state = make_state();
-        {
-            let conn = state.lock().unwrap();
-            db::insert_rotation_job(&conn, "fp-old", "fp-new", 5, 6, None).unwrap();
-        }
-        let result = ensure_safe_to_push(&state);
-        assert!(
-            result.is_err(),
-            "ensure_safe_to_push (called by run_push_entry) must block for active rotation job"
         );
     }
 

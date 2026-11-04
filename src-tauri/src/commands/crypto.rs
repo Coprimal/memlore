@@ -28,6 +28,7 @@ use crate::EncryptionKeyState;
 // The vault lifecycle lives in `memlore_engine::vault` (mobile-app plan,
 // phase 11); these keep the old `crate::commands::crypto::*` paths compiling.
 use crate::commands::keychain::DesktopVaultHooks;
+use memlore_engine::sync::force_re_pair::complete_force_re_pair_inner;
 #[cfg(test)]
 use memlore_engine::vault::decode_hex_salt;
 #[cfg(test)]
@@ -469,7 +470,12 @@ async fn reupload_keyring_after_password_change(
     if !is_connected {
         return;
     }
-    crate::commands::gdrive::try_reupload_keyring_and_update_dirty_flag(state, key_state).await;
+    crate::commands::gdrive::try_reupload_keyring_and_update_dirty_flag(
+        state,
+        key_state,
+        &crate::commands::sync::DesktopCredentialStore,
+    )
+    .await;
 }
 
 /// Payload emitted with the `xj://rotation-resume-required` event so the
@@ -1048,38 +1054,12 @@ pub async fn cancel_first_time_setup(
     db::delete_pending_setup(&conn, &setup_id).map_err(|e| e.to_string())
 }
 
-/// Read the persisted `force_re_pair_required` / `force_re_pair_reason` pair.
-///
-/// Returns `Some(reason)` when the vault was rotated on another device and
-/// this device has not yet completed re-pairing. Returns `None` otherwise.
-///
-/// The flag survives app restarts (it lives in the DB settings table), so
-/// without this command the frontend Zustand `useForceRePair` store reverts
-/// to its default `false` after every relaunch and the user is silently
-/// dropped back into the (now-broken) lock-screen flow. The frontend calls
-/// this on app mount and hydrates the store from the result.
-pub(crate) fn get_force_re_pair_status_inner(
-    conn: &rusqlite::Connection,
-) -> Result<Option<String>, String> {
-    let required = db::get_setting(conn, db::FORCE_RE_PAIR_REQUIRED)
-        .map_err(|e| e.to_string())?
-        .filter(|v| !v.is_empty());
-    if required.as_deref() != Some("1") {
-        return Ok(None);
-    }
-    let reason = db::get_setting(conn, db::FORCE_RE_PAIR_REASON)
-        .map_err(|e| e.to_string())?
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "Vault was rotated on another device.".to_string());
-    Ok(Some(reason))
-}
-
 #[tauri::command]
 pub async fn get_force_re_pair_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     let conn = state.lock()?;
-    get_force_re_pair_status_inner(&conn)
+    memlore_engine::sync::force_re_pair::get_force_re_pair_status_inner(&conn)
 }
 
 /// Crash-recovery probe: returns the first pending setup row if one exists
@@ -2800,117 +2780,16 @@ pub async fn complete_force_re_pair(
             .ok()
     };
 
-    // Validate passphrase BEFORE touching the DB connection. Steps 1-3 of
-    // onboard_complete_inner only need the provider + mnemonic — they never
-    // touch the DB. By bailing here on a wrong passphrase we keep AppState
-    // completely untouched, so the user's retry still finds the real DB.
-    onboard_validate_passphrase_inner(&provider, &recovery_mnemonic).await?;
-
-    // Read the current device name AND the current `sync_provider` BEFORE
-    // swapping the connection. The previous shape swapped first, then
-    // queried — but the placeholder we swapped in was a bare `:memory:`
-    // connection with no schema, so `db::list_devices` blew up with `no
-    // such table: devices` and the user saw "no such table" instead of a
-    // re-pair flow. Read first, swap second, and migrate the placeholder so
-    // any other code that hits the state lock during the rekey window sees
-    // a usable (if empty) DB. `sync_provider` is captured here so the
-    // post-success re-assert writes the same value back (skip when unset)
-    // instead of hardcoding `"gdrive"`.
-    let (device_name, prior_sync_provider) = {
-        let conn = state.lock()?;
-        let device_name = db::list_devices(&conn)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|d| d.is_current)
-            .map(|d| d.name)
-            .unwrap_or_else(|| "My Device".to_string());
-        let prior_sync_provider = db::get_sync_provider(&conn).map_err(|e| e.to_string())?;
-        (device_name, prior_sync_provider)
-    };
-
-    // Extract the real DB connection to pass to the inner function.
-    // Pattern mirrors onboard_complete: swap in a fully-migrated placeholder,
-    // work on real conn, swap back.
-    let real_conn = {
-        let placeholder = rusqlite::Connection::open_in_memory()
-            .map_err(|e| format!("placeholder conn failed: {e}"))?;
-        db::schema::migrate(&placeholder)
-            .map_err(|e| format!("Failed to migrate placeholder: {e}"))?;
-        db::set_encryption_mode(&placeholder, db::EncryptionMode::Unset)
-            .map_err(|e| format!("Failed to seed placeholder mode: {e}"))?;
-        let mut guard = state.lock()?;
-        std::mem::replace(&mut *guard, placeholder)
-    };
-
-    let result = onboard_complete_inner(
-        real_conn,
+    complete_force_re_pair_inner(
+        &state,
         &key_state,
         &provider,
         &recovery_mnemonic,
         &new_local_password,
-        &device_name,
         boot_path.as_deref(),
-        None, // no pending Drive session from the force-re-pair path
-        None, // unlock_method (existing test — defaults to password-only)
         &DesktopVaultHooks,
     )
-    .await;
-
-    match result {
-        Ok(real_conn) => {
-            // Swap real connection back.
-            state.set_connection(real_conn)?;
-
-            // Clear force re-pair flags AND re-assert the sync-provider /
-            // sync-enabled settings. `persist_connect_settings` wrote both
-            // earlier in `gdrive_complete_connect`, but the user-visible
-            // "Enable sync" toggle reads `sync_provider` for its disabled
-            // prop. If we hit any flow that landed force-re-pair without
-            // persist_connect_settings running first (or a stale snapshot
-            // taken before the connect), the toggle would stay frozen-off
-            // even though the vault is healthy. Writes are idempotent.
-            // Re-assert the provider captured before the swap so a folder
-            // install (`local` / `icloud`) is not overwritten with `gdrive`.
-            {
-                let conn = state.lock()?;
-                clear_force_re_pair_and_reassert_sync(&conn, prior_sync_provider.as_deref());
-            }
-
-            Ok(())
-        }
-        Err((real_conn, e)) => {
-            // Restore the real connection so the placeholder doesn't linger in
-            // AppState. The real conn is always valid (it has the correct key,
-            // whatever state it was in before the swap), so swapping it back
-            // allows the user to retry without the app being stuck on an empty
-            // placeholder DB. The passphrase was validated before the swap, so
-            // wrong-passphrase cases never reach here; any error here is a
-            // post-swap inner error (DB write / rekey). Retry may succeed if
-            // the failure was transient (I/O, Drive timeout, etc.).
-            let _ = state.set_connection(real_conn);
-            Err(e)
-        }
-    }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Clear force-re-pair flags and re-assert sync-connected / sync-enabled.
-///
-/// Re-writes `sync_provider` only when `prior_sync_provider` is `Some`, so a
-/// folder-provider install (`"local"` / `"icloud"`) is not overwritten with
-/// `"gdrive"`. A missing prior value is left untouched.
-fn clear_force_re_pair_and_reassert_sync(
-    conn: &rusqlite::Connection,
-    prior_sync_provider: Option<&str>,
-) {
-    let _ = db::delete_setting(conn, db::FORCE_RE_PAIR_REQUIRED);
-    let _ = db::delete_setting(conn, db::FORCE_RE_PAIR_REASON);
-    if let Some(provider) = prior_sync_provider {
-        let _ = db::set_setting(conn, "sync_provider", provider);
-    }
-    let _ = db::set_setting(conn, "sync_connected", "true");
-    let _ = db::set_sync_enabled(conn, true);
+    .await
 }
 
 #[cfg(test)]
@@ -6491,68 +6370,6 @@ mod tests {
         assert!(
             !has_active_after_abort,
             "aborted rotation job must NOT be active"
-        );
-    }
-
-    // ─── get_force_re_pair_status ────────────────────────────────────────────
-
-    #[test]
-    fn get_force_re_pair_status_returns_none_when_flag_unset() {
-        let conn = setup();
-        assert_eq!(get_force_re_pair_status_inner(&conn).unwrap(), None);
-    }
-
-    #[test]
-    fn get_force_re_pair_status_returns_reason_when_flag_set() {
-        let conn = setup();
-        db::set_setting(&conn, db::FORCE_RE_PAIR_REQUIRED, "1").unwrap();
-        db::set_setting(&conn, db::FORCE_RE_PAIR_REASON, "vault_rotated_on_peer").unwrap();
-        assert_eq!(
-            get_force_re_pair_status_inner(&conn).unwrap(),
-            Some("vault_rotated_on_peer".to_string())
-        );
-    }
-
-    #[test]
-    fn get_force_re_pair_status_returns_fallback_reason_when_reason_missing() {
-        // Some callsites only set the flag and skip the reason (the V1 wipe
-        // path used to be one — see gdrive.rs). The frontend still needs a
-        // non-empty string so it can render the ForceRePairScreen — give it
-        // a generic fallback instead of silently swallowing the trigger.
-        let conn = setup();
-        db::set_setting(&conn, db::FORCE_RE_PAIR_REQUIRED, "1").unwrap();
-        let status = get_force_re_pair_status_inner(&conn).unwrap();
-        assert!(status.is_some(), "flag is set, must report non-None");
-        assert!(
-            !status.unwrap().is_empty(),
-            "reason must be a non-empty fallback string"
-        );
-    }
-
-    #[test]
-    fn get_force_re_pair_status_ignores_empty_flag_value() {
-        let conn = setup();
-        db::set_setting(&conn, db::FORCE_RE_PAIR_REQUIRED, "").unwrap();
-        assert_eq!(get_force_re_pair_status_inner(&conn).unwrap(), None);
-    }
-
-    /// `complete_force_re_pair` re-asserts the `sync_provider` value that was
-    /// stored before the connection swap. A folder-provider install must keep
-    /// `"local"` instead of being overwritten with `"gdrive"`.
-    #[test]
-    fn complete_force_re_pair_keeps_stored_local_sync_provider() {
-        let conn = setup();
-        db::set_setting(&conn, "sync_provider", "local").unwrap();
-
-        let prior = db::get_sync_provider(&conn).unwrap();
-        clear_force_re_pair_and_reassert_sync(&conn, prior.as_deref());
-
-        let provider = db::get_setting(&conn, "sync_provider")
-            .unwrap()
-            .expect("sync_provider must still be set");
-        assert_eq!(
-            provider, "local",
-            "complete_force_re_pair must keep the stored sync_provider"
         );
     }
 
