@@ -32,7 +32,8 @@ function appendNew(rows: readonly EntryRow[], items: readonly EntryRow[]): Entry
 
 // Bumped by every lock or invisibility change of an entry or journal (and
 // every move): rows read before it may show an entry now locked as plain, so
-// lists drop them.
+// lists drop them. A sync that changed entries bumps it too (`useSync`'s one
+// `onEntriesChanged` listener): a pull may have locked or moved any of them.
 let listsDirty = 0;
 const dirtyListeners = new Set<() => void>();
 

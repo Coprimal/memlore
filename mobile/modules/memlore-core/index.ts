@@ -17,6 +17,10 @@ export type StartupMode = 'first_launch' | 'password_locked' | 'boot_file_corrup
  * ERR_SECOND_LOCK_REQUIRED: the entry or journal is locked and shown
  * redacted (`showExistence` on, not revealed); reveal with the second-lock
  * password. Never returned while locked rows are hidden.
+ * ERR_VAULT_NOT_EMPTY: this phone's vault holds entries (trashed ones
+ * included), so it never joins another cloud vault: onboarding, and a Drive
+ * connect that finds a different vault, are refused and change nothing.
+ * ERR_WRONG_PHRASE: the recovery phrase does not open the cloud vault.
  */
 export type MemloreErrorCode =
   | 'ERR_LOCKED'
@@ -28,7 +32,9 @@ export type MemloreErrorCode =
   | 'ERR_NOT_FOUND'
   | 'ERR_NAME_TAKEN'
   | 'ERR_LAST_JOURNAL'
-  | 'ERR_SECOND_LOCK_REQUIRED';
+  | 'ERR_SECOND_LOCK_REQUIRED'
+  | 'ERR_VAULT_NOT_EMPTY'
+  | 'ERR_WRONG_PHRASE';
 
 /** The device's biometric hardware. */
 export type BiometricKind = 'faceID' | 'touchID' | 'none';
@@ -202,25 +208,79 @@ export interface SpikeICloudContainerProbe {
   containerLeaf: string | null;
 }
 
-/** Spike 17.2: a PKCE pair (S256) and a `state` nonce. Secret: never log. */
-export interface SpikeOAuthPkce {
-  verifier: string;
-  challenge: string;
-  state: string;
+/**
+ * A Google sign-in started by `driveConnectBegin`. Open `authUrl` in an auth
+ * session that returns to `redirectUri`'s scheme. The PKCE verifier and state
+ * stay in Rust (10 minutes).
+ */
+export interface DriveConnectStart {
+  sessionId: string;
+  authUrl: string;
+  /** `com.googleusercontent.apps.<id>:/oauth2redirect`. */
+  redirectUri: string;
 }
 
-/** Spike 17.2: the Keychain item holding the token JSON. */
-export type SpikeOAuthKeychainItem =
-  | { found: false }
-  | {
-      found: true;
-      /** Secret: never log. */
-      value: string;
-      afterFirstUnlockThisDeviceOnly: boolean;
-      accessGroup?: string;
-      /** Unix milliseconds. */
-      modifiedAt?: number;
-    };
+/** What a finished Google sign-in found. */
+export type ConnectOutcome =
+  /** Connected; an empty Drive got this vault's keys. */
+  | { kind: 'connected' }
+  /**
+   * First launch and Drive holds a vault: join it with the phrase
+   * (`onboardValidatePhrase`, `onboardComplete`) under `sessionId`.
+   */
+  | { kind: 'needs_onboarding'; sessionId: string }
+  /** First launch and Drive holds no vault: create one here, then connect in Settings. */
+  | { kind: 'no_cloud_vault' }
+  /**
+   * Connected but blocked until `rePair` with the phrase: an empty phone vault
+   * joining another cloud vault, or this phone's own vault after another
+   * device rotated its keys (its entries are kept).
+   */
+  | { kind: 'join_with_phrase' };
+
+/** Google Drive as Settings shows it. */
+export interface DriveStatus {
+  connected: boolean;
+  email: string | null;
+  /** Unix milliseconds. */
+  lastSyncMs: number | null;
+  /** Entries waiting to be pushed. */
+  pendingCount: number;
+  /** Why sync is blocked until a re-pair with the phrase, if it is. */
+  blocked: string | null;
+}
+
+/** Lifecycle phase of the last sync. */
+export type SyncPhase = 'idle' | 'syncing' | 'synced' | 'error';
+
+/** Why sync cannot push until the user acts. */
+export type SyncBlocked =
+  /** The cloud vault was rotated elsewhere (or not verified): `rePair` with the phrase. */
+  | { kind: 'needs_re_pair'; reason: string }
+  /** A recovery on another device moved the cloud ahead of this phone: nothing is pushed. */
+  | { kind: 'fenced' }
+  /** Google Drive must be connected again. */
+  | { kind: 'needs_reconnect' };
+
+export interface SyncStatus {
+  phase: SyncPhase;
+  /** A sync task is running. */
+  running: boolean;
+  blocked: SyncBlocked | null;
+  /** The last sync's error, while `phase` is `error`. */
+  error: string | null;
+  /** Unix milliseconds. */
+  lastSyncMs: number | null;
+  /** Entries waiting to be pushed. */
+  pendingCount: number;
+}
+
+export interface SyncProgressEvent {
+  /** The desktop progress key (`pushing-entries`, `pulling-entries`, ..., `catch-up`). */
+  step: string;
+  done: number;
+  total: number;
+}
 
 export interface ScreenCaptureChangeEvent {
   /** Recording, mirroring or AirPlay of the app's screen is on. */
@@ -254,6 +314,12 @@ export type MemloreCoreEvents = {
    * interval). Re-read `lockState()`. Arrives in either order with `onAutoLock`.
    */
   onLockSessionEnded: () => void;
+  /** A running sync moved to `step`. */
+  onSyncProgress: (event: SyncProgressEvent) => void;
+  /** The sync status changed; every sync ends with one whose `running` is false. */
+  onSyncStatus: (status: SyncStatus) => void;
+  /** A sync changed entries under the app (a pull or a web edit): reload lists. */
+  onEntriesChanged: () => void;
 };
 
 declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
@@ -478,6 +544,70 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
   /** The rules of `setEntryInvisible`, for a listed journal and its entries. */
   setJournalInvisible(journalId: string, invisible: boolean): Promise<void>;
 
+  // Google Drive and sync. The OAuth tokens, PKCE verifier and state stay in
+  // Rust and the Keychain; JS only passes the one-time callback URL back.
+  // Never log the callback URL, the recovery phrase or the passwords these take.
+  /**
+   * Starts a Google sign-in. ERR_IO when Drive is not configured on this build
+   * (no `MemloreGoogleIosClientId` in Info.plist).
+   */
+  driveConnectBegin(): Promise<DriveConnectStart>;
+  /**
+   * Finishes the sign-in with the auth session's callback URL. ERR_LOCKED while
+   * locked (except at first launch), ERR_VAULT_NOT_EMPTY when Drive holds a
+   * different vault and this phone has entries (undone: disconnected, nothing
+   * changed), ERR_IO for a bad or expired callback or a sync in progress.
+   */
+  driveConnectComplete(sessionId: string, callbackUrl: string): Promise<ConnectOutcome>;
+  /** Drops an unfinished sign-in (the auth session was cancelled). */
+  driveConnectCancel(sessionId: string): Promise<void>;
+  /** Ends a running sync, then forgets this phone's tokens and Drive settings; never revokes at Google. */
+  driveDisconnect(): Promise<void>;
+  /** ERR_LOCKED while the vault is locked. */
+  driveStatus(): Promise<DriveStatus>;
+  /**
+   * Checks the phrase against the cloud vault of `sessionId`, changing
+   * nothing. ERR_WRONG_PHRASE; ERR_VAULT_NOT_EMPTY unless this is an empty
+   * first launch or the vault is unlocked.
+   */
+  onboardValidatePhrase(sessionId: string, phrase: string): Promise<void>;
+  /**
+   * Joins the cloud vault of `sessionId` at first launch with a new local
+   * password; the vault is unlocked afterwards. ERR_VAULT_NOT_EMPTY (nothing
+   * written), ERR_FORMAT for a short password, ERR_WRONG_PHRASE.
+   */
+  onboardComplete(sessionId: string, phrase: string, password: string): Promise<void>;
+  /**
+   * Re-pairs this unlocked phone with the cloud vault through the phrase and
+   * sets `password`; keeps the phone's entries. ERR_LOCKED, ERR_FORMAT,
+   * ERR_WRONG_PHRASE.
+   */
+  rePair(phrase: string, password: string): Promise<void>;
+  /**
+   * Checks again whether the cloud still needs a re-pair: true when the block
+   * was cleared; false when it stands, there is no cloud or a sync is running.
+   */
+  recheckRePair(): Promise<boolean>;
+  /**
+   * Starts a sync and resolves at once (events report it): false when one is
+   * already running. `manual` (the user asked) also resets the failure
+   * backoff. ERR_LOCKED while the vault is locked.
+   */
+  syncNow(manual: boolean): Promise<boolean>;
+  /** One scheduler tick (native timer, every 5 s while active and unlocked); true when a sync started. */
+  syncTick(): Promise<boolean>;
+  /** The app came to the foreground: the next tick may retry a failed sync early (with a cooldown). */
+  syncKick(): Promise<void>;
+  /** ERR_LOCKED while the vault is locked. */
+  syncStatus(): Promise<SyncStatus>;
+  /**
+   * Deletes this phone's vault after checking `password` (ERR_WRONG_PASSWORD
+   * changes nothing): ends the sync, locks, removes the vault files and both
+   * Keychain items; `startupMode()` then reports `first_launch`. ERR_IO when
+   * the vault could not be closed (it stays locked, every file kept).
+   */
+  deleteVault(password: string): Promise<void>;
+
   // Spike 17.1 (dev route `app/(dev)/spike-icloud.tsx` only, read-only; see
   // ios/ICloudSpike.swift). Reject with code ERR_SPIKE.
   // TODO(later): see docs/LATER.md (remove with the dev spike routes).
@@ -492,17 +622,6 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
   spikeICloudListLaterInBackground(delaySeconds: number): Promise<void>;
   /** JSON of the last background listing, or null. */
   spikeICloudBackgroundResult(): Promise<string | null>;
-
-  // Spike 17.2 (dev route `app/(dev)/spike-oauth.tsx` only; see
-  // ios/OAuthSpike.swift). Never log what these pass or return. Reject with
-  // code ERR_SPIKE.
-  // TODO(later): see docs/LATER.md (remove with the dev spike routes).
-  spikeOAuthPkce(): Promise<SpikeOAuthPkce>;
-  /** Writes the one Keychain item (AfterFirstUnlockThisDeviceOnly). */
-  spikeOAuthKeychainWrite(value: string): Promise<void>;
-  spikeOAuthKeychainRead(): Promise<SpikeOAuthKeychainItem>;
-  /** Resolves false when there was no item. */
-  spikeOAuthKeychainDelete(): Promise<boolean>;
 }
 
 const MemloreCore = requireNativeModule<MemloreCoreModule>('MemloreCore');

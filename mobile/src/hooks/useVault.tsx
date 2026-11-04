@@ -50,6 +50,8 @@ const KNOWN_CODES: Record<MemloreErrorCode, true> = {
   ERR_NAME_TAKEN: true,
   ERR_LAST_JOURNAL: true,
   ERR_SECOND_LOCK_REQUIRED: true,
+  ERR_VAULT_NOT_EMPTY: true,
+  ERR_WRONG_PHRASE: true,
 };
 const ERROR_CODES = Object.keys(KNOWN_CODES) as MemloreErrorCode[];
 

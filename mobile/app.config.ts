@@ -23,12 +23,16 @@ const spikeICloudIos = spikeICloud
     }
   : {};
 
-// Spike 17.2 (Google OAuth, `app/(dev)/spike-oauth.tsx`). The iOS OAuth client
+// Google Drive sign-in (iOS OAuth client, PKCE, no client secret). The client
 // ID comes from MEMLORE_GOOGLE_IOS_CLIENT_ID in `mobile/.env.local` (gitignored)
-// and is never written in a tracked file. Its reversed form is the redirect URL
-// scheme. `ios.scheme` merges into the same CFBundleURLTypes entry as `scheme`;
-// setting `ios.infoPlist.CFBundleURLTypes` instead would make Expo drop
-// `memlore` and `app.memlore.mobile`. Without the variable: no scheme, no extra.
+// and is never written in a tracked file. It lands in Info.plist as
+// `MemloreGoogleIosClientId`: native hands it to the engine at start
+// (`configureDrive`), and Rust builds the auth URL and the reversed-client-ID
+// redirect. That reversed form is the URL scheme the auth session returns to.
+// `ios.scheme` merges into the same CFBundleURLTypes entry as `scheme`; setting
+// `ios.infoPlist.CFBundleURLTypes` instead would make Expo drop `memlore` and
+// `app.memlore.mobile`. Without the variable: no Info.plist key, no scheme, and
+// Drive sign-in reports "not configured".
 const googleIosClientMatch = /^([a-z0-9-]+)\.apps\.googleusercontent\.com$/i.exec(
   process.env.MEMLORE_GOOGLE_IOS_CLIENT_ID ?? '',
 );
@@ -84,6 +88,7 @@ const config: ExpoConfig = {
       ...('infoPlist' in spikeICloudIos ? spikeICloudIos.infoPlist : {}),
       NSFaceIDUsageDescription:
         'Memlore uses Face ID to unlock your journal. You can always use your password instead.',
+      ...(googleIosClientId ? { MemloreGoogleIosClientId: googleIosClientId } : {}),
     },
     ...(googleIosScheme ? { scheme: [googleIosScheme] } : {}),
   },
@@ -127,7 +132,6 @@ const config: ExpoConfig = {
     typedRoutes: true,
     reactCompiler: true,
   },
-  ...(googleIosClientId ? { extra: { googleIosClientId } } : {}),
 };
 
 export default config;

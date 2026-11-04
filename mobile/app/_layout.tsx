@@ -5,12 +5,16 @@ import '@/src/theme/unistyles';
 import { Stack } from 'expo-router';
 import { useUnistyles } from 'react-native-unistyles';
 
+import { SyncProvider } from '@/src/hooks/useSync';
 import { useVault, VaultProvider } from '@/src/hooks/useVault';
 
 export default function RootLayout() {
   return (
     <VaultProvider>
-      <RootStack />
+      {/* Outside the unlocked guard: onboarding signs in to Drive at first launch. */}
+      <SyncProvider>
+        <RootStack />
+      </SyncProvider>
     </VaultProvider>
   );
 }
@@ -40,9 +44,8 @@ function RootStack() {
           undeclared one outside both, where it stays reachable while locked. */}
       <Stack.Protected guard={unlocked} redirectTo="/vault">
         <Stack.Screen name="(app)" options={{ animation: 'none' }} />
-        {/* Dev-only spikes (iCloud, OAuth) stay behind the vault until M2. */}
+        {/* Dev-only iCloud spike stays behind the vault until M2b. */}
         <Stack.Screen name="(dev)/spike-icloud" />
-        <Stack.Screen name="(dev)/spike-oauth" />
       </Stack.Protected>
       <Stack.Protected guard={!unlocked} redirectTo="/">
         <Stack.Screen name="vault" options={{ animation: 'none' }} />

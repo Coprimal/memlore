@@ -563,6 +563,15 @@ impl MemloreEngine {
         self.scheduler().retry.kick(now_ms);
     }
 
+    /// End a running sync, if any: abort it and wait at most
+    /// `SYNC_CANCEL_WAIT` (the same path `lock()` uses). Keys, settings and
+    /// the Drive token are untouched. Called when the app goes to the
+    /// background without locking yet (ADR §13); the next foreground tick
+    /// starts a fresh cycle.
+    pub fn sync_cancel(&self) {
+        drop(self.cancel_sync_and_wait());
+    }
+
     /// The sync status as of now.
     pub fn sync_status(&self) -> Result<SyncStatusFfi, MemloreError> {
         let running = self

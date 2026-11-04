@@ -19,15 +19,33 @@ private final class EngineHolder: @unchecked Sendable {
     if let engine {
       return engine
     }
-    let support = try FileManager.default.url(
-      for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-    let vault = support.appendingPathComponent("vault", isDirectory: true)
+    let vault = try Self.vaultFolder()
     protectVaultFolder(vault)
     let appVersion =
       Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
     let created = try MemloreEngine(appDataDir: vault.path, appVersion: appVersion)
+    // The iOS OAuth client id (app.config.ts). Absent: Drive sign-in and
+    // sync report "not configured". Never logged.
+    if let clientId = Bundle.main.object(forInfoDictionaryKey: "MemloreGoogleIosClientId")
+      as? String, !clientId.isEmpty
+    {
+      created.configureDrive(clientId: clientId)
+    }
     engine = created
     return created
+  }
+
+  /// Applies `protectVaultFolder` again before a new vault is written there
+  /// (create, onboard): `deleteVault` removed the files of the old one.
+  /// Idempotent.
+  func protectVault() throws {
+    protectVaultFolder(try Self.vaultFolder())
+  }
+
+  private static func vaultFolder() throws -> URL {
+    let support = try FileManager.default.url(
+      for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+    return support.appendingPathComponent("vault", isDirectory: true)
   }
 }
 
@@ -111,6 +129,13 @@ private func toException(_ error: Error) -> Exception {
     return Exception(
       name: "MemloreSecondLockRequired", description: "The second lock is locked",
       code: "ERR_SECOND_LOCK_REQUIRED")
+  case MemloreError.VaultNotEmpty:
+    return Exception(
+      name: "MemloreVaultNotEmpty", description: "This phone's vault already holds entries",
+      code: "ERR_VAULT_NOT_EMPTY")
+  case MemloreError.WrongPhrase:
+    return Exception(
+      name: "MemloreWrongPhrase", description: "Wrong recovery phrase", code: "ERR_WRONG_PHRASE")
   default:
     return Exception(name: "MemloreIo", description: error.localizedDescription, code: "ERR_IO")
   }
@@ -181,10 +206,13 @@ private func refreshAutoLockCache(_ engine: MemloreEngine) {
   }
 }
 
-/// Mirrors the engine's lock state for `DeviceSecurity`. Call on
-/// `engineQueue` right after the engine call succeeded: the main thread runs
-/// these in engine-queue order, so the flag ends in the engine's state.
+/// Mirrors the engine's lock state for `DeviceSecurity` (and the sync timer,
+/// which follows it). Call on `engineQueue` right after the engine call
+/// succeeded: the main thread runs these in engine-queue order, so the flag
+/// ends in the engine's state. An unlock (password, Face ID, create,
+/// onboarding) also kicks the scheduler here, before the timer starts.
 private func markVault(unlocked: Bool) {
+  if unlocked { (try? EngineHolder.shared.get())?.syncKick() }
   DispatchQueue.main.async {
     MainActor.assumeIsolated { DeviceSecurity.vaultUnlocked = unlocked }
   }
@@ -225,6 +253,37 @@ private func endLockSession(done: @escaping @MainActor () -> Void) {
     DispatchQueue.main.async {
       MainActor.assumeIsolated { done() }
     }
+  }
+}
+
+/// `SyncDriver`'s tick, from its timer queue (never the main thread). Waits
+/// for `engineQueue`, so a late tick is coalesced by the timer instead of
+/// piling up behind a busy queue. `Locked` (a lock raced the timer) is not an
+/// error.
+private func syncTickVault() {
+  engineQueue.sync {
+    do {
+      _ = try EngineHolder.shared.get().syncTick()
+    } catch MemloreError.Locked {
+      // The vault locked between the timer and this tick: nothing to do.
+    } catch {
+      NSLog("[MemloreCore] sync tick failed: \(error)")
+    }
+  }
+}
+
+/// `DeviceSecurity`'s kick when the app becomes active while unlocked.
+private func syncKickVault() {
+  engineQueue.async {
+    (try? EngineHolder.shared.get())?.syncKick()
+  }
+}
+
+/// `DeviceSecurity`'s background cancel of a running sync, queued after the
+/// saves and before the lock-session re-lock (ADR §12 order).
+private func syncCancelVault() {
+  engineQueue.async {
+    (try? EngineHolder.shared.get())?.syncCancel()
   }
 }
 
@@ -500,6 +559,158 @@ private func relockMinutes(_ minutes: Int) throws -> UInt32 {
   return value
 }
 
+/// `DriveConnectStart` in `index.ts`.
+struct DriveConnectStartRecord: Record {
+  @Field var sessionId: String = ""
+  @Field var authUrl: String = ""
+  @Field var redirectUri: String = ""
+
+  init() {}
+
+  init(_ start: DriveConnectStartFfi) {
+    sessionId = start.sessionId
+    authUrl = start.authUrl
+    redirectUri = start.redirectUri
+  }
+}
+
+/// `ConnectOutcome` in `index.ts`.
+struct ConnectOutcomeRecord: Record {
+  @Field var kind: String = "connected"
+  @Field var sessionId: String? = nil
+
+  init() {}
+
+  init(_ outcome: ConnectOutcomeFfi) {
+    switch outcome {
+    case .connected:
+      kind = "connected"
+    case .needsOnboarding(let id):
+      kind = "needs_onboarding"
+      sessionId = id
+    case .noCloudVault:
+      kind = "no_cloud_vault"
+    case .joinWithPhrase:
+      kind = "join_with_phrase"
+    }
+  }
+}
+
+/// `DriveStatus` in `index.ts`.
+struct DriveStatusRecord: Record {
+  @Field var connected: Bool = false
+  @Field var email: String? = nil
+  /// Unix milliseconds.
+  @Field var lastSyncMs: Double? = nil
+  @Field var pendingCount: Int = 0
+  @Field var blocked: String? = nil
+
+  init() {}
+
+  init(_ status: DriveStatusFfi) {
+    connected = status.connected
+    email = status.email
+    lastSyncMs = status.lastSyncMs.map { Double($0) }
+    pendingCount = Int(clamping: status.pendingCount)
+    blocked = status.blocked
+  }
+}
+
+/// `SyncBlocked` in `index.ts`.
+struct SyncBlockedRecord: Record {
+  @Field var kind: String = "fenced"
+  @Field var reason: String? = nil
+
+  init() {}
+
+  init(_ blocked: SyncBlockedFfi) {
+    switch blocked {
+    case .needsRePair(let why):
+      kind = "needs_re_pair"
+      reason = why
+    case .fenced:
+      kind = "fenced"
+    case .needsReconnect:
+      kind = "needs_reconnect"
+    }
+  }
+}
+
+/// `SyncStatus` in `index.ts`, for `syncStatus` and the `onSyncStatus` event.
+struct SyncStatusRecord: Record {
+  @Field var phase: String = "idle"
+  @Field var running: Bool = false
+  @Field var blocked: SyncBlockedRecord? = nil
+  @Field var error: String? = nil
+  /// Unix milliseconds.
+  @Field var lastSyncMs: Double? = nil
+  @Field var pendingCount: Int = 0
+
+  init() {}
+
+  init(_ status: SyncStatusFfi) {
+    switch status.phase {
+    case .idle: phase = "idle"
+    case .syncing: phase = "syncing"
+    case .synced: phase = "synced"
+    case .error: phase = "error"
+    }
+    running = status.running
+    blocked = status.blocked.map { SyncBlockedRecord($0) }
+    error = status.error
+    lastSyncMs = status.lastSyncMs.map { Double($0) }
+    pendingCount = Int(clamping: status.pendingCount)
+  }
+}
+
+/// The engine's `SyncObserver`: forwards sync events to JS. Rust calls it
+/// from a sync task's thread, never from `engineQueue`, and it must never
+/// call back into the engine (a `lock()` can hold the engine for up to 2 s).
+/// It only hops to main and sends. One per module instance: a JS reload
+/// registers the new module's forwarder, which replaces this one in Rust.
+private final class SyncEventForwarder: SyncObserver, @unchecked Sendable {
+  /// Set once in `init`, read on main only.
+  private weak var module: MemloreCoreModule?
+
+  init(module: MemloreCoreModule) {
+    self.module = module
+  }
+
+  func onProgress(step: String, done: UInt64, total: UInt64) {
+    let body: [String: Any?] = [
+      "step": step, "done": Int(clamping: done), "total": Int(clamping: total),
+    ]
+    DispatchQueue.main.async { self.module?.sendEvent("onSyncProgress", body) }
+  }
+
+  func onStatus(status: SyncStatusFfi) {
+    let record = SyncStatusRecord(status)
+    DispatchQueue.main.async {
+      guard let module = self.module else { return }
+      module.sendEvent("onSyncStatus", record.toDictionary(appContext: module.appContext))
+    }
+  }
+
+  func onEntriesChanged() {
+    DispatchQueue.main.async { self.module?.sendEvent("onEntriesChanged", [:]) }
+  }
+}
+
+/// After a failed `deleteVault`: a wrong password changed nothing, but a
+/// failure past the password check (the vault could not be closed) has
+/// already cleared the keys. Asks the engine rather than guessing, so the
+/// auto-lock flag never reads "locked" while the vault is open.
+private func markVaultAfterFailedDelete(_ engine: MemloreEngine) {
+  do {
+    _ = try engine.autoLockSeconds()
+  } catch MemloreError.Locked {
+    markVault(unlocked: false)
+  } catch {
+    // Unknown: keep the flag. A stale "unlocked" only costs a flush request
+    // and a lock call that changes nothing.
+  }
+}
+
 public class MemloreCoreModule: Module {
   /// Main thread only.
   private var deviceSecurity: DeviceSecurity?
@@ -507,19 +718,40 @@ public class MemloreCoreModule: Module {
   public func definition() -> ModuleDefinition {
     Name("MemloreCore")
 
-    Events("onAutoLock", "onScreenCaptureChange", "onFlushRequest", "onLockSessionEnded")
+    Events(
+      "onAutoLock", "onScreenCaptureChange", "onFlushRequest", "onLockSessionEnded",
+      "onSyncProgress", "onSyncStatus", "onEntriesChanged")
 
     // Both hop to main in order, so a reload's destroy never runs before its
     // create. Destroy holds the module until the observers are gone.
     OnCreate {
+      // The engine outlives a JS reload; its observer is replaced by the new
+      // module's, so events never go to a destroyed module. Not removed on
+      // destroy: that could run after the next module's registration.
+      let forwarder = SyncEventForwarder(module: self)
+      engineQueue.async {
+        do {
+          try withEngine { engine in engine.setSyncObserver(observer: forwarder) }
+        } catch {
+          NSLog("[MemloreCore] could not register the sync observer: \(error)")
+        }
+      }
       DispatchQueue.main.async {
         MainActor.assumeIsolated {
           let security = DeviceSecurity(
             sendEvent: { [weak module = self] name, body in module?.sendEvent(name, body) },
             lockVault: autoLockVault,
-            endLockSession: endLockSession)
+            endLockSession: endLockSession,
+            kickSync: syncKickVault,
+            cancelSync: syncCancelVault)
           security.start()
           self.deviceSecurity = security
+          // Process-wide; a reload sees no didBecomeActive or unlock, so it
+          // is seeded from the live state.
+          SyncDriver.shared.configure(
+            tick: syncTickVault,
+            active: UIApplication.shared.applicationState == .active,
+            unlocked: DeviceSecurity.vaultUnlocked)
         }
       }
     }
@@ -558,6 +790,7 @@ public class MemloreCoreModule: Module {
 
     AsyncFunction("createVault") { (password: String) throws -> String in
       try withEngine { engine in
+        try EngineHolder.shared.protectVault()
         let phrase = try engine.createVault(password: password)
         refreshAutoLockCache(engine)
         markVault(unlocked: true)
@@ -964,23 +1197,89 @@ public class MemloreCoreModule: Module {
       ICloudSpike.backgroundResult()
     }.runOnQueue(ICloudSpike.queue)
 
-    // Spike 17.2, dev route only (`app/(dev)/spike-oauth.tsx`); PKCE and one
-    // Keychain item, see OAuthSpike.swift. Rejects with code ERR_SPIKE.
-    // TODO(later): see docs/LATER.md (remove with the dev spike routes).
-    AsyncFunction("spikeOAuthPkce") { () throws -> [String: Any] in
-      try OAuthSpike.pkce()
-    }.runOnQueue(OAuthSpike.queue)
+    // Google Drive and sync (ADR §13). The tokens, PKCE verifier and state
+    // stay in Rust and the Keychain. Never log the callback URL, the phrase
+    // or the passwords these take. A sync itself runs off `engineQueue` on
+    // the FFI's runtime; these calls only start, query or cancel it.
+    AsyncFunction("driveConnectBegin") { () throws -> DriveConnectStartRecord in
+      try withEngine { engine in try DriveConnectStartRecord(engine.driveConnectBegin()) }
+    }.runOnQueue(engineQueue)
 
-    AsyncFunction("spikeOAuthKeychainWrite") { (value: String) throws in
-      try OAuthSpike.write(value)
-    }.runOnQueue(OAuthSpike.queue)
+    AsyncFunction("driveConnectComplete") {
+      (sessionId: String, callbackUrl: String) throws -> ConnectOutcomeRecord in
+      try withEngine { engine in
+        try ConnectOutcomeRecord(
+          engine.driveConnectComplete(sessionId: sessionId, callbackUrl: callbackUrl))
+      }
+    }.runOnQueue(engineQueue)
 
-    AsyncFunction("spikeOAuthKeychainRead") { () throws -> [String: Any] in
-      try OAuthSpike.read()
-    }.runOnQueue(OAuthSpike.queue)
+    AsyncFunction("driveConnectCancel") { (sessionId: String) throws in
+      try withEngine { engine in engine.driveConnectCancel(sessionId: sessionId) }
+    }.runOnQueue(engineQueue)
 
-    AsyncFunction("spikeOAuthKeychainDelete") { () throws -> Bool in
-      try OAuthSpike.delete()
-    }.runOnQueue(OAuthSpike.queue)
+    AsyncFunction("driveDisconnect") { () throws in
+      try withEngine { engine in try engine.driveDisconnect() }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("driveStatus") { () throws -> DriveStatusRecord in
+      try withEngine { engine in try DriveStatusRecord(engine.driveStatus()) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("onboardValidatePhrase") { (sessionId: String, phrase: String) throws in
+      try withEngine { engine in
+        try engine.onboardValidatePhrase(sessionId: sessionId, phrase: phrase)
+      }
+    }.runOnQueue(engineQueue)
+
+    // Joins the cloud vault at first launch and leaves it unlocked, like
+    // `createVault`.
+    AsyncFunction("onboardComplete") {
+      (sessionId: String, phrase: String, password: String) throws in
+      try withEngine { engine in
+        try EngineHolder.shared.protectVault()
+        try engine.onboardComplete(sessionId: sessionId, phrase: phrase, password: password)
+        refreshAutoLockCache(engine)
+        markVault(unlocked: true)
+      }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("rePair") { (phrase: String, password: String) throws in
+      try withEngine { engine in try engine.rePair(phrase: phrase, password: password) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("recheckRePair") { () throws -> Bool in
+      try withEngine { engine in try engine.recheckRePair() }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("syncNow") { (manual: Bool) throws -> Bool in
+      try withEngine { engine in try engine.syncNow(manual: manual) }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("syncTick") { () throws -> Bool in
+      try withEngine { engine in try engine.syncTick() }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("syncKick") { () throws in
+      try withEngine { engine in engine.syncKick() }
+    }.runOnQueue(engineQueue)
+
+    AsyncFunction("syncStatus") { () throws -> SyncStatusRecord in
+      try withEngine { engine in try SyncStatusRecord(engine.syncStatus()) }
+    }.runOnQueue(engineQueue)
+
+    // Back to first launch on success. The next `createVault` or
+    // `onboardComplete` re-applies the vault folder's protection first.
+    AsyncFunction("deleteVault") { (password: String) throws in
+      try withEngine { engine in
+        do {
+          try engine.deleteVault(password: password)
+        } catch {
+          markVaultAfterFailedDelete(engine)
+          throw error
+        }
+        markVault(unlocked: false)
+        cacheAutoLockSeconds(AutoLockCache.defaultSeconds)
+      }
+    }.runOnQueue(engineQueue)
   }
 }
