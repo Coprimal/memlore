@@ -10,7 +10,7 @@
 //! `*_inner` vault helpers are only called from here, never exported. Error
 //! messages carry no key material.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use memlore_core::envelope::{open_entry, EnvelopeError};
@@ -22,29 +22,41 @@ use memlore_engine::ops::entries::{
     maybe_detect_language_after_save, maybe_mark_entry_embedding_dirty_after_save,
     save_entry_content_merged_impl,
 };
+use memlore_engine::sync::connect::persist_connect_settings;
+use memlore_engine::sync::gdrive_provider::GDriveSession;
+use memlore_engine::sync::pending_session;
+use memlore_engine::sync::schedule::LastEditState;
 use memlore_engine::utils::boot_file::{self, UnlockMethod};
-use memlore_engine::utils::encryption::KdfParams;
+use memlore_engine::utils::encryption::{unwrap_key, KdfParams};
 use memlore_engine::vault::biometric::BiometricUnlockError;
 use memlore_engine::vault::startup::StartupMode;
 use memlore_engine::vault::{self, VaultPlatformHooks};
 use memlore_engine::{AppState, EncryptionKeyState};
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
-use crate::keystore::OsKeyStore;
+use crate::drive::PendingOAuth;
+use crate::keystore::{DriveTokenStore, OsKeyStore};
+use crate::sync::{MobileCredentialStore, MobileScheduler, SyncReport};
 
+pub use drive::{ConnectOutcomeFfi, DriveConnectStartFfi, DriveStatusFfi};
 pub use entries::{EntryDetailFfi, EntryPageFfi, EntryRowFfi, TrashRowFfi};
 pub use locks::LockStateFfi;
 pub use organize::{JournalFfi, TagFfi};
 pub use search::{SearchFiltersFfi, SearchResultFfi};
+pub use sync::{SyncBlockedFfi, SyncObserver, SyncPhaseFfi, SyncStatusFfi};
 pub use templates::TemplateFfi;
 pub use versions::VersionFfi;
 
+mod drive;
 mod entries;
 mod keystore;
 mod locks;
+mod onboard;
 mod organize;
 mod search;
+mod sync;
 mod templates;
 mod versions;
 
@@ -53,6 +65,14 @@ uniffi::setup_scaffolding!();
 /// Process-wide runtime for the engine's async code. Never dropped: a JS
 /// reload that creates a second engine reuses it.
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+/// The FFI runtime, for driving the engine's async flows from a blocking
+/// FFI call (never from inside the runtime).
+fn runtime() -> Result<&'static Runtime, MemloreError> {
+    RUNTIME
+        .get()
+        .ok_or_else(|| io("The sync runtime is not running".to_string()))
+}
 
 /// Device name written at first-time setup (the desktop derives one from the
 /// platform the same way).
@@ -113,6 +133,14 @@ pub enum MemloreError {
     /// (Covered); the user reveals it with the second-lock password.
     #[error("the second lock is locked")]
     SecondLockRequired,
+    /// The phone vault holds entries (trashed ones included), so it never
+    /// joins another cloud vault: onboarding, and a Drive connect that finds
+    /// a different vault, are refused and leave it as it was.
+    #[error("this phone's vault already holds entries")]
+    VaultNotEmpty,
+    /// The recovery phrase does not open the cloud vault.
+    #[error("wrong recovery phrase")]
+    WrongPhrase,
 }
 
 fn io(msg: String) -> MemloreError {
@@ -158,9 +186,11 @@ pub struct EntryFrameFfi {
 }
 
 /// Mobile side of the vault lifecycle: the os_kek lives in `keystore` (the
-/// iOS Keychain), no post-unlock sweep, no pending cloud session.
+/// iOS Keychain), no post-unlock sweep; a pending cloud session persists
+/// through `credentials` (the Drive token goes to the Keychain).
 struct MobileVaultHooks {
     keystore: Arc<dyn OsKeyStore>,
+    credentials: Arc<MobileCredentialStore>,
 }
 
 impl VaultPlatformHooks for MobileVaultHooks {
@@ -206,12 +236,14 @@ impl VaultPlatformHooks for MobileVaultHooks {
         .map_err(|e| e.to_string())
     }
 
+    /// Same as the desktop hook, with the mobile credential store.
     fn consume_pending_cloud_session(
         &self,
-        _conn: &rusqlite::Connection,
-        _session_id: &str,
+        conn: &rusqlite::Connection,
+        session_id: &str,
     ) -> Option<Result<(), String>> {
-        None
+        pending_session::consume(session_id)
+            .map(|pending| persist_connect_settings(conn, &pending, self.credentials.as_ref()))
     }
 }
 
@@ -245,6 +277,25 @@ pub struct MemloreEngine {
     // this queues once settings sync brings an embed provider).
     indexer: EntryIndexer,
     lock_session: Mutex<LockSession>,
+    /// The Drive refresh token (Keychain) and the OAuth client id. Shared
+    /// with `hooks`, which persists a pending cloud session through it.
+    credentials: Arc<MobileCredentialStore>,
+    /// The Drive session of the last connect (memory only), like the
+    /// desktop's managed `GDriveSessionState`.
+    live_session: Mutex<Option<GDriveSession>>,
+    /// The one Google sign-in between `drive_connect_begin` and
+    /// `drive_connect_complete` (`drive.rs`).
+    oauth: Mutex<Option<PendingOAuth>>,
+    /// The running background sync, which `lock()` ends before the keys go
+    /// (`sync.rs`).
+    sync_task: Mutex<Option<JoinHandle<()>>>,
+    /// The scheduler's backoff cursor, on-launch rule and owed keyring
+    /// reconcile.
+    scheduler: Mutex<MobileScheduler>,
+    /// The sync observer and the last sync's outcome.
+    sync_report: SyncReport,
+    /// When the editor last saved: the on-save debounce clock.
+    last_edit: LastEditState,
 }
 
 #[uniffi::export]
@@ -253,7 +304,18 @@ impl MemloreEngine {
     /// `app_data_dir/memlore.db` the way the desktop `setup` does.
     #[uniffi::constructor]
     pub fn new(app_data_dir: String, app_version: String) -> Result<Arc<Self>, MemloreError> {
-        Self::with_keystore(app_data_dir, app_version, keystore::default_keystore())
+        Self::with_stores(
+            app_data_dir,
+            app_version,
+            keystore::default_keystore(),
+            keystore::default_token_store(),
+        )
+    }
+
+    /// The Google OAuth client id of this app (the iOS client: no secret).
+    /// Drive cannot connect or sync until it is set.
+    pub fn configure_drive(&self, client_id: String) {
+        self.credentials.set_client_id(client_id);
     }
 
     pub fn startup_mode(&self) -> StartupModeFfi {
@@ -315,7 +377,9 @@ impl MemloreEngine {
             } else {
                 io(e)
             }
-        })
+        })?;
+        self.rearm_sync_on_launch();
+        Ok(())
     }
 
     /// Clear the keys from memory, like the desktop `lock_encryption`, then
@@ -332,18 +396,15 @@ impl MemloreEngine {
     /// Never fails open: the session and the keys go first, and if the
     /// placeholder cannot replace the connection it stays open behind the
     /// lock gate. That is logged, but no logger is installed on mobile yet.
+    ///
+    /// A running sync is ended before the keys are cleared (bounded wait,
+    /// see `sync.rs`), and no new one can start until they are (the sync
+    /// slot stays held), so no key copy outlives the lock. Nor does a Drive
+    /// credential in memory: the live session and an unfinished sign-in go
+    /// (after an unlock the session is rebuilt from the Keychain).
     // TODO(later): see docs/LATER.md ("Mobile M1 notes", Phase 2 review suggestions).
     pub fn lock(&self) -> Result<(), MemloreError> {
-        self.end_lock_session();
-        self.key_state.clear_key().map_err(io)?;
-        let closed = boot_file::load(&boot_file::boot_path(&self.db_path)).and_then(|boot| {
-            if boot.mode != db::EncryptionMode::Password {
-                return Ok(());
-            }
-            let placeholder = vault::startup::password_locked_placeholder(&boot)?;
-            self.state.set_connection(placeholder)
-        });
-        if let Err(e) = closed {
+        if let Err(e) = self.lock_and_close()? {
             log::error!("lock: the connection was not replaced, data calls stay locked ({e})");
         }
         Ok(())
@@ -400,7 +461,45 @@ impl MemloreEngine {
             &self.key_state,
             &self.hooks,
         )
-        .map_err(biometric_unlock_err)
+        .map_err(biometric_unlock_err)?;
+        self.rearm_sync_on_launch();
+        Ok(())
+    }
+
+    /// Delete the phone vault for good and return to first launch. Needs
+    /// the vault password, checked against the boot file first: a wrong one
+    /// changes nothing. Then the running sync ends, the vault locks, its
+    /// files (DB, `-wal`, `-shm`, boot file, conversion leftovers) and the
+    /// media folder go, and both Keychain items (os_kek, Drive token) are
+    /// wiped. The memory state of the deleted vault goes too (the lock drops
+    /// the Drive session and sign-in; the last sync's outcome and the
+    /// scheduler's state are reset). The vault folder itself stays: Swift
+    /// set its data protection class and backup exclusion, and new files
+    /// inherit them. If the open database cannot be closed, it stops there
+    /// with an error: locked, every file kept.
+    pub fn delete_vault(&self, password: String) -> Result<(), MemloreError> {
+        let password = Zeroizing::new(password);
+        self.verify_password(&password)?;
+        // A keyed connection still open would outlive the unlink of its
+        // files and could later remove the new vault's `-wal` by path: stop
+        // before any file goes.
+        self.lock_and_close()?
+            .map_err(|e| io(format!("The vault could not be closed for deletion: {e}")))?;
+        let removed = remove_vault_files(&self.db_path);
+        let os_kek = self.hooks.keystore.remove();
+        let token = self.credentials.tokens().remove();
+        self.reset_sync_memory();
+        // Re-detect whatever is left, even after a failed removal, so the
+        // engine never keeps answering for a vault that is half gone.
+        let (conn, mode) = startup(
+            &self.db_path,
+            &self.key_state,
+            &self.hooks,
+            &self.credentials,
+        )?;
+        self.state.set_connection(conn).map_err(io)?;
+        *self.startup_mode.lock().unwrap_or_else(|p| p.into_inner()) = mode;
+        removed.and(os_kek).and(token).map_err(io)
     }
 
     /// The auto-lock interval: 0 (immediate), 60, 300 or 900 seconds. Fails
@@ -453,8 +552,8 @@ impl MemloreEngine {
     /// command: `full_state` is the editor's whole document
     /// (`Y.encodeStateAsUpdate`, never an incremental update) and it is
     /// MERGED into the stored one, so an edit that landed meanwhile (MCP
-    /// append, outbox import) survives. Then the same post-save hooks, minus
-    /// the desktop-only `last_edit` debounce clock.
+    /// append, outbox import) survives. Then the same post-save hooks and
+    /// the `last_edit` debounce clock of the on-save sync.
     pub fn save_entry_yjs(
         &self,
         id: String,
@@ -472,16 +571,36 @@ impl MemloreEngine {
             save_entry_content_merged_impl(conn, &id, &full_state, &content_text, &preview_text)
                 .map_err(io)
         })?;
-        self.after_entry_save(&id)
+        self.after_entry_save(&id)?;
+        // Stamped only after the write committed, like the desktop.
+        self.last_edit.mark_now();
+        Ok(())
     }
 }
 
 impl MemloreEngine {
-    /// [`Self::new`] with the os_kek kept in `keystore` (tests pass a fake).
+    /// [`Self::with_stores`] with a fresh in-memory Drive token store.
+    #[cfg(test)]
     fn with_keystore(
         app_data_dir: String,
         app_version: String,
         keystore: Arc<dyn OsKeyStore>,
+    ) -> Result<Arc<Self>, MemloreError> {
+        Self::with_stores(
+            app_data_dir,
+            app_version,
+            keystore,
+            Arc::new(keystore::MemoryTokenStore::default()),
+        )
+    }
+
+    /// [`Self::new`] with the os_kek kept in `keystore` and the Drive token
+    /// in `tokens` (tests pass fakes).
+    fn with_stores(
+        app_data_dir: String,
+        app_version: String,
+        keystore: Arc<dyn OsKeyStore>,
+        tokens: Arc<dyn DriveTokenStore>,
     ) -> Result<Arc<Self>, MemloreError> {
         if memlore_engine::ops::app_info::try_app_version().is_none() {
             memlore_engine::ops::app_info::set_app_version(Box::leak(app_version.into_boxed_str()));
@@ -503,9 +622,12 @@ impl MemloreEngine {
             .map_err(|e| io(format!("Failed to create the app data dir: {e}")))?;
         let db_path = data_dir.join("memlore.db");
         let key_state = EncryptionKeyState::new();
-        let hooks = MobileVaultHooks { keystore };
-        let (conn, mode) =
-            vault::startup::startup_init(&db_path, &key_state, &hooks).map_err(io)?;
+        let credentials = Arc::new(MobileCredentialStore::new(tokens));
+        let hooks = MobileVaultHooks {
+            keystore,
+            credentials: credentials.clone(),
+        };
+        let (conn, mode) = startup(&db_path, &key_state, &hooks, &credentials)?;
         Ok(Arc::new(Self {
             db_path,
             state: AppState::new(conn),
@@ -514,7 +636,58 @@ impl MemloreEngine {
             hooks,
             indexer: EntryIndexer::with_stub(),
             lock_session: Mutex::new(LockSession::default()),
+            credentials,
+            live_session: Mutex::new(None),
+            oauth: Mutex::new(None),
+            sync_task: Mutex::new(None),
+            scheduler: Mutex::new(MobileScheduler::default()),
+            sync_report: SyncReport::default(),
+            last_edit: LastEditState::new(),
         }))
+    }
+
+    /// The on-launch sync rule fires again after an unlock (on mobile an
+    /// unlock is the "launch"), and the next sync first runs the keyring
+    /// reconcile the desktop runs at startup.
+    fn rearm_sync_on_launch(&self) {
+        let mut scheduler = self.scheduler.lock().unwrap_or_else(|p| p.into_inner());
+        scheduler.on_launch_done = false;
+        scheduler.reconcile_pending = true;
+    }
+
+    /// The body of [`Self::lock`]: the outer error is a failed key clear,
+    /// the inner one a connection that was not replaced by the placeholder
+    /// (a created vault only; the keys are gone either way).
+    fn lock_and_close(&self) -> Result<Result<(), String>, MemloreError> {
+        let sync_slot = self.cancel_sync_and_wait();
+        self.end_lock_session();
+        *self.live_session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.oauth.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.key_state.clear_key().map_err(io)?;
+        drop(sync_slot);
+        Ok(
+            boot_file::load(&boot_file::boot_path(&self.db_path)).and_then(|boot| {
+                if boot.mode != db::EncryptionMode::Password {
+                    return Ok(());
+                }
+                let placeholder = vault::startup::password_locked_placeholder(&boot)?;
+                self.state.set_connection(placeholder)
+            }),
+        )
+    }
+
+    /// Check `password` against the boot file's password wrap, without
+    /// unlocking or changing anything. `WrongPassword` like `unlock`.
+    fn verify_password(&self, password: &str) -> Result<(), MemloreError> {
+        let boot = boot_file::load(&boot_file::boot_path(&self.db_path)).map_err(io)?;
+        let (Some(wrapped), Some(salt)) = (boot.wrapped_key.as_deref(), boot.kek_salt.as_deref())
+        else {
+            return Err(io("There is no vault password to check".to_string()));
+        };
+        let salt = vault::decode_hex_salt(salt).map_err(io)?;
+        unwrap_key(wrapped, password, &salt)
+            .map(drop)
+            .map_err(|_| MemloreError::WrongPassword)
     }
 
     /// The lock gate: `Locked` unless the keys are loaded, then run `f` on
@@ -585,10 +758,9 @@ impl MemloreEngine {
         f(&mut self.lock_session.lock().unwrap_or_else(|p| p.into_inner()));
     }
 
-    /// The desktop post-save hooks (language, embedding), minus its
-    /// `last_edit` debounce clock. Call it outside the lock gate, after the
-    /// connection guard is released: the embedding hook takes the connection
-    /// itself.
+    /// The desktop post-save hooks (language, embedding). Call it outside
+    /// the lock gate, after the connection guard is released: the embedding
+    /// hook takes the connection itself.
     fn after_entry_save(&self, id: &str) -> Result<(), MemloreError> {
         {
             let conn = self.state.lock().map_err(io)?;
@@ -596,6 +768,62 @@ impl MemloreEngine {
         }
         maybe_mark_entry_embedding_dirty_after_save(&self.state, &self.indexer, id);
         Ok(())
+    }
+}
+
+/// `startup_init` plus the Drive token half of its first-launch Keychain
+/// wipe: a token left by an earlier install (the Keychain outlives an
+/// uninstall) is never paired with a new vault. A password-locked or
+/// corrupt-boot launch keeps it.
+fn startup(
+    db_path: &Path,
+    key_state: &EncryptionKeyState,
+    hooks: &MobileVaultHooks,
+    credentials: &MobileCredentialStore,
+) -> Result<(rusqlite::Connection, StartupMode), MemloreError> {
+    let (conn, mode) = vault::startup::startup_init(db_path, key_state, hooks).map_err(io)?;
+    if mode == StartupMode::FirstLaunch {
+        if let Err(e) = credentials.tokens().remove() {
+            log::warn!("first launch: the stale Drive token was not wiped ({e})");
+        }
+    }
+    Ok((conn, mode))
+}
+
+/// Remove the vault's files next to `db_path`, and its media folder.
+/// Conversion leftovers go first (startup recovery would restore a
+/// `.db.bak` over a missing DB), then the boot file: without it the next
+/// launch is a first launch whatever else is left.
+fn remove_vault_files(db_path: &Path) -> Result<(), String> {
+    let boot = boot_file::boot_path(db_path);
+    let sibling = |suffix: &str| {
+        let mut path = db_path.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    let files = [
+        db_path.with_extension("db.bak"),
+        db_path.with_extension("db.enc"),
+        db_path.with_extension("db.plain"),
+        boot.with_extension("boot.bak"),
+        boot,
+        db_path.to_path_buf(),
+        sibling("-wal"),
+        sibling("-shm"),
+    ];
+    for path in &files {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("Failed to delete a vault file: {e}"));
+            }
+            _ => {}
+        }
+    }
+    match std::fs::remove_dir_all(db_path.with_file_name("media")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("Failed to delete the media folder: {e}"))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -717,7 +945,7 @@ fn envelope_err(e: EnvelopeError) -> MemloreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keystore::MemoryKeyStore;
+    use crate::keystore::{DriveTokenStore, MemoryKeyStore, MemoryTokenStore};
     use yrs::updates::decoder::Decode;
     use yrs::{ReadTxn, Transact, Update, XmlElementPrelim, XmlFragment, XmlTextPrelim};
 
@@ -727,7 +955,7 @@ mod tests {
     }
 
     /// `base` plus a paragraph holding `text`, as an editor would save it.
-    fn typed(base: &[u8], text: &str) -> Vec<u8> {
+    pub(crate) fn typed(base: &[u8], text: &str) -> Vec<u8> {
         let doc = yrs::Doc::with_client_id(7);
         let fragment = doc.get_or_insert_xml_fragment("default");
         let mut txn = doc.transact_mut();
@@ -738,7 +966,7 @@ mod tests {
     }
 
     /// Save `text` into a listed entry through the mobile save.
-    fn write_text(engine: &MemloreEngine, id: &str, text: &str) {
+    pub(crate) fn write_text(engine: &MemloreEngine, id: &str, text: &str) {
         let base = engine.load_entry_yjs(id.to_string()).unwrap();
         engine
             .save_entry_yjs(id.to_string(), typed(&base, text), text.into(), text.into())
@@ -2044,19 +2272,23 @@ mod tests {
         ));
     }
 
-    /// First launch wipes a stale Keychain item, a password-locked launch
-    /// keeps it: an os_kek left by an earlier install is never paired with a
-    /// new vault, and a relaunch never loses the Face ID key of the vault
-    /// that is there.
+    /// First launch wipes the stale Keychain items (the os_kek and the Drive
+    /// refresh token), a password-locked launch keeps them: an item left by
+    /// an earlier install is never paired with a new vault, and a relaunch
+    /// never loses the Face ID key or the Drive sign-in of the vault that is
+    /// there.
     #[test]
     fn first_launch_wipes_a_stale_keychain_item_a_password_locked_launch_keeps_it() {
         let fresh = tempfile::TempDir::new().unwrap();
         let stale = Arc::new(MemoryKeyStore::default());
         stale.store(&[7u8; 32]).unwrap();
-        let engine = MemloreEngine::with_keystore(
+        let stale_token = Arc::new(MemoryTokenStore::default());
+        stale_token.store("stale-token-fixture").unwrap();
+        let engine = MemloreEngine::with_stores(
             fresh.path().to_string_lossy().into_owned(),
             "0.0.0-test".into(),
             stale.clone(),
+            stale_token.clone(),
         )
         .unwrap();
         assert_eq!(engine.startup_mode(), StartupModeFfi::FirstLaunch);
@@ -2064,20 +2296,27 @@ mod tests {
             matches!(stale.retrieve(), Err(vault::OsKekError::NotFound)),
             "first launch kept a stale Keychain item"
         );
+        assert!(
+            stale_token.load().unwrap().is_none(),
+            "first launch kept a stale Drive token"
+        );
 
         let dir = tempfile::TempDir::new().unwrap();
         let keystore = Arc::new(MemoryKeyStore::default());
+        let tokens = Arc::new(MemoryTokenStore::default());
         let open = || {
-            MemloreEngine::with_keystore(
+            MemloreEngine::with_stores(
                 dir.path().to_string_lossy().into_owned(),
                 "0.0.0-test".into(),
                 keystore.clone(),
+                tokens.clone(),
             )
             .unwrap()
         };
         let engine = open();
         engine.create_vault("password12".to_string()).unwrap();
         engine.enable_biometric().unwrap();
+        tokens.store("token-fixture").unwrap();
         drop(engine);
 
         let engine = open();
@@ -2086,5 +2325,153 @@ mod tests {
             keystore.retrieve().is_ok(),
             "password-locked launch wiped the Face ID key"
         );
+        assert!(
+            tokens.load().unwrap().is_some(),
+            "password-locked launch wiped the Drive token"
+        );
+    }
+
+    /// Sets its flag when dropped: the future that owns it was dropped.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// `lock()` ends a running sync before it clears the keys (fail
+    /// closed): a sync that never completes, started through the same
+    /// plumbing as the real one, holds the single-sync guard; after `lock()`
+    /// its future is gone, the guard is free and the keys are cleared. No
+    /// Drive credential outlives the lock either: the live session and an
+    /// unfinished sign-in are gone (the Keychain rebuilds the session after
+    /// an unlock).
+    #[test]
+    fn lock_ends_a_running_sync_and_clears_keys() {
+        let _serial = crate::sync::test_support::serial();
+        let (_dir, engine) = unlocked_engine();
+        engine.configure_drive("fixture-client.apps.googleusercontent.com".to_string());
+        engine.drive_connect_begin().unwrap();
+        *engine.live_session.lock().unwrap() = Some(GDriveSession {
+            access_token: "access-fixture".to_string(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            refresh_token: Zeroizing::new("refresh-fixture".to_string()),
+            client_id: "fixture-client".to_string(),
+            client_secret: None,
+        });
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        engine
+            .spawn_sync_task(async move {
+                let _flag = flag;
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        assert!(
+            memlore_engine::sync::guard::is_sync_in_progress(),
+            "the sync task does not hold the single-sync guard"
+        );
+
+        engine.lock().unwrap();
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "lock left the sync running"
+        );
+        assert!(
+            !memlore_engine::sync::guard::is_sync_in_progress(),
+            "lock left the single-sync guard taken"
+        );
+        assert!(!engine.key_state.is_initialized().unwrap());
+        assert!(
+            engine.live_session.lock().unwrap().is_none(),
+            "lock kept the live Drive session"
+        );
+        assert!(
+            engine.oauth.lock().unwrap().is_none(),
+            "lock kept the unfinished sign-in"
+        );
+        assert!(
+            matches!(
+                engine.spawn_sync_task(std::future::pending::<()>()),
+                Err(MemloreError::Locked)
+            ),
+            "a sync started after the lock"
+        );
+        assert!(!memlore_engine::sync::guard::is_sync_in_progress());
+    }
+
+    /// Delete the phone vault: a wrong password changes nothing (files,
+    /// both Keychain items, startup mode, the open vault); the right one
+    /// removes the vault files and the media folder, wipes the os_kek and
+    /// the Drive token and returns to first launch, so a new vault can be
+    /// created in its place, on disk.
+    #[test]
+    fn delete_vault_is_password_gated_and_wipes_everything() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keystore = Arc::new(MemoryKeyStore::default());
+        let tokens = Arc::new(MemoryTokenStore::default());
+        let open = || {
+            MemloreEngine::with_stores(
+                dir.path().to_string_lossy().into_owned(),
+                "0.0.0-test".into(),
+                keystore.clone(),
+                tokens.clone(),
+            )
+            .unwrap()
+        };
+        let engine = open();
+        engine.create_vault("password12".to_string()).unwrap();
+        let id = engine.create_entry("Kept".to_string(), None).unwrap();
+        engine.enable_biometric().unwrap();
+        tokens.store("token-fixture").unwrap();
+        let db_path = dir.path().join("memlore.db");
+        let boot = boot_file::boot_path(&db_path);
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("photo.bin"), b"media").unwrap();
+
+        assert!(matches!(
+            engine.delete_vault("wrong-password".to_string()),
+            Err(MemloreError::WrongPassword)
+        ));
+        assert!(db_path.exists() && boot.exists() && media.join("photo.bin").exists());
+        assert!(
+            keystore.retrieve().is_ok(),
+            "wrong password wiped the os_kek"
+        );
+        assert!(
+            tokens.load().unwrap().is_some(),
+            "wrong password wiped the token"
+        );
+        assert_eq!(engine.startup_mode(), StartupModeFfi::PasswordLocked);
+        assert!(
+            engine.get_entry(id.clone()).is_ok(),
+            "wrong password locked the vault"
+        );
+
+        engine.delete_vault("password12".to_string()).unwrap();
+        assert!(!boot.exists(), "the boot file survived");
+        assert!(!media.exists(), "the media folder survived");
+        assert!(matches!(
+            keystore.retrieve(),
+            Err(vault::OsKekError::NotFound)
+        ));
+        assert!(tokens.load().unwrap().is_none(), "the Drive token survived");
+        assert_eq!(engine.startup_mode(), StartupModeFfi::FirstLaunch);
+        assert!(!engine.key_state.is_initialized().unwrap());
+        assert!(matches!(engine.entry_count(), Err(MemloreError::Locked)));
+
+        engine.create_vault("password34".to_string()).unwrap();
+        expect_not_found(engine.get_entry(id.clone()), "old entry in the new vault");
+        drop(engine);
+        let engine = open();
+        assert_eq!(engine.startup_mode(), StartupModeFfi::PasswordLocked);
+        assert!(matches!(
+            engine.unlock("password12".to_string()),
+            Err(MemloreError::WrongPassword)
+        ));
+        engine.unlock("password34".to_string()).unwrap();
+        expect_not_found(engine.get_entry(id), "old entry after a relaunch");
     }
 }

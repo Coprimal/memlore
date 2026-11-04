@@ -12,6 +12,7 @@ use memlore_engine::ops::tags::{
     add_tag_to_entry_impl, delete_tag_impl, remove_tag_from_entry_impl, update_tag_impl,
     UpdateTagError,
 };
+use memlore_engine::sync::engine::reset_session_own_cloud_reconciled;
 
 use crate::{
     format_err, io, require_listed_entry, require_listed_journal, MemloreEngine, MemloreError,
@@ -113,8 +114,8 @@ impl MemloreEngine {
     /// (desktop parity, irreversible). Refused with `LastJournal` when no
     /// other unlocked, visible journal would remain, in every view (a user is
     /// never left with only journals that need a reveal or a vault). Media
-    /// files are unlinked once the delete has committed.
-    // TODO(later): M2 must re-arm reset_session_own_cloud_reconciled after a journal delete (docs/LATER.md "Mobile M3a notes")
+    /// files are unlinked once the delete has committed, and the own-cloud
+    /// prune is re-armed for their cloud copies, as on desktop.
     pub fn delete_journal(&self, id: String) -> Result<(), MemloreError> {
         let media_paths = self.with_scope(|conn, scope| {
             require_listed_journal(conn, scope, &id)?;
@@ -133,6 +134,7 @@ impl MemloreEngine {
         for (storage_path, thumbnail_path) in &media_paths {
             remove_media_files_best_effort(storage_path, thumbnail_path.as_deref());
         }
+        reset_session_own_cloud_reconciled();
         Ok(())
     }
 
