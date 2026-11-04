@@ -10,6 +10,7 @@ import MemloreCore, {
 } from '@/modules/memlore-core';
 import { markEntryListsDirty } from '@/src/hooks/useEntries';
 import { errorCode, useVault } from '@/src/hooks/useVault';
+import { dropCachedRows } from '@/src/lib/rowCache';
 
 /**
  * A nil field of a native Record may arrive missing rather than null: every
@@ -143,8 +144,9 @@ export function useSync(): Sync {
  * The provider's state. `status` follows `onSyncStatus` and is read with
  * `syncStatus()` whenever the vault is unlocked and the app becomes active;
  * null while locked or not read yet. `progress` is the running sync's last
- * step, null once it ended. A sync that pulls entries bumps the entry lists
- * (`markEntryListsDirty`), so they read again.
+ * step, null once it ended. A sync that pulls or changes entries drops the
+ * row cache and bumps the entry lists (`markEntryListsDirty`), so they read
+ * again.
  *
  * Actions reject with the module's error (`errorCode(e)`: ERR_WRONG_PHRASE,
  * ERR_VAULT_NOT_EMPTY, ERR_WRONG_PASSWORD, ERR_IO…); ERR_LOCKED while the app
@@ -191,8 +193,11 @@ function useSyncState() {
     const progressSub = MemloreCore.addListener('onSyncProgress', (event) => {
       setProgress({ step: event.step, done: event.done, total: event.total });
     });
-    // The only subscription: one bump, however many lists are mounted.
+    // The only subscription: one bump, however many lists are mounted. The
+    // event names no entry, so every cached row may be stale (a pulled edit's
+    // title or preview): all are dropped; the lists' reads put them back.
     const entriesSub = MemloreCore.addListener('onEntriesChanged', () => {
+      dropCachedRows();
       markEntryListsDirty();
     });
     return () => {

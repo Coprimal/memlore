@@ -392,11 +392,12 @@ impl<'a> MobileSyncHooks<'a> {
 
     /// After the cycle: a cycle that failed before reporting (the push
     /// guards, the keyring checks) still ends in an error status, with the
-    /// fence recognised; entries a pull brought in are announced.
+    /// fence recognised; entries a pull brought in or changed are
+    /// announced (`pulled` counts only new rows, an edit is `merged`).
     fn finish(&self, state: &AppState, result: &Result<SyncSummary, String>) {
         match result {
             Ok(summary) => {
-                if summary.pulled > 0 {
+                if summary.pulled > 0 || summary.merged > 0 {
                     if let Some(observer) = self.report.observer() {
                         observer.on_entries_changed();
                     }
@@ -896,6 +897,119 @@ mod tests {
             recorder.entries_changed.load(Ordering::SeqCst) > 0,
             "the observer was not told the entries changed"
         );
+
+        // STOP 2 step 4: a later desktop edit of an entry the phone already
+        // holds is a merge, not a new row; the phone must still be told, or
+        // its list keeps the old preview.
+        desktop.edit_entry(&ids[0], "desktop edit two");
+        let summary = desktop.sync();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        recorder.entries_changed.store(0, Ordering::SeqCst);
+        let status = sync_and_wait(&phone);
+        assert_eq!(status.phase, SyncPhaseFfi::Synced, "{status:?}");
+        let page = phone.list_entries(None, 0).unwrap();
+        let row = page.items.iter().find(|r| r.id == ids[0]).unwrap();
+        assert!(
+            row.preview_text
+                .as_deref()
+                .is_some_and(|p| p.contains("desktop edit two")),
+            "the list row kept the old preview: {:?}",
+            row.preview_text
+        );
+        assert!(
+            recorder.entries_changed.load(Ordering::SeqCst) > 0,
+            "the observer was not told a pulled edit changed the entries"
+        );
+    }
+
+    /// STOP 2 step 5: a desktop that set its second lock (password, show
+    /// existence, 5 min) and locked an entry long before the phone existed,
+    /// before it connected or between two of its syncs, hands all of it to
+    /// a phone that onboards with the phrase. Before its first sync the
+    /// phone has none of it (the mobile UI must read the lock state again
+    /// after a sync, not keep this first answer); after it the lock is
+    /// enabled, the entry lists covered and stays unreadable until the
+    /// reveal with the desktop's password.
+    #[test]
+    fn desktop_second_lock_reaches_a_phone_onboarding_with_the_phrase() {
+        for lock_before_connect in [true, false] {
+            second_lock_reaches_an_onboarded_phone(lock_before_connect);
+        }
+    }
+
+    fn second_lock_reaches_an_onboarded_phone(lock_before_connect: bool) {
+        use memlore_engine::ops::second_lock::{
+            set_entry_locked_impl, set_second_lock_password_impl,
+        };
+        let _serial = serial();
+        let cloud = tempfile::TempDir::new().unwrap();
+        let desktop = DesktopRole::first_launch();
+        let phrase = desktop.create_vault("password12");
+        let plain = desktop.write_entry("Plain", "plain body");
+        let locked = desktop.write_entry("Locked", "locked body");
+        let set_lock = || {
+            let conn = desktop.state.lock().unwrap();
+            set_second_lock_password_impl(&conn, "desk-second-pw").unwrap();
+            db::set_setting(&conn, "second_lock_show_existence", "true").unwrap();
+            db::set_setting(&conn, "second_lock_auto_lock_minutes", "5").unwrap();
+            set_entry_locked_impl(&conn, &locked, true).unwrap();
+        };
+        if lock_before_connect {
+            set_lock();
+        }
+        desktop.connect(cloud.path(), "second-lock-desktop");
+        let summary = desktop.sync();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        if !lock_before_connect {
+            set_lock();
+            let summary = desktop.sync();
+            assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        }
+
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let phone = engine_at(phone_dir.path(), Arc::default());
+        let session_id = "second-lock-onboard";
+        connect_folder(&phone, cloud.path(), session_id).unwrap();
+        phone
+            .onboard_complete(session_id.to_string(), phrase, "password34".to_string())
+            .unwrap();
+        let before = phone.lock_state().unwrap();
+        assert!(
+            !before.enabled && !before.show_existence,
+            "settings before the first sync: {before:?}"
+        );
+
+        for _ in 0..2 {
+            let status = sync_and_wait(&phone);
+            assert_eq!(status.phase, SyncPhaseFfi::Synced, "{status:?}");
+            let state = phone.lock_state().unwrap();
+            assert!(state.enabled, "the desktop's second lock is off: {state:?}");
+            assert!(state.show_existence && !state.revealed, "{state:?}");
+            assert_eq!(state.auto_lock_minutes, 5);
+            let page = phone.list_entries(None, 0).unwrap();
+            assert_eq!(page.total, 2, "the locked entry is not counted");
+            let row = page
+                .items
+                .iter()
+                .find(|r| r.id == locked)
+                .expect("the locked entry is not listed (Covered)");
+            assert!(row.is_locked, "{row:?}");
+            assert!(page.items.iter().any(|r| r.id == plain));
+            assert!(
+                matches!(
+                    phone.get_entry(locked.clone()),
+                    Err(MemloreError::SecondLockRequired)
+                ),
+                "the locked entry was readable without the reveal"
+            );
+        }
+        assert!(phone
+            .unlock_second_lock("desk-second-pw".to_string())
+            .unwrap());
+        assert_eq!(
+            phone.get_entry(locked).unwrap().content_text.as_deref(),
+            Some("locked body")
+        );
     }
 
     /// A peer rotation blocks the phone until it re-pairs: after the
@@ -1323,6 +1437,17 @@ pub(crate) mod test_support {
             let (yjs, content_text, preview_text) = build_entry_yjs(&[text], &[]);
             save_entry_content_impl(&conn, &entry.id, &yjs, &content_text, &preview_text).unwrap();
             entry.id
+        }
+
+        /// Append a paragraph of `text` to the body of entry `id`, as the
+        /// desktop editor saves an edit.
+        pub(crate) fn edit_entry(&self, id: &str, text: &str) {
+            let conn = self.state.lock().unwrap();
+            let base = db::get_entry_content(&conn, id)
+                .unwrap()
+                .unwrap_or_default();
+            save_entry_content_impl(&conn, id, &crate::tests::typed(&base, text), text, text)
+                .unwrap();
         }
 
         /// One sync cycle, holding the single-sync guard.
