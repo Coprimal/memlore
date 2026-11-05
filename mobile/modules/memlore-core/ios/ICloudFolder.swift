@@ -33,6 +33,10 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
   /// started earlier stops its walk and touches nothing more ("forget wins").
   private let forgotten = OSAllocatedUnfairLock(initialState: UInt64(0))
 
+  /// The coordinated read `prepare` is waiting on, if any: `forget` cancels
+  /// it, since a directory the File Provider never fills would hold `queue`.
+  private let inFlight = OSAllocatedUnfairLock<NSFileCoordinator?>(uncheckedState: nil)
+
   /// The URL whose security scope is open. Only touched on `queue`.
   private var scoped: URL?
 
@@ -69,6 +73,7 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
 
   func forget() {
     forgotten.withLock { $0 &+= 1 }
+    inFlight.withLockUnchecked { $0?.cancel() }
     queue.sync {
       pending = nil
       scoped?.stopAccessingSecurityScopedResource()
@@ -211,48 +216,130 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
     return true
   }
 
-  /// Starts downloading every placeholder under `root` except `media/`,
-  /// without waiting: a plain read of one still downloading downloads it on
-  /// demand (STOP 1 P2), and the engine's reads land on downloads already
-  /// in flight. Plain enumeration (no `NSFileCoordinator`), hidden files
-  /// included (`.meta`, legacy placeholders). False when a `forget` came.
+  /// How long `prepare` waits for the downloads it started.
+  private static let downloadDeadline: TimeInterval = 60
+
+  /// Materializes every directory under `root` (the engine lists them with
+  /// plain I/O, which blocks on a dataless one), downloads every placeholder
+  /// file outside `media/` and waits for them (`awaitDownloads`). Hidden
+  /// files included (`.meta`, legacy placeholders). A root without `.meta`
+  /// is not walked (the iCloud Drive root, say): the engine refuses it as
+  /// not a sync folder. False when the root can't be read or a `forget` came.
   private func prefetch(_ root: URL, _ started: UInt64) -> Bool {
-    guard
-      let walker = FileManager.default.enumerator(
-        at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [],
-        errorHandler: { _, _ in true })
-    else { return true }
-    var kicked = 0
+    guard let top = list(root, started) else { return false }
+    guard top.contains(where: { $0.lastPathComponent == ".meta" }) else {
+      return isCurrent(started)
+    }
+    var downloading: [URL] = []
     var failed = 0
-    for case let item as URL in walker {
-      guard isCurrent(started) else { return false }
-      if (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
-        if item.lastPathComponent == "media" { walker.skipDescendants() }
-        continue
+    var dirs: [(entries: [URL], inMedia: Bool)] = [(top, false)]
+    while let (entries, inMedia) = dirs.popLast() {
+      for item in entries {
+        guard isCurrent(started) else { return false }
+        if (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+          // `media/` is materialized too (the engine may list it); only its
+          // files are not downloaded ahead.
+          if let children = list(item, started) {
+            dirs.append((children, inMedia || item.lastPathComponent == "media"))
+          } else if !isCurrent(started) {
+            return false
+          }
+          continue
+        }
+        if inMedia { continue }
+        switch kick(item) {
+        case true?: downloading.append(Self.realURL(item).0)
+        case false?: failed += 1
+        case nil: break
+        }
       }
-      let (file, legacyPlaceholder) = Self.realURL(item)
-      if !legacyPlaceholder {
+    }
+    if downloading.count + failed > 0 {
+      NSLog(
+        "[ICloudFolder] …/%@: %ld downloads started, %ld refused", root.lastPathComponent,
+        downloading.count, failed)
+    }
+    return awaitDownloads(downloading, started)
+  }
+
+  /// Waits until every file in `files` is downloaded, for at most
+  /// `downloadDeadline`. A read the engine opens on a file whose download
+  /// this started may never return once the download lands (seen in STOP 2),
+  /// while a read of a dataless file nobody is downloading downloads it on
+  /// demand (STOP 1 P2). Past the deadline the engine reads anyway (iCloud is
+  /// slow, the folder is not gone). False when a `forget` came.
+  /// TODO(later): the read can still hang past the deadline; see
+  /// docs/LATER.md "M2b: dataless iCloud directories on a real iPhone".
+  private func awaitDownloads(_ files: [URL], _ started: UInt64) -> Bool {
+    var waiting = files
+    let deadline = Date().addingTimeInterval(Self.downloadDeadline)
+    while true {
+      guard isCurrent(started) else { return false }
+      waiting.removeAll { file in
         // Resource values are cached per URL (STOP 1 P7): read a fresh one.
         var fresh = file
         fresh.removeAllCachedResourceValues()
-        let status = (try? fresh.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?
-          .ubiquitousItemDownloadingStatus
-        // nil: not an iCloud item.
-        guard let status, status != .current else { continue }
+        return (try? fresh.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?
+          .ubiquitousItemDownloadingStatus == .current
       }
-      do {
-        try FileManager.default.startDownloadingUbiquitousItem(at: file)
-        kicked += 1
-      } catch {
-        failed += 1
-      }
+      if waiting.isEmpty { return true }
+      if Date() >= deadline { break }
+      Thread.sleep(forTimeInterval: 0.5)
     }
-    if kicked + failed > 0 {
-      NSLog(
-        "[ICloudFolder] …/%@: %ld downloads started, %ld refused", root.lastPathComponent, kicked,
-        failed)
-    }
+    NSLog(
+      "[ICloudFolder] %ld downloads still running after %.0f s", waiting.count,
+      Self.downloadDeadline)
     return true
+  }
+
+  /// Lists `dir`. A dataless directory (one the File Provider has not filled
+  /// yet) is listed inside a coordinated read, which asks the provider to
+  /// fill it (one level per call); a plain `readdir` of it blocks until the
+  /// provider does, and that can be never. nil when it can't be read or a
+  /// `forget` came (its cancel ends the wait).
+  /// TODO(later): no timeout on the coordinated read yet; see docs/LATER.md
+  /// "M2b: dataless iCloud directories on a real iPhone".
+  private func list(_ dir: URL, _ started: UInt64) -> [URL]? {
+    let read = {
+      try? FileManager.default.contentsOfDirectory(
+        at: $0, includingPropertiesForKeys: [.isDirectoryKey], options: [])
+    }
+    var probe = dir
+    probe.removeAllCachedResourceValues()
+    let status = (try? probe.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?
+      .ubiquitousItemDownloadingStatus
+    // nil: not an iCloud item, listed as it is.
+    guard let status, status != .current else { return read(dir) }
+    let coordinator = NSFileCoordinator()
+    inFlight.withLockUnchecked { $0 = coordinator }
+    defer { inFlight.withLockUnchecked { $0 = nil } }
+    // After publishing it: a `forget` from here on cancels this read.
+    guard isCurrent(started) else { return nil }
+    var listed: [URL]?
+    var error: NSError?
+    coordinator.coordinate(readingItemAt: dir, options: [], error: &error) { listed = read($0) }
+    return isCurrent(started) ? listed : nil
+  }
+
+  /// Starts downloading `item` unless it is already current (nil). False
+  /// when the system refused.
+  private func kick(_ item: URL) -> Bool? {
+    let (file, legacyPlaceholder) = Self.realURL(item)
+    if !legacyPlaceholder {
+      // Resource values are cached per URL (STOP 1 P7): read a fresh one.
+      var fresh = file
+      fresh.removeAllCachedResourceValues()
+      let status = (try? fresh.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?
+        .ubiquitousItemDownloadingStatus
+      // nil: not an iCloud item.
+      guard let status, status != .current else { return nil }
+    }
+    do {
+      try FileManager.default.startDownloadingUbiquitousItem(at: file)
+      return true
+    } catch {
+      return false
+    }
   }
 
   /// `.a.bin.icloud` is the legacy name of a placeholder for `a.bin` (older
