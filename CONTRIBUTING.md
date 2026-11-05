@@ -38,23 +38,22 @@ debug = "line-tables-only"  # dependencies keep file:line backtraces
 incremental = false
 ```
 
-To share one cache across Rust projects, create `~/.cargo/config.toml` once per machine (outside git) with `target-dir = ".cargo/shared-target"` under `[build]` (relative to `$HOME`) and the **same** profile as above. Profiles that differ make Cargo build every dependency twice.
+`~/.cargo/config.toml` (once per machine, outside git) holds the **same** profile and no `target-dir`. Profiles that differ make Cargo build every dependency twice.
 
-- `pnpm tauri dev` and `cargo test` then use `~/.cargo/shared-target`; `pnpm tauri build` and `scripts/build-signed-app.sh` still pin `src-tauri/target` so bundles stay in the repo (unless the checkout builds on the external SSD, below).
-- Delete the old `src-tauri/target` after switching.
+- Each checkout builds into its own folder on the external SSD (below). Without that config, builds use `src-tauri/target`.
+- Delete the old `src-tauri/target` after switching to the SSD.
 - Build one project at a time (Cargo locks the directory).
-- Never run `cargo clean` / `pnpm cargo:clean`: it wipes the cache of every project.
 
-### Target on the external SSD (per checkout, opt-in)
+### Target on the external SSD (one folder per checkout)
 
-A checkout can build on an external SSD instead of `~/.cargo/shared-target`, to free space on the internal disk. It is opt-in per checkout: a repo-root `.cargo/config.toml` (gitignored) sets its `target-dir`. That covers `pnpm tauri dev`, `cargo test`, `cargo clippy`, rust-analyzer, `pnpm tauri build`, `scripts/build-signed-app.sh` and the release script. Use one folder per checkout (the main checkout and each worktree), never a shared one:
+Every checkout builds on an external SSD, to free space on the internal disk: a repo-root `.cargo/config.toml` (gitignored) sets its `target-dir`. That covers `pnpm tauri dev`, `cargo test`, `cargo clippy`, rust-analyzer, `pnpm tauri build`, `scripts/build-signed-app.sh` and the release script. Use one folder per checkout (the main checkout and each worktree), never a shared one:
 
 ```sh
 cp .cargo/config.toml.example .cargo/config.toml   # set the folder for this checkout
 mkdir -p /Volumes/Thi2TB/cargo-target/memlore   # main checkout; a worktree uses memlore-<worktree>
 ```
 
-Cargo reads config files from the current directory upward, and `$HOME` has the lowest priority. This `target-dir` therefore wins over `~/.cargo/config.toml`, whether you run from the repo root or from `src-tauri/`. Check it in `src-tauri/`:
+Cargo reads config files from the current directory upward, and `$HOME` has the lowest priority. This `target-dir` therefore applies whether you run from the repo root or from `src-tauri/`. Check it in `src-tauri/`:
 
 ```sh
 cargo metadata --no-deps --format-version 1 | jq -r .target_directory
@@ -66,8 +65,8 @@ Unplug and replug: macOS mounts the volume at `/Volumes/Thi2TB` again. The path 
 
 - **The SSD mounts as `Thi2TB 1`:** another volume with the same name is mounted. Eject that one (`diskutil list`, `diskutil unmount`), then remount the SSD so it gets `/Volumes/Thi2TB` back.
 - **The volume was renamed:** update `target-dir` in `.cargo/config.toml`.
-- **Builds still go to the shared target:** `CARGO_TARGET_DIR` is set in the environment (`echo $CARGO_TARGET_DIR`), or the config is not at the checkout root.
-- **Free space:** run `cargo sweep` in `src-tauri/`. It follows the same config. You can also delete the checkout's folder under `/Volumes/Thi2TB/cargo-target/`. `cargo clean` / `pnpm cargo:clean` in such a checkout only clears its SSD folder, but in a checkout without the config it wipes the whole shared target.
+- **Builds still go to the internal disk:** `CARGO_TARGET_DIR` is set in the environment (`echo $CARGO_TARGET_DIR`), or the config is not at the checkout root.
+- **Free space:** run `cargo sweep` in `src-tauri/`. It follows the same config. You can also delete the checkout's folder under `/Volumes/Thi2TB/cargo-target/`. `cargo clean` / `pnpm cargo:clean` only clears the checkout's own target folder.
 - **Spotlight** indexes the SSD. If the SSD holds only caches, `sudo mdutil -i off /Volumes/Thi2TB` stops that (optional).
 
 `node_modules` stays on the internal disk. pnpm hardlinks it from its store, so a copy on another volume would take more space, not less. `~/.tauri` holds updater signing keys, not a cache.

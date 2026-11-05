@@ -7,7 +7,7 @@
 #      mobile/modules/memlore-core/ios/Generated (gitignored);
 #   3. mobile/modules/memlore-core/ios/MemloreCoreFFI.xcframework (gitignored)
 #      with both slices and the FFI header + module.modulemap.
-# The target directory comes from `cargo metadata` (the shared Cargo cache).
+# The target directory comes from `cargo metadata` (the checkout's SSD target-dir).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
