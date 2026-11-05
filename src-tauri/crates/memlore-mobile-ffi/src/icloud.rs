@@ -42,14 +42,18 @@ pub enum FolderPrepareFfi {
     /// differ from the stored one after a move).
     Ready { root_path: String },
     /// No folder: never picked, forgotten, deleted, in the Trash, iCloud
-    /// signed out, or any failure on the Swift side.
+    /// signed out, or any other failure on the Swift side.
     Gone,
+    /// The folder is there but could not be read now (iCloud did not list
+    /// it). A sync fails and tries again later; the folder is not asked for.
+    Unreadable,
 }
 
 /// The picked iCloud Drive folder, implemented in Swift. Called on an FFI
 /// caller's thread or a blocking runtime thread, never under the DB lock;
 /// an implementation must not call back into the engine. Infallible: a
-/// Swift failure is `Gone`. `forget` wins: `prepare`, `prepare_connect`
+/// Swift failure is `Gone`, except a folder iCloud could not list
+/// (`Unreadable`). `forget` wins: `prepare`, `prepare_connect`
 /// and `forget` are serialized, and a `prepare` that finishes after a
 /// `forget` keeps no bookmark and no open scope.
 ///
@@ -61,7 +65,10 @@ pub enum FolderPrepareFfi {
 #[uniffi::export(with_foreign)]
 pub trait FolderAccess: Send + Sync {
     /// Resolve the bookmark, keep its security scope open, refuse a folder
-    /// that is gone and start downloading placeholders (without waiting).
+    /// that is gone, fill every directory iCloud has not downloaded yet and
+    /// download the placeholder files outside `media/`. Blocks: up to a
+    /// minute for the downloads it started, and for as long as iCloud takes
+    /// to list a directory (a `forget` ends that wait).
     fn prepare(&self) -> FolderPrepareFfi;
     /// Promote the staged pick, if one is current, to the bookmark, then the
     /// same as [`Self::prepare`]. Without one it is [`Self::prepare`].
@@ -208,12 +215,17 @@ impl MemloreEngine {
 
     /// Take `prepare`'s answer for the configured folder: a usable root
     /// clears `NeedsFolder` and, when the folder moved, replaces the stored
-    /// `root_path` (device-local, never synced); anything else is
+    /// `root_path` (device-local, never synced); `Unreadable` is an I/O
+    /// error that leaves `NeedsFolder` as it was; anything else is
     /// `FolderUnavailable` and `NeedsFolder` until a later `Ready` or a
     /// disconnect.
     fn adopt_folder_root(&self, answer: Option<FolderPrepareFfi>) -> Result<(), MemloreError> {
         let root = checked_root(answer);
-        self.sync_report.set_needs_folder(root.is_err());
+        match &root {
+            Ok(_) => self.sync_report.set_needs_folder(false),
+            Err(MemloreError::FolderUnavailable) => self.sync_report.set_needs_folder(true),
+            Err(_) => {}
+        }
         let root = root?;
         let root_path = root.to_string_lossy().into_owned();
         let conn = self.state.lock().map_err(io)?;
@@ -253,6 +265,9 @@ fn checked_root(answer: Option<FolderPrepareFfi>) -> Result<PathBuf, MemloreErro
                 Err(MemloreError::FolderUnavailable)
             }
         }
+        Some(FolderPrepareFfi::Unreadable) => Err(io(
+            "the iCloud folder could not be read; try again later".into(),
+        )),
         Some(FolderPrepareFfi::Gone) | None => Err(MemloreError::FolderUnavailable),
     }
 }
@@ -593,6 +608,41 @@ mod tests {
         );
         phone.drive_disconnect().unwrap();
         assert_eq!(phone.sync_status().unwrap().blocked, None);
+    }
+
+    /// A folder iCloud could not list right now (STOP 2: offline, or a
+    /// provider error) fails the sync as a plain error, never as "Choose the
+    /// folder again", and the next sync that can read it succeeds.
+    #[test]
+    fn an_unreadable_folder_fails_the_sync_without_asking_for_the_folder() {
+        let _serial = serial();
+        let cloud = tempfile::TempDir::new().unwrap();
+        let folder = cloud.path().join("Memlore");
+        std::fs::create_dir(&folder).unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let (phone, access) = phone_at(phone_dir.path());
+        access.answer(ready(&folder));
+        assert_eq!(
+            phone.icloud_connect().unwrap(),
+            ConnectOutcomeFfi::Connected
+        );
+
+        let forgets = access.forgets();
+        access.answer(FolderPrepareFfi::Unreadable);
+        let status = sync_and_wait(&phone);
+        assert_eq!(status.phase, SyncPhaseFfi::Error, "{status:?}");
+        assert_eq!(
+            status.blocked, None,
+            "an unreadable folder asked for a re-pick"
+        );
+        assert_eq!(
+            access.forgets(),
+            forgets,
+            "an unreadable folder dropped the bookmark"
+        );
+
+        access.answer(ready(&folder));
+        assert_eq!(sync_and_wait(&phone).phase, SyncPhaseFfi::Synced);
     }
 
     /// A pick only stages a folder: a sync keeps the connected one (it

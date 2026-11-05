@@ -200,7 +200,12 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
       isDirectory.boolValue, !(path as NSString).pathComponents.contains(".Trash")
     else { return .gone }
-    guard prefetch(resolved, started), isCurrent(started) else { return .gone }
+    switch prefetch(resolved, started) {
+    case .forgotten: return .gone
+    case .unreadable: return .unreadable
+    case .done: break
+    }
+    guard isCurrent(started) else { return .gone }
     return .ready(rootPath: path)
   }
 
@@ -219,30 +224,41 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
   /// How long `prepare` waits for the downloads it started.
   private static let downloadDeadline: TimeInterval = 60
 
+  /// How a `prefetch` ended.
+  private enum Walk {
+    case done
+    /// A `forget` came.
+    case forgotten
+    /// iCloud did not list the root: try again later, the folder is there.
+    case unreadable
+  }
+
   /// Materializes every directory under `root` (the engine lists them with
   /// plain I/O, which blocks on a dataless one), downloads every placeholder
   /// file outside `media/` and waits for them (`awaitDownloads`). Hidden
   /// files included (`.meta`, legacy placeholders). A root without `.meta`
   /// is not walked (the iCloud Drive root, say): the engine refuses it as
-  /// not a sync folder. False when the root can't be read or a `forget` came.
-  private func prefetch(_ root: URL, _ started: UInt64) -> Bool {
-    guard let top = list(root, started) else { return false }
+  /// not a sync folder. A subdirectory that can't be listed is skipped.
+  private func prefetch(_ root: URL, _ started: UInt64) -> Walk {
+    guard let top = list(root, started) else {
+      return isCurrent(started) ? .unreadable : .forgotten
+    }
     guard top.contains(where: { $0.lastPathComponent == ".meta" }) else {
-      return isCurrent(started)
+      return isCurrent(started) ? .done : .forgotten
     }
     var downloading: [URL] = []
     var failed = 0
     var dirs: [(entries: [URL], inMedia: Bool)] = [(top, false)]
     while let (entries, inMedia) = dirs.popLast() {
       for item in entries {
-        guard isCurrent(started) else { return false }
+        guard isCurrent(started) else { return .forgotten }
         if (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
           // `media/` is materialized too (the engine may list it); only its
           // files are not downloaded ahead.
           if let children = list(item, started) {
             dirs.append((children, inMedia || item.lastPathComponent == "media"))
           } else if !isCurrent(started) {
-            return false
+            return .forgotten
           }
           continue
         }
@@ -259,15 +275,17 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
         "[ICloudFolder] …/%@: %ld downloads started, %ld refused", root.lastPathComponent,
         downloading.count, failed)
     }
-    return awaitDownloads(downloading, started)
+    return awaitDownloads(downloading, started) ? .done : .forgotten
   }
 
-  /// Waits until every file in `files` is downloaded, for at most
-  /// `downloadDeadline`. A read the engine opens on a file whose download
-  /// this started may never return once the download lands (seen in STOP 2),
-  /// while a read of a dataless file nobody is downloading downloads it on
-  /// demand (STOP 1 P2). Past the deadline the engine reads anyway (iCloud is
-  /// slow, the folder is not gone). False when a `forget` came.
+  /// Waits until no file in `files` is still a placeholder being downloaded,
+  /// for at most `downloadDeadline`. A read the engine opens on a file whose
+  /// download this started may never return once the download lands (seen
+  /// in STOP 2), while a read of a dataless file nobody is downloading
+  /// downloads it on demand (STOP 1 P2). A file with a local copy (an older
+  /// version) or a failed download (offline) is not waited for. Past the
+  /// deadline the engine reads anyway (iCloud is slow, the folder is not
+  /// gone). False when a `forget` came.
   /// TODO(later): the read can still hang past the deadline; see
   /// docs/LATER.md "M2b: dataless iCloud directories on a real iPhone".
   private func awaitDownloads(_ files: [URL], _ started: UInt64) -> Bool {
@@ -279,8 +297,13 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
         // Resource values are cached per URL (STOP 1 P7): read a fresh one.
         var fresh = file
         fresh.removeAllCachedResourceValues()
-        return (try? fresh.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?
-          .ubiquitousItemDownloadingStatus == .current
+        guard
+          let values = try? fresh.resourceValues(forKeys: [
+            .ubiquitousItemDownloadingStatusKey, .ubiquitousItemDownloadingErrorKey,
+          ])
+        else { return true }
+        return values.ubiquitousItemDownloadingError != nil
+          || values.ubiquitousItemDownloadingStatus != .notDownloaded
       }
       if waiting.isEmpty { return true }
       if Date() >= deadline { break }
@@ -295,8 +318,8 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
   /// Lists `dir`. A dataless directory (one the File Provider has not filled
   /// yet) is listed inside a coordinated read, which asks the provider to
   /// fill it (one level per call); a plain `readdir` of it blocks until the
-  /// provider does, and that can be never. nil when it can't be read or a
-  /// `forget` came (its cancel ends the wait).
+  /// provider does, and that can be never. nil when it can't be read (logged)
+  /// or a `forget` came (its cancel ends the wait).
   /// TODO(later): no timeout on the coordinated read yet; see docs/LATER.md
   /// "M2b: dataless iCloud directories on a real iPhone".
   private func list(_ dir: URL, _ started: UInt64) -> [URL]? {
@@ -318,7 +341,13 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
     var listed: [URL]?
     var error: NSError?
     coordinator.coordinate(readingItemAt: dir, options: [], error: &error) { listed = read($0) }
-    return isCurrent(started) ? listed : nil
+    guard isCurrent(started) else { return nil }
+    if listed == nil {
+      NSLog(
+        "[ICloudFolder] …/%@ could not be listed: %@ %ld", dir.lastPathComponent,
+        error?.domain ?? "no error", error?.code ?? 0)
+    }
+    return listed
   }
 
   /// Starts downloading `item` unless it is already current (nil). False
