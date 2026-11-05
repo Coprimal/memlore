@@ -34,6 +34,8 @@ thiserror = "2"
 log = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
+# The `{ "root_path" }` sync config of a folder provider (`icloud.rs`).
+serde_json = "1.0"
 # Same version and features as memlore-engine (the hooks take a `Connection`).
 rusqlite = { version = "0.34", features = ["bundled-sqlcipher-vendored-openssl"] }
 
@@ -42,7 +44,6 @@ rusqlite = { version = "0.34", features = ["bundled-sqlcipher-vendored-openssl"]
 security-framework = "3"
 
 [dev-dependencies]
-serde_json = "1.0"
 base64 = "0.22"
 yrs = "0.25"
 tempfile = "3"

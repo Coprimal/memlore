@@ -34,6 +34,8 @@ function coerceDriveStatus(raw: DriveStatus): DriveStatus {
     lastSyncMs: raw.lastSyncMs ?? null,
     pendingCount: raw.pendingCount,
     blocked: raw.blocked ?? null,
+    provider: raw.provider ?? null,
+    folderName: raw.folderName ?? null,
   };
 }
 

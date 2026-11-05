@@ -136,6 +136,14 @@ private func toException(_ error: Error) -> Exception {
   case MemloreError.WrongPhrase:
     return Exception(
       name: "MemloreWrongPhrase", description: "Wrong recovery phrase", code: "ERR_WRONG_PHRASE")
+  case MemloreError.FolderUnavailable:
+    return Exception(
+      name: "MemloreFolderUnavailable", description: "The sync folder is not available",
+      code: "ERR_FOLDER_UNAVAILABLE")
+  case MemloreError.NotASyncFolder:
+    return Exception(
+      name: "MemloreNotASyncFolder", description: "This folder is not a Memlore sync folder",
+      code: "ERR_NOT_SYNC_FOLDER")
   default:
     return Exception(name: "MemloreIo", description: error.localizedDescription, code: "ERR_IO")
   }
@@ -604,6 +612,10 @@ struct DriveStatusRecord: Record {
   @Field var lastSyncMs: Double? = nil
   @Field var pendingCount: Int = 0
   @Field var blocked: String? = nil
+  /// `gdrive`, `icloud` or `local` while connected.
+  @Field var provider: String? = nil
+  /// Last path component of a folder provider's root.
+  @Field var folderName: String? = nil
 
   init() {}
 
@@ -613,6 +625,8 @@ struct DriveStatusRecord: Record {
     lastSyncMs = status.lastSyncMs.map { Double($0) }
     pendingCount = Int(clamping: status.pendingCount)
     blocked = status.blocked
+    provider = status.provider
+    folderName = status.folderName
   }
 }
 
@@ -632,6 +646,8 @@ struct SyncBlockedRecord: Record {
       kind = "fenced"
     case .needsReconnect:
       kind = "needs_reconnect"
+    case .needsFolder:
+      kind = "needs_folder"
     }
   }
 }
