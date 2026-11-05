@@ -5,18 +5,22 @@ import '@/src/theme/unistyles';
 import { Stack } from 'expo-router';
 import { useUnistyles } from 'react-native-unistyles';
 
+import { SyncProvider } from '@/src/hooks/useSync';
 import { useVault, VaultProvider } from '@/src/hooks/useVault';
 
 export default function RootLayout() {
   return (
     <VaultProvider>
-      <RootStack />
+      {/* Outside the unlocked guard: onboarding signs in to Drive at first launch. */}
+      <SyncProvider>
+        <RootStack />
+      </SyncProvider>
     </VaultProvider>
   );
 }
 
 /**
- * Only `vault` exists while the vault is not unlocked, and only the app (and
+ * Only `vault` (and `onboard`) exists while the vault is not unlocked, and only the app (and
  * the dev spikes) while it is: a lock removes every protected screen, so the
  * swipe back cannot return to them. The explicit redirects keep the fallback
  * off the route sort order, which puts groups before `vault`.
@@ -40,12 +44,14 @@ function RootStack() {
           undeclared one outside both, where it stays reachable while locked. */}
       <Stack.Protected guard={unlocked} redirectTo="/vault">
         <Stack.Screen name="(app)" options={{ animation: 'none' }} />
-        {/* Dev-only spikes (iCloud, OAuth) stay behind the vault until M2. */}
+        {/* Dev-only iCloud spike stays behind the vault until M2b. */}
         <Stack.Screen name="(dev)/spike-icloud" />
-        <Stack.Screen name="(dev)/spike-oauth" />
       </Stack.Protected>
       <Stack.Protected guard={!unlocked} redirectTo="/">
         <Stack.Screen name="vault" options={{ animation: 'none' }} />
+        {/* First launch, "I already use Memlore": joins the cloud vault. No swipe back: a
+            sign-in in flight must land on this screen, which drops an unused session. */}
+        <Stack.Screen name="onboard" options={{ gestureEnabled: false }} />
       </Stack.Protected>
     </Stack>
   );

@@ -2,18 +2,22 @@ import Darwin
 import UIKit
 
 /// The app-switcher privacy shield, the background auto-lock clock, save
-/// before lock and screen-capture detection (decisions 5 and 6). Main thread
-/// only. It never calls the engine itself: `lockVault` queues `lock()` and
-/// `endLockSession` queues the second-lock and invisible-vault re-lock on the
-/// one serial engine queue in `MemloreCoreModule.swift`, like every other
-/// engine call.
+/// before lock and screen-capture detection (decisions 5 and 6), and the
+/// foreground sync triggers (`SyncDriver`, ADR §13). Main thread only. It
+/// never calls the engine itself: `lockVault` queues `lock()`,
+/// `endLockSession` the second-lock and invisible-vault re-lock, `kickSync`
+/// the `syncKick` and `cancelSync` the `syncCancel` on the one serial engine
+/// queue in `MemloreCoreModule.swift`, like every other engine call.
 @MainActor
 final class DeviceSecurity {
   /// Whether the engine holds the keys, as seen from the main thread.
   /// Process-wide like the engine, which outlives a JS reload.
   /// `MemloreCoreModule` sets it after each successful unlock, vault creation
-  /// and lock, in the order those ran on the engine queue.
-  static var vaultUnlocked = false
+  /// and lock, in the order those ran on the engine queue. The sync timer
+  /// follows it.
+  static var vaultUnlocked = false {
+    didSet { SyncDriver.shared.setUnlocked(vaultUnlocked) }
+  }
 
   /// How long a pending auto-lock keeps the shield up when JS never calls
   /// `releasePrivacyShield()` (no listener yet, a reload), so the app is never
@@ -36,6 +40,11 @@ final class DeviceSecurity {
   /// Queues the engine's `lockSecondLock()` and `closeInvisibleVault()`;
   /// `done` runs on the main thread after them.
   private let endLockSession: (@escaping @MainActor () -> Void) -> Void
+  /// Queues the engine's `syncKick()`.
+  private let kickSync: () -> Void
+  /// Queues the engine's `syncCancel()` (ends a running sync, at most 2 s;
+  /// keys untouched).
+  private let cancelSync: () -> Void
 
   private var observers: [NSObjectProtocol] = []
   private var shields: [UIView] = []
@@ -58,11 +67,15 @@ final class DeviceSecurity {
   init(
     sendEvent: @escaping (String, [String: Any?]) -> Void,
     lockVault: @escaping (@escaping @MainActor () -> Void) -> Void,
-    endLockSession: @escaping (@escaping @MainActor () -> Void) -> Void
+    endLockSession: @escaping (@escaping @MainActor () -> Void) -> Void,
+    kickSync: @escaping () -> Void,
+    cancelSync: @escaping () -> Void
   ) {
     self.sendEvent = sendEvent
     self.lockVault = lockVault
     self.endLockSession = endLockSession
+    self.kickSync = kickSync
+    self.cancelSync = cancelSync
   }
 
   func start() {
@@ -131,7 +144,10 @@ final class DeviceSecurity {
   /// resign active; the shield covering the app then is accepted.
   /// Then, with the shield already up, JS is asked to save while the
   /// WebView still runs; `didEnterBackground` waits for the answer.
+  /// The sync timer stops (no engine call); a running sync goes on until
+  /// the background cancel in `finishFlushWait`.
   private func willResignActive() {
+    SyncDriver.shared.setActive(false)
     showShield()
     flushRequest = nil
     if Self.vaultUnlocked { requestFlush() }
@@ -176,6 +192,10 @@ final class DeviceSecurity {
   }
 
   private func didBecomeActive() {
+    // The kick is queued before the timer's first tick, so that tick may
+    // already retry a failed sync. Locked (an auto-lock): no timer.
+    if Self.vaultUnlocked { kickSync() }
+    SyncDriver.shared.setActive(true)
     guard autoLockPending else {
       hideShield()
       return
@@ -238,12 +258,18 @@ final class DeviceSecurity {
   /// would gate the save of a revealed locked entry); the task ends once they
   /// have. Reads the live state: a manual lock that ran during the wait is not
   /// locked again nor reported as an auto-lock.
+  /// When the vault stays unlocked, a running sync is cancelled first (plan
+  /// M2a decision 10), also queued after the saves; `lock()` cancels it
+  /// itself. The queue is serial, so the task ends only after the cancel
+  /// returned. A foreground return during the wait cancels too; the next
+  /// tick starts a fresh cycle.
   private func finishFlushWait() {
     guard let end = endFlushWait else { return }
     endFlushWait = nil
     flushTimeout?.cancel()
     flushTimeout = nil
     let lockDue = Self.vaultUnlocked && AutoLockCache.seconds == 0
+    if !lockDue { cancelSync() }
     let send = self.sendEvent
     endLockSession {
       send("onLockSessionEnded", [:])

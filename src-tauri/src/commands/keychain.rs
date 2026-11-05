@@ -333,8 +333,13 @@ impl memlore_engine::vault::VaultPlatformHooks for DesktopVaultHooks {
         conn: &rusqlite::Connection,
         session_id: &str,
     ) -> Option<Result<(), String>> {
-        crate::commands::pending_drive_session::consume(session_id)
-            .map(|pending| crate::commands::gdrive::persist_connect_settings(conn, &pending))
+        crate::commands::pending_drive_session::consume(session_id).map(|pending| {
+            memlore_engine::sync::connect::persist_connect_settings(
+                conn,
+                &pending,
+                &crate::commands::sync::DesktopCredentialStore,
+            )
+        })
     }
 }
 

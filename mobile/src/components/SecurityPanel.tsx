@@ -1,9 +1,11 @@
-import { useState } from 'react';
-import { ActivityIndicator, Pressable, Switch, Text, View } from 'react-native';
+import { useRef, useState } from 'react';
+import { ActivityIndicator, Alert, Pressable, Switch, Text, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import type { AutoLockSeconds, BiometricKind } from '@/modules/memlore-core';
 import { ErrorText, errorMessage } from '@/src/components/ErrorText';
+import { PasswordSheet } from '@/src/components/PasswordSheet';
+import { useSync } from '@/src/hooks/useSync';
 import type { useVault } from '@/src/hooks/useVault';
 import { type AuthKey, t } from '@/src/i18n';
 
@@ -22,8 +24,8 @@ export function biometricName(kind: BiometricKind): string {
 }
 
 /**
- * Face ID/Touch ID and the auto-lock interval. Rendered in the Settings tab,
- * behind the unlocked guard, so a lock unmounts it.
+ * Face ID/Touch ID, the auto-lock interval and deleting this phone's vault.
+ * Rendered in the Settings tab, behind the unlocked guard, so a lock unmounts it.
  */
 export function SecurityPanel({ vault }: { vault: Vault }) {
   return (
@@ -51,6 +53,74 @@ export function SecurityPanel({ vault }: { vault: Vault }) {
         })}
       </View>
       <ErrorText message={errorMessage(vault.error)} />
+      <DeleteVaultRow />
+    </>
+  );
+}
+
+/**
+ * Deletes this phone's vault: a confirmation that says everything on this
+ * phone goes, with the entries Drive does not hold yet (or that nothing is
+ * synced), then the password. On success the app shows the first-launch
+ * screen (`useSync().deleteVault`).
+ */
+function DeleteVaultRow() {
+  const sync = useSync();
+  const [sheetOpen, setSheetOpen] = useState(false);
+  // The confirmation's text, also the password sheet's warning.
+  const [warning, setWarning] = useState(() => t('mobile.delete_vault.body'));
+  // A second tap while Drive is read must not stack a second confirmation.
+  const confirming = useRef(false);
+
+  /** The body, plus what sync has not saved; the body alone if Drive cannot be read. */
+  async function readWarning(): Promise<string> {
+    const body = t('mobile.delete_vault.body');
+    try {
+      const drive = await sync.driveStatus();
+      if (!drive.connected) return `${body}\n\n${t('mobile.delete_vault.not_synced')}`;
+      const count = drive.pendingCount;
+      return count > 0 ? `${body}\n\n${t('mobile.delete_vault.pending', { count })}` : body;
+    } catch {
+      return body;
+    }
+  }
+
+  async function confirm() {
+    if (confirming.current) return;
+    confirming.current = true;
+    const text = await readWarning();
+    confirming.current = false;
+    setWarning(text);
+    Alert.alert(t('mobile.delete_vault.title'), text, [
+      { text: t('common:confirm_dialog.cancel'), style: 'cancel' },
+      {
+        text: t('mobile.delete_vault.confirm'),
+        style: 'destructive',
+        onPress: () => setSheetOpen(true),
+      },
+    ]);
+  }
+
+  return (
+    <>
+      <Pressable
+        testID="delete-vault"
+        accessibilityRole="button"
+        onPress={() => void confirm()}
+        style={styles.dangerButton}
+      >
+        <Text style={styles.dangerLabel}>{t('mobile.delete_vault.row')}</Text>
+      </Pressable>
+      <PasswordSheet
+        visible={sheetOpen}
+        title={t('mobile.delete_vault.sheet_title')}
+        description={t('mobile.delete_vault.sheet_description')}
+        warning={warning}
+        placeholder={t('lock.password_placeholder')}
+        submitLabel={t('mobile.delete_vault.submit')}
+        onSubmit={(password) => sync.deleteVault(password)}
+        onClose={() => setSheetOpen(false)}
+      />
     </>
   );
 }
@@ -152,6 +222,21 @@ const styles = StyleSheet.create((theme) => ({
     borderColor: selected ? theme.colors.accent : theme.colors.borderDefault,
     backgroundColor: selected ? theme.colors.accent : theme.colors.elevated,
   }),
+  // The delete row's destructive button.
+  dangerButton: {
+    alignItems: 'center',
+    marginTop: theme.space(3),
+    paddingVertical: theme.space(3),
+    borderWidth: 1,
+    borderRadius: theme.radii.button,
+    borderColor: theme.colors.dangerBorder,
+    backgroundColor: theme.colors.dangerBg,
+  },
+  dangerLabel: {
+    fontSize: 17,
+    fontWeight: '600',
+    color: theme.colors.dangerText,
+  },
   pillLabel: (selected: boolean) => ({
     fontSize: 15,
     fontWeight: selected ? '600' : '400',

@@ -3,7 +3,7 @@
 //! Google Drive keeps its OAuth two-phase flow in [`crate::commands::gdrive`].
 //! This module owns the filesystem-provider entry points: a TCC-safe
 //! availability probe and `cloud_folder_connect`, which then joins the
-//! shared [`crate::commands::gdrive::complete_cloud_connect`] pipeline.
+//! shared [`memlore_engine::sync::connect::complete_cloud_connect`] pipeline.
 
 use std::path::{Path, PathBuf};
 
@@ -251,11 +251,13 @@ pub async fn cloud_folder_connect<R: Runtime>(
         root_path: root.to_string_lossy().into_owned(),
     };
 
-    crate::commands::gdrive::complete_cloud_connect(
-        &app,
+    memlore_engine::sync::connect::complete_cloud_connect(
+        &crate::commands::gdrive::DesktopConnectHooks {
+            app: Some(&app),
+            session_state: &session_state,
+        },
         &*state,
         &*key_state,
-        &*session_state,
         &session_id,
         CloudProvider::Folder(
             LocalSyncProvider::new(root).with_recovery_fence(local_generation, None),

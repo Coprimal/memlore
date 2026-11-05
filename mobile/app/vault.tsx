@@ -1,5 +1,13 @@
+import { useRouter } from 'expo-router';
 import { type ReactNode, useEffect, useState } from 'react';
-import { ActivityIndicator, KeyboardAvoidingView, ScrollView, Text, TextInput } from 'react-native';
+import {
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Pressable,
+  ScrollView,
+  Text,
+  TextInput,
+} from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { ActionButton } from '@/src/components/ActionButton';
@@ -67,6 +75,7 @@ export default function VaultScreen() {
 }
 
 function CreateVault({ vault }: { vault: Vault }) {
+  const router = useRouter();
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [invalid, setInvalid] = useState<string | null>(null);
@@ -114,6 +123,16 @@ function CreateVault({ vault }: { vault: Vault }) {
         disabled={vault.busy}
         onPress={submit}
       />
+      {/* Joins the vault another device syncs to Google Drive (app/onboard.tsx). */}
+      <Pressable
+        testID="onboard-start"
+        accessibilityRole="button"
+        disabled={vault.busy}
+        onPress={() => router.push('/onboard')}
+        style={styles.secondaryButton}
+      >
+        <Text style={styles.secondaryLabel}>{t('mobile.onboard.start')}</Text>
+      </Pressable>
     </>
   );
 }
@@ -270,5 +289,13 @@ const styles = StyleSheet.create((theme, rt) => ({
   error: {
     fontSize: 15,
     color: theme.colors.dangerText,
+  },
+  secondaryButton: {
+    alignItems: 'center',
+    paddingVertical: theme.space(3),
+  },
+  secondaryLabel: {
+    fontSize: 17,
+    color: theme.colors.accentText,
   },
 }));

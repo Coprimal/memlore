@@ -13,6 +13,7 @@ use memlore_engine::ops::entries::{
     update_entry_emotion_impl, update_entry_impl,
 };
 use memlore_engine::ops::guards::validate_emotion;
+use memlore_engine::sync::engine::reset_session_own_cloud_reconciled;
 
 use crate::organize::TagFfi;
 use crate::{
@@ -288,27 +289,31 @@ impl MemloreEngine {
     /// Delete an entry of [`Self::list_trash`] for good; anything else is
     /// `NotFound`. A locked entry only when revealed: the engine purges a
     /// Covered view as Hidden (`purge_view`). The impl unlinks its media
-    /// files once the purge commits.
-    // TODO(later): M2 must re-arm reset_session_own_cloud_reconciled after a purge (docs/LATER.md "Mobile M3a notes")
+    /// files once the purge commits, and the next automatic sync sweeps its
+    /// orphaned cloud media (the own-cloud prune is re-armed, as on desktop).
     pub fn purge_entry(&self, id: String) -> Result<(), MemloreError> {
         self.with_scope(|conn, scope| {
             purge_entry_impl(conn, &id, scope.view, scope.vault.as_deref())
                 .map(drop)
                 .map_err(trash_err)
-        })
+        })?;
+        reset_session_own_cloud_reconciled();
+        Ok(())
     }
 
     /// Delete for good the confirmed `ids` that [`Self::list_trash`] still
     /// shows readably; any other id is skipped (a Covered locked row too, as
     /// for [`Self::purge_entry`]). Returns how many were deleted. The impl
-    /// unlinks their media files once the purge commits.
-    // TODO(later): M2 must re-arm reset_session_own_cloud_reconciled after a purge (docs/LATER.md "Mobile M3a notes")
+    /// unlinks their media files once the purge commits; a purge re-arms
+    /// the own-cloud prune, like [`Self::purge_entry`].
     pub fn empty_trash(&self, ids: Vec<String>) -> Result<u32, MemloreError> {
-        self.with_scope(|conn, scope| {
-            let purged =
-                empty_trash_impl(conn, &ids, scope.view, scope.vault.as_deref()).map_err(io)?;
-            Ok(u32::try_from(purged).unwrap_or(u32::MAX))
-        })
+        let purged = self.with_scope(|conn, scope| {
+            empty_trash_impl(conn, &ids, scope.view, scope.vault.as_deref()).map_err(io)
+        })?;
+        if purged > 0 {
+            reset_session_own_cloud_reconciled();
+        }
+        Ok(u32::try_from(purged).unwrap_or(u32::MAX))
     }
 }
 

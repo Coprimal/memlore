@@ -3,6 +3,10 @@
 //! `memlore_engine::vault::biometric`). `MobileVaultHooks` forwards the
 //! engine's os_kek hooks to an [`OsKeyStore`].
 //!
+//! The Google Drive refresh token lives here too ([`DriveTokenStore`]), never
+//! in the vault DB: `MobileCredentialStore` (`sync.rs`) reads and writes it
+//! through this store.
+//!
 //! On iOS the item lives in the Keychain under the same identity and access
 //! control as the desktop's macOS item (`src-tauri/src/commands/keychain.rs`,
 //! `mod platform`). Host builds (tests, `cargo check`) have no keystore. No
@@ -39,6 +43,29 @@ pub(crate) fn default_keystore() -> Arc<dyn OsKeyStore> {
     }
 }
 
+/// Where the Google Drive refresh token is kept. Crate-internal like
+/// [`OsKeyStore`]: Swift and JS never see the token.
+pub(crate) trait DriveTokenStore: Send + Sync {
+    /// The stored token, `None` when there is none.
+    fn load(&self) -> Result<Option<Zeroizing<String>>, String>;
+    /// Store `token`, replacing any existing item.
+    fn store(&self, token: &str) -> Result<(), String>;
+    /// Remove the item. Idempotent: a missing item is not an error.
+    fn remove(&self) -> Result<(), String>;
+}
+
+/// The token store of the platform this build runs on.
+pub(crate) fn default_token_store() -> Arc<dyn DriveTokenStore> {
+    #[cfg(target_os = "ios")]
+    {
+        Arc::new(ios::IosDriveToken)
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        Arc::new(UnavailableTokenStore)
+    }
+}
+
 #[cfg(target_os = "ios")]
 mod ios {
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
@@ -48,7 +75,7 @@ mod ios {
     };
     use zeroize::Zeroizing;
 
-    use super::{OsKekError, OsKeyStore};
+    use super::{DriveTokenStore, OsKekError, OsKeyStore};
 
     /// Same item as the desktop (`KEYCHAIN_SERVICE` / `KEYCHAIN_ACCOUNT`).
     const KEYCHAIN_SERVICE: &str = "com.memlore.encryption-key";
@@ -126,6 +153,68 @@ mod ios {
             }
         }
     }
+
+    const DRIVE_TOKEN_SERVICE: &str = "app.memlore.mobile.gdrive";
+    const DRIVE_TOKEN_ACCOUNT: &str = "refresh-token";
+    const DRIVE_TOKEN_LABEL: &str = "Memlore Google Drive sign-in";
+
+    /// The Drive refresh token as an iOS Keychain generic password: readable
+    /// after the first unlock since boot (background sync, M2c), never
+    /// migrated to another device, not synchronizable, and no user presence
+    /// or biometry needed to read it.
+    pub(super) struct IosDriveToken;
+
+    /// Every call addresses the not-synchronizable store only.
+    fn token_options() -> PasswordOptions {
+        let mut options =
+            PasswordOptions::new_generic_password(DRIVE_TOKEN_SERVICE, DRIVE_TOKEN_ACCOUNT);
+        options.set_access_synchronized(Some(false));
+        options
+    }
+
+    impl DriveTokenStore for IosDriveToken {
+        fn load(&self) -> Result<Option<Zeroizing<String>>, String> {
+            match generic_password(token_options()) {
+                Ok(bytes) => {
+                    let bytes = Zeroizing::new(bytes);
+                    std::str::from_utf8(&bytes)
+                        .map(|t| Some(Zeroizing::new(t.to_string())))
+                        .map_err(|_| "Drive token item is not UTF-8".to_string())
+                }
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+                Err(e) => Err(format!("Failed to read the Drive token from Keychain: {e}")),
+            }
+        }
+
+        fn store(&self, token: &str) -> Result<(), String> {
+            // Delete-then-add, like the os_kek: an update would keep the old
+            // item's attributes.
+            self.remove()?;
+            let mut options = token_options();
+            // The safe API has no `kSecAttrAccessible` setter, so the
+            // protection class rides on a `SecAccessControl` with NO
+            // constraint flags: no user presence, no biometry.
+            let access = SecAccessControl::create_with_protection(
+                Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+                0,
+            )
+            .map_err(|e| format!("Failed to create access control: {e}"))?;
+            options.set_access_control(access);
+            options.set_label(DRIVE_TOKEN_LABEL);
+            set_generic_password_options(token.as_bytes(), options)
+                .map_err(|e| format!("Failed to store the Drive token in Keychain: {e}"))
+        }
+
+        fn remove(&self) -> Result<(), String> {
+            match delete_generic_password_options(token_options()) {
+                Ok(()) => Ok(()),
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+                Err(e) => Err(format!(
+                    "Failed to remove the Drive token from Keychain: {e}"
+                )),
+            }
+        }
+    }
 }
 
 /// Host builds: no keystore, so the engine never offers biometric unlock.
@@ -179,6 +268,49 @@ impl OsKeyStore for MemoryKeyStore {
 
     fn remove(&self) -> Result<(), String> {
         *self.key.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
+/// Host builds: no Keychain. Nothing is stored, so Drive never connects.
+#[cfg(not(target_os = "ios"))]
+struct UnavailableTokenStore;
+
+#[cfg(not(target_os = "ios"))]
+impl DriveTokenStore for UnavailableTokenStore {
+    fn load(&self) -> Result<Option<Zeroizing<String>>, String> {
+        Ok(None)
+    }
+
+    fn store(&self, _token: &str) -> Result<(), String> {
+        Err("Google Drive sign-in is not available on this platform".to_string())
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// In-memory token store for the inline tests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MemoryTokenStore {
+    token: std::sync::Mutex<Option<Zeroizing<String>>>,
+}
+
+#[cfg(test)]
+impl DriveTokenStore for MemoryTokenStore {
+    fn load(&self) -> Result<Option<Zeroizing<String>>, String> {
+        Ok(self.token.lock().unwrap().clone())
+    }
+
+    fn store(&self, token: &str) -> Result<(), String> {
+        *self.token.lock().unwrap() = Some(Zeroizing::new(token.to_string()));
+        Ok(())
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        *self.token.lock().unwrap() = None;
         Ok(())
     }
 }

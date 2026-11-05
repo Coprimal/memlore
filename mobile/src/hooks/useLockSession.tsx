@@ -56,8 +56,9 @@ export function useLockSession(): LockSession {
 }
 
 /**
- * The provider's state. `generation` changes whenever `revealed` or
- * `vaultOpen` does: lists refetch on it, an open locked entry pops.
+ * The provider's state. `generation` changes whenever `revealed`,
+ * `vaultOpen`, `enabled` or `showExistence` does (the lock view changed):
+ * lists refetch on it, an open locked entry pops.
  * Actions reject with the module's error (`errorCode(e)`: ERR_WRONG_PASSWORD,
  * ERR_FORMAT, ERR_SECOND_LOCK_REQUIRED…); ERR_LOCKED also shows the lock
  * screen. Passwords are passed through, never stored or logged.
@@ -77,7 +78,14 @@ function useLockSessionState() {
   function apply(next: LockState) {
     const prev = current.current;
     current.current = next;
-    if (prev.revealed !== next.revealed || prev.vaultOpen !== next.vaultOpen) {
+    // `enabled` and `showExistence` pick the engine's view too (Hidden or
+    // Covered): a sync that pulled a peer's change must refetch the lists.
+    // Not on the first read: the lists already read in the engine's view, and
+    // a refetch then would blank them once at every unlock.
+    const viewChanged =
+      prev !== CLOSED &&
+      (prev.enabled !== next.enabled || prev.showExistence !== next.showExistence);
+    if (prev.revealed !== next.revealed || prev.vaultOpen !== next.vaultOpen || viewChanged) {
       setGeneration((g) => g + 1);
     }
     setState(next);
@@ -192,10 +200,16 @@ function useLockSessionState() {
     const ended = MemloreCore.addListener('onLockSessionEnded', () => {
       void endSession();
     });
+    // A sync may have pulled the lock settings (a peer's password, show
+    // existence, minutes): the first read after onboarding predates them.
+    const synced = MemloreCore.addListener('onSyncStatus', (body) => {
+      if (!body.running) void refresh();
+    });
     return () => {
       alive.current = false;
       appState.remove();
       ended.remove();
+      synced.remove();
     };
   }, []);
 

@@ -1,8 +1,8 @@
 //! Google OAuth 2.0 PKCE helpers for the Google Drive sync provider.
 //!
-//! Desktop apps (macOS) use the PKCE flow with a loopback redirect URI.
-//! No `client_secret` is used — per Google documentation, installed/desktop
-//! apps must omit `client_secret` from token requests.
+//! Desktop apps (macOS) use the PKCE flow with a loopback redirect URI and
+//! send a `client_secret` (see `PLACEHOLDER_CLIENT_SECRET`). Google's
+//! installed-app clients (iOS) have no secret and omit the field.
 //!
 //! # Client ID provisioning
 //!
@@ -124,6 +124,65 @@ pub fn build_authorization_url(
 pub struct AuthCallback {
     pub code: String,
     pub state: String,
+}
+
+/// Parse the one-time redirect a mobile OAuth session hands back
+/// (`com.googleusercontent.apps.<id>:/oauth2redirect?state=...&code=...`) and
+/// return the authorization code.
+///
+/// Refuses anything that is not exactly one well-formed callback for
+/// `expected_redirect` with exactly one `state` equal to `expected_state`,
+/// no `error`, and exactly one non-empty `code`. Error messages are fixed
+/// strings: they never echo the URL or any value the provider sent, and the
+/// URL is never logged (it carries the one-time code).
+#[doc(hidden)]
+pub fn parse_redirect_callback(
+    callback_url: &str,
+    expected_state: &str,
+    expected_redirect: &str,
+) -> Result<String, String> {
+    const INVALID: &str = "Invalid sign-in callback";
+    let expected = Url::parse(expected_redirect).map_err(|_| INVALID.to_string())?;
+    let url = Url::parse(callback_url).map_err(|_| INVALID.to_string())?;
+    if url.scheme() != expected.scheme()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str() != expected.host_str()
+        || url.port() != expected.port()
+        || url.path() != expected.path()
+        || url.fragment().is_some()
+    {
+        return Err(INVALID.to_string());
+    }
+
+    let mut state: Option<String> = None;
+    let mut code: Option<String> = None;
+    let mut error = false;
+    for (key, value) in url.query_pairs() {
+        let slot = match key.as_ref() {
+            "error" => {
+                error = true;
+                continue;
+            }
+            "state" => &mut state,
+            "code" => &mut code,
+            _ => continue,
+        };
+        if slot.replace(value.into_owned()).is_some() {
+            return Err(INVALID.to_string());
+        }
+    }
+    // State first: a callback that is not ours never gets a specific answer.
+    if state.as_deref() != Some(expected_state) {
+        return Err(INVALID.to_string());
+    }
+    if error {
+        return Err("Google sign-in was cancelled or refused".to_string());
+    }
+    match code {
+        Some(code) if !code.is_empty() => Ok(code),
+        _ => Err(INVALID.to_string()),
+    }
 }
 
 /// Bind a TCP listener on `127.0.0.1:0` and return it along with the
@@ -339,12 +398,12 @@ fn ensure_appdata_scope(scope: Option<&str>) -> Result<(), String> {
 /// `token_url` is parameterized for testing (wiremock).
 ///
 /// `client_secret` is required by Google's Desktop-app OAuth flow — see
-/// the `PLACEHOLDER_CLIENT_SECRET` doc comment for why. Pass an empty
-/// string only if you know your client type doesn't need one (Android, iOS,
-/// Chrome apps — not applicable to Memlore).
+/// the `PLACEHOLDER_CLIENT_SECRET` doc comment for why — so desktop passes
+/// `Some`. Google's installed-app clients (iOS) have no secret: pass `None`
+/// and the `client_secret` field is left out of the form body.
 pub async fn exchange_code(
     client_id: &str,
-    client_secret: &str,
+    client_secret: Option<&str>,
     code: &str,
     verifier: &PkceVerifier,
     redirect_uri: &str,
@@ -355,14 +414,16 @@ pub async fn exchange_code(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let params = [
+    let mut params = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("client_id", client_id),
-        ("client_secret", client_secret),
-        ("code_verifier", &verifier.0),
-        ("redirect_uri", redirect_uri),
     ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
+    params.push(("code_verifier", &verifier.0));
+    params.push(("redirect_uri", redirect_uri));
 
     let resp = client
         .post(&config.token_url)
@@ -394,12 +455,14 @@ pub async fn exchange_code(
 /// Refresh an access token using a refresh token.
 ///
 /// Desktop app OAuth clients on Google must send `client_secret` — see
-/// `PLACEHOLDER_CLIENT_SECRET` doc comment. (Google's docs list Android /
-/// iOS / Chrome as exempt from this requirement, but Desktop is NOT in the
-/// exempt list.)
+/// `PLACEHOLDER_CLIENT_SECRET` doc comment — so desktop passes `Some`.
+/// (Google's docs list Android / iOS / Chrome as exempt from this
+/// requirement, but Desktop is NOT in the exempt list.) Google's
+/// installed-app clients (iOS) have no secret: pass `None` and the
+/// `client_secret` field is left out of the form body.
 pub async fn refresh_access_token(
     client_id: &str,
-    client_secret: &str,
+    client_secret: Option<&str>,
     refresh_token: &str,
     config: &GoogleOAuthConfig,
 ) -> Result<TokenResponse, String> {
@@ -408,12 +471,14 @@ pub async fn refresh_access_token(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let params = [
+    let mut params = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", client_id),
-        ("client_secret", client_secret),
     ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
 
     let resp = client
         .post(&config.token_url)
@@ -481,6 +546,68 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ─── Mobile redirect callback (hostile input) ──────────────────────────
+
+    #[test]
+    fn redirect_callback_accepts_only_one_well_formed_callback() {
+        let redirect = "com.googleusercontent.apps.test:/oauth2redirect";
+        let ok = parse_redirect_callback(
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&code=c1&scope=x",
+            "s1",
+            redirect,
+        );
+        assert_eq!(ok.as_deref(), Ok("c1"));
+
+        let refused = [
+            // state mismatch
+            "com.googleusercontent.apps.test:/oauth2redirect?state=other&code=c1",
+            // missing state
+            "com.googleusercontent.apps.test:/oauth2redirect?code=c1",
+            // user cancelled / Google refused
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&error=access_denied",
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&code=c1&error=x",
+            // missing or empty code
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1",
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&code=",
+            // duplicate parameters
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&code=c1&code=c2",
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1&state=s1&code=c1",
+            // foreign scheme, host or path
+            "com.googleusercontent.apps.evil:/oauth2redirect?state=s1&code=c1",
+            "memlore://oauth2redirect?state=s1&code=c1",
+            "com.googleusercontent.apps.test:/other?state=s1&code=c1",
+            "https://example.com/oauth2redirect?state=s1&code=c1",
+            // fragment, userinfo, explicit port
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s1#code=c1",
+            "com.googleusercontent.apps.test://user@/oauth2redirect?state=s1&code=c1",
+            "com.googleusercontent.apps.test://host:1/oauth2redirect?state=s1&code=c1",
+            // an error with a foreign state gets no specific answer
+            "com.googleusercontent.apps.test:/oauth2redirect?state=other&error=access_denied",
+            // not a URL
+            "not a url",
+        ];
+        for url in refused {
+            let err = parse_redirect_callback(url, "s1", redirect)
+                .expect_err(&format!("must refuse {url}"));
+            // Never echo provider-supplied text back to the caller.
+            assert!(!err.contains("access_denied"), "{err}");
+            assert!(!err.contains("c1") && !err.contains("other"), "{err}");
+        }
+        let foreign = parse_redirect_callback(
+            "com.googleusercontent.apps.test:/oauth2redirect?state=other&error=access_denied",
+            "s1",
+            redirect,
+        );
+        assert_eq!(foreign, Err("Invalid sign-in callback".to_string()));
+        // Percent-encoding is decoded before the comparison.
+        let encoded = parse_redirect_callback(
+            "com.googleusercontent.apps.test:/oauth2redirect?state=s%31&code=c%2F1",
+            "s1",
+            redirect,
+        );
+        assert_eq!(encoded.as_deref(), Ok("c/1"));
+    }
 
     // ─── PKCE tests ─────────────────────────────────────────────────────────
 
@@ -708,7 +835,7 @@ mod tests {
         let (verifier, _) = generate_pkce();
         let result = exchange_code(
             "test-client-id",
-            "test-client-secret",
+            Some("test-client-secret"),
             "testcode123",
             &verifier,
             "http://127.0.0.1:54321",
@@ -744,7 +871,7 @@ mod tests {
         let (verifier, _) = generate_pkce();
         let err = exchange_code(
             "cid",
-            "sec",
+            Some("sec"),
             "code",
             &verifier,
             "http://127.0.0.1:1",
@@ -782,9 +909,14 @@ mod tests {
             revoke_url: format!("{}/revoke", mock_server.uri()),
         };
 
-        let result = refresh_access_token("test-client", "test-secret", "myrefreshtoken", &config)
-            .await
-            .unwrap();
+        let result = refresh_access_token(
+            "test-client",
+            Some("test-secret"),
+            "myrefreshtoken",
+            &config,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.access_token, "ya29.refreshed");
         assert!(
             result.refresh_token.is_none(),
@@ -808,7 +940,7 @@ mod tests {
             revoke_url: format!("{}/revoke", mock_server.uri()),
         };
 
-        let err = refresh_access_token("cid", "sec", "bad-refresh-token", &config)
+        let err = refresh_access_token("cid", Some("sec"), "bad-refresh-token", &config)
             .await
             .unwrap_err();
         assert!(err.contains("Auth:"), "expected Auth error, got: {err}");
@@ -841,7 +973,7 @@ mod tests {
             revoke_url: format!("{}/revoke", mock_server.uri()),
         };
 
-        let err = refresh_access_token("cid", "sec", "revoked-refresh-token", &config)
+        let err = refresh_access_token("cid", Some("sec"), "revoked-refresh-token", &config)
             .await
             .unwrap_err();
         assert!(
@@ -852,6 +984,70 @@ mod tests {
             err.contains("Reconnect to Google Drive"),
             "expected user-facing action hint, got: {err}"
         );
+    }
+
+    // ─── exact token-request form bodies ─────────────────────────────────────
+
+    /// Pins the exact urlencoded body of both token requests. The desktop
+    /// body (with a secret) is frozen: shipped desktop OAuth clients send it
+    /// byte for byte. Installed-app clients (iOS) have no secret, so `None`
+    /// must omit the `client_secret` key entirely.
+    #[tokio::test]
+    async fn token_requests_send_exact_form_body() {
+        let cases: [(Option<&str>, &str, &str); 2] = [
+            (
+                Some("test-client-secret"),
+                "grant_type=authorization_code&code=testcode123&client_id=test-client-id&client_secret=test-client-secret&code_verifier=fixed-verifier&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321",
+                "grant_type=refresh_token&refresh_token=myrefreshtoken&client_id=test-client-id&client_secret=test-client-secret",
+            ),
+            (
+                None,
+                "grant_type=authorization_code&code=testcode123&client_id=test-client-id&code_verifier=fixed-verifier&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321",
+                "grant_type=refresh_token&refresh_token=myrefreshtoken&client_id=test-client-id",
+            ),
+        ];
+        for (secret, want_exchange, want_refresh) in cases {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "ya29.test-access-token",
+                    "refresh_token": "1//test-refresh-token",
+                    "expires_in": 3600,
+                    "scope": DRIVE_APPDATA_SCOPE,
+                    "token_type": "Bearer"
+                })))
+                .mount(&mock_server)
+                .await;
+            let config = GoogleOAuthConfig {
+                auth_url: format!("{}/auth", mock_server.uri()),
+                token_url: format!("{}/token", mock_server.uri()),
+                revoke_url: format!("{}/revoke", mock_server.uri()),
+            };
+
+            exchange_code(
+                "test-client-id",
+                secret,
+                "testcode123",
+                &PkceVerifier("fixed-verifier".to_string()),
+                "http://127.0.0.1:54321",
+                &config,
+            )
+            .await
+            .unwrap();
+            refresh_access_token("test-client-id", secret, "myrefreshtoken", &config)
+                .await
+                .unwrap();
+
+            let bodies: Vec<String> = mock_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| String::from_utf8(r.body.clone()).unwrap())
+                .collect();
+            assert_eq!(bodies, [want_exchange, want_refresh]);
+        }
     }
 
     // ─── revoke_token ────────────────────────────────────────────────────────
@@ -987,7 +1183,7 @@ mod tests {
         let (verifier, _) = generate_pkce();
         let err = exchange_code(
             "cid",
-            "sec",
+            Some("sec"),
             "code",
             &verifier,
             "http://127.0.0.1:1",
@@ -1022,7 +1218,7 @@ mod tests {
             revoke_url: format!("{}/revoke", mock_server.uri()),
         };
 
-        let err = refresh_access_token("cid", "sec", "old-refresh", &config)
+        let err = refresh_access_token("cid", Some("sec"), "old-refresh", &config)
             .await
             .unwrap_err();
         assert!(

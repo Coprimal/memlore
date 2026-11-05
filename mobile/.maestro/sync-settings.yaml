@@ -1,0 +1,100 @@
+# Sync without Google (M2a phase 7.6): a new vault shows Settings > Sync
+# disconnected ("Connect Google Drive", no account); pull-to-refresh with no
+# Drive is harmless; deleting the phone vault with its password goes back to
+# the first-launch screen ("I already use Memlore on another device").
+# No Google sign-in: STOP 2 covers the connected states by hand.
+#
+# Runs against the Release simulator build (see vault-create-unlock.yaml).
+appId: app.memlore.mobile
+---
+- launchApp:
+    clearState: true
+
+# First launch: create the vault.
+- extendedWaitUntil:
+    visible:
+      id: backup-notice
+    timeout: 15000
+- tapOn:
+    id: password-input
+- inputText: "12345678"
+- tapOn:
+    id: confirm-password-input
+- inputText: "12345678"
+- tapOn:
+    id: create-vault-button
+- extendedWaitUntil:
+    visible:
+      id: recovery-phrase
+    timeout: 30000
+- tapOn:
+    id: phrase-saved-button
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+    timeout: 15000
+
+# Settings > Sync: not connected, so "Connect Google Drive" and no account.
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: sync-connect
+    direction: DOWN
+    centerElement: true
+- assertVisible:
+    id: sync-panel
+- assertNotVisible:
+    id: sync-account
+- assertNotVisible:
+    id: sync-disconnect
+
+# Entries: pull to refresh with no Drive ends by itself; the list stays.
+- tapOn:
+    id: entries-tab
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+    timeout: 10000
+- swipe:
+    start: "50%,30%"
+    end: "50%,80%"
+    duration: 800
+- extendedWaitUntil:
+    visible:
+      id: entry-count
+      text: "0 entries"
+    timeout: 10000
+- assertVisible:
+    id: new-entry-button
+
+# Settings > Security: delete this phone's vault (confirm, then the password).
+- tapOn:
+    id: settings-tab
+- scrollUntilVisible:
+    element:
+      id: delete-vault
+    direction: DOWN
+    centerElement: true
+- tapOn:
+    id: delete-vault
+- tapOn: "Delete"
+- extendedWaitUntil:
+    visible:
+      id: password-sheet-input
+    timeout: 5000
+- tapOn:
+    id: password-sheet-input
+- inputText: "12345678"
+- tapOn:
+    id: password-sheet-submit
+
+# First launch again: the create screen with "I already use Memlore".
+- extendedWaitUntil:
+    visible:
+      id: onboard-start
+    timeout: 20000
+- assertVisible:
+    id: create-vault-button
+- assertNotVisible:
+    id: settings-tab

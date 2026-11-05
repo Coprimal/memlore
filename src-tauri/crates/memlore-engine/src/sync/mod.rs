@@ -7,10 +7,18 @@
 //! There are no Tauri commands and no provider implementations here — the
 //! `LocalSyncProvider` and the `useSync` hook land in Chunk 3c.
 
+#[doc(hidden)]
+pub mod cloud_config;
 pub mod cloud_provider;
+#[doc(hidden)]
+pub mod connect;
+#[doc(hidden)]
+pub mod cycle;
 pub mod embedding_sync;
 pub mod engine;
 pub mod entry_sync;
+#[doc(hidden)]
+pub mod force_re_pair;
 pub mod gdrive_oauth;
 pub mod gdrive_provider;
 #[cfg(any(test, feature = "test-support"))]
@@ -18,6 +26,8 @@ pub mod gdrive_provider;
 pub mod golden_fixtures;
 pub mod guard;
 pub(crate) mod index_sync;
+#[doc(hidden)]
+pub mod keyring_publish;
 pub mod keyring_v2;
 pub mod local_keyring_v2;
 pub mod local_provider;
@@ -25,10 +35,18 @@ pub mod media_cache;
 pub mod media_sync;
 pub mod metadata;
 pub mod outbox_import;
+#[doc(hidden)]
+pub mod pending_session;
+#[doc(hidden)]
+pub mod platform;
 pub mod provider;
 pub mod recovery;
 pub mod rotation;
 pub mod safety;
+#[doc(hidden)]
+pub mod schedule;
+#[doc(hidden)]
+pub mod stall_guard;
 pub mod sync_control;
 pub mod version_sync;
 
