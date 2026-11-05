@@ -25,7 +25,8 @@ import os
 /// A background task (M2c, `BackgroundPrefetch.swift`) runs the same walk
 /// through `prefetchInBackground` with a deadline, one walk at a time. A
 /// foreground `prepare` stops it and keeps any new one from starting while
-/// it waits; neither touches the bookmark.
+/// it waits; a pick stops it too. A walk never drops the bookmark; it may
+/// refresh a stale one (same folder, guarded by `isCurrent`).
 final class ICloudFolder: FolderAccess, @unchecked Sendable {
   static let shared = ICloudFolder()
 
@@ -48,7 +49,8 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
     var next: UInt64 = 0
     /// The reserved walk, running or waiting for `queue`.
     var active: UInt64?
-    /// `cancelBackground` asked the active walk to stop.
+    /// `cancelBackground`, a foreground `prepare` or a pick asked the active
+    /// walk to stop. Reset when a walk is reserved and when it is released.
     var stopped = false
     /// The active walk holds `queue`.
     var walking = false
@@ -57,6 +59,9 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
   }
 
   private let background = OSAllocatedUnfairLock(initialState: Background())
+
+  /// The background walk's summary line (M2c); foreground lines use NSLog.
+  private static let log = Logger(subsystem: "app.memlore.mobile", category: "background")
 
   /// The URL whose security scope is open. Only touched on `queue`.
   private var scoped: URL?
@@ -132,10 +137,11 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
   /// The walk `prepare` does (resolve, scope, prefetch, wait), from a
   /// background task, for the `walk` `reserveBackground` returned: it stops
   /// at `deadline`, at a `forget`, at its own `cancelBackground` or when a
-  /// foreground `prepare` comes. True when it finished before any of them;
+  /// foreground `prepare` or a pick comes. True when it finished before any of them;
   /// false when it stopped, or the folder is gone or unreadable. It never
-  /// touches `pending` and never removes the bookmark. Blocks: call it off
-  /// the main thread.
+  /// touches `pending`, and never drops the bookmark; it may refresh a stale
+  /// one (same folder, guarded by `isCurrent`). Blocks: call it off the main
+  /// thread.
   func prefetchInBackground(_ walk: UInt64, until deadline: Date) -> Bool {
     // Outside `queue.sync`, so a walk refused at the start releases it too.
     defer {
@@ -148,11 +154,17 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
     }
     let started = forgotten.withLock { $0 }
     let begin = Date()
+    // Latched by `keepGoing`, which only ever turns false: a `.gone` walk
+    // that saw it fail stopped, one that didn't found the folder gone.
+    var halted = false
     let keepGoing = {
-      self.isCurrent(started) && Date() < deadline
+      let going =
+        self.isCurrent(started) && Date() < deadline
         && self.background.withLock {
           $0.active == walk && !$0.stopped && $0.foregroundWaiting == 0
         }
+      if !going { halted = true }
+      return going
     }
     return queue.sync {
       guard keepGoing() else { return false }
@@ -164,13 +176,18 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
       let outcome: String
       switch result {
       case .ready: outcome = "finished"
-      case _ where !keepGoing(): outcome = "stopped"
       case .unreadable: outcome = "unreadable"
-      case .gone: outcome = "gone"
+      case .gone: outcome = halted ? "stopped" : "gone"
       }
-      NSLog(
-        "[ICloudFolder] background walk …/%@: %@, %ld downloads started, %ld refused, %.1f s",
-        stats.folder ?? "-", outcome, stats.kicked, stats.refused, Date().timeIntervalSince(begin))
+      let folder = stats.folder ?? "-"
+      let (kicked, refused) = (stats.kicked, stats.refused)
+      let elapsed = Date().timeIntervalSince(begin)
+      Self.log.notice(
+        """
+        background walk …/\(folder, privacy: .private): \(outcome, privacy: .public), \
+        \(kicked, privacy: .public) downloads started, \(refused, privacy: .public) refused, \
+        \(elapsed, format: .fixed(precision: 1), privacy: .public) s
+        """)
       if case .ready = result { return true }
       return false
     }
@@ -178,8 +195,10 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
 
   /// Stops `walk` (running or waiting for `queue`), from its task's expiry;
   /// another walk is never touched. Never touches the bookmark, `pending`,
-  /// `scoped` or `forgotten`, and cancels `inFlight` only while that walk
-  /// holds `queue`: a foreground read is never cancelled. Any thread.
+  /// `scoped` or `forgotten` itself (the walk it stops never drops the
+  /// bookmark; it may refresh a stale one, same folder, guarded by
+  /// `isCurrent`), and cancels `inFlight` only while that walk holds
+  /// `queue`: a foreground read is never cancelled. Any thread.
   func cancelBackground(_ walk: UInt64) {
     background.withLock { state in
       guard state.active == walk else { return }
@@ -199,13 +218,22 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
   private func inForeground(_ body: () -> FolderPrepareFfi) -> FolderPrepareFfi {
     background.withLock { state in
       state.foregroundWaiting += 1
-      // Under the lock, as in `cancelBackground`.
-      if state.walking {
-        inFlight.withLockUnchecked { $0?.cancel() }
-      }
+      stopWalk(&state)
     }
     defer { background.withLock { $0.foregroundWaiting -= 1 } }
     return body()
+  }
+
+  /// Under `background`: stops the reserved walk, running or still waiting
+  /// for `queue` (it sees `stopped` at its first check, even once the
+  /// caller is done), and cancels `inFlight` only while that walk holds
+  /// `queue`, as in `cancelBackground` (the walk can't clear `walking` and
+  /// leave `queue` to a foreground read this would cancel).
+  private func stopWalk(_ state: inout Background) {
+    if state.active != nil { state.stopped = true }
+    if state.walking {
+      inFlight.withLockUnchecked { $0?.cancel() }
+    }
   }
 
   // MARK: Picker
@@ -240,8 +268,11 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
 
   /// Stages the picked folder when it is in iCloud Drive and no `forget`
   /// came since the pick started. Its scope is open only while it is
-  /// checked and bookmarked; the bookmark and `scoped` are not touched.
+  /// checked and bookmarked; the bookmark and `scoped` are not touched. A
+  /// running or queued background walk is stopped first (a walk reserved in
+  /// the moment after that can still run ahead of staging; rare).
   fileprivate func adopt(_ url: URL, started: UInt64, promise: Promise) {
+    background.withLock { stopWalk(&$0) }
     queue.async {
       guard self.isCurrent(started) else {
         promise.reject(Self.cancelled())
@@ -313,8 +344,10 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
 
   /// On `queue`. Checks `keepGoing` before every change, so a `forget` that
   /// came first leaves nothing behind (a later `forget` closes what this
-  /// opened). `limit` caps the download wait (`awaitDownloads`); a timed-out
-  /// wait still makes the folder `Ready` when `keepGoing` holds.
+  /// opened). Never drops the bookmark; may refresh a stale one (same
+  /// folder, guarded by `isCurrent` through `keepGoing`). `limit` caps the
+  /// download wait (`awaitDownloads`); a timed-out wait still makes the
+  /// folder `Ready` when `keepGoing` holds.
   private func walkOnQueue(
     _ keepGoing: () -> Bool, until limit: Date, stats: inout WalkStats
   ) -> FolderPrepareFfi {
@@ -372,7 +405,7 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
   private enum Walk {
     case done
     /// Its stop condition fired: a `forget` (or, in the background, a
-    /// `cancelBackground`, a foreground `prepare` or the deadline).
+    /// `cancelBackground`, a foreground `prepare`, a pick or the deadline).
     case stopped
     /// iCloud did not list the root: try again later, the folder is there.
     case unreadable
@@ -394,7 +427,6 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
       return keepGoing() ? .done : .stopped
     }
     var downloading: [URL] = []
-    var failed = 0
     var dirs: [(entries: [URL], inMedia: Bool)] = [(top, false)]
     while let (entries, inMedia) = dirs.popLast() {
       for item in entries {
@@ -410,19 +442,20 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
           continue
         }
         if inMedia { continue }
+        // Counted as they start: a walk stopped mid-tree still logs them.
         switch kick(item) {
-        case true?: downloading.append(Self.realURL(item).0)
-        case false?: failed += 1
+        case true?:
+          downloading.append(Self.realURL(item).0)
+          stats.kicked += 1
+        case false?: stats.refused += 1
         case nil: break
         }
       }
     }
-    stats.kicked = downloading.count
-    stats.refused = failed
-    if downloading.count + failed > 0 {
+    if downloading.count + stats.refused > 0 {
       NSLog(
         "[ICloudFolder] …/%@: %ld downloads started, %ld refused", root.lastPathComponent,
-        downloading.count, failed)
+        downloading.count, stats.refused)
     }
     switch awaitDownloads(downloading, keepGoing, until: limit) {
     case .stopped: return .stopped
@@ -483,8 +516,8 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
   /// yet) is listed inside a coordinated read, which asks the provider to
   /// fill it (one level per call); a plain `readdir` of it blocks until the
   /// provider does, and that can be never. nil when it can't be read (logged)
-  /// or `keepGoing` failed (a `forget`, or a `cancelBackground` or foreground
-  /// `prepare` during a background walk, cancels the wait).
+  /// or `keepGoing` failed (a `forget`, or a `cancelBackground`, foreground
+  /// `prepare` or pick during a background walk, cancels the wait).
   /// TODO(later): no timeout on the coordinated read yet; see docs/LATER.md
   /// "M2b: dataless iCloud directories on a real iPhone".
   private func list(_ dir: URL, _ keepGoing: () -> Bool) -> [URL]? {
@@ -502,7 +535,7 @@ final class ICloudFolder: FolderAccess, @unchecked Sendable {
     inFlight.withLockUnchecked { $0 = coordinator }
     defer { inFlight.withLockUnchecked { $0 = nil } }
     // After publishing it: a `forget` (or, during a background walk, a
-    // `cancelBackground` or a foreground `prepare`) from here on cancels it.
+    // `cancelBackground`, a foreground `prepare` or a pick) cancels it.
     guard keepGoing() else { return nil }
     var listed: [URL]?
     var error: NSError?

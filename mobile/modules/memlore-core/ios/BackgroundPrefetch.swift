@@ -131,7 +131,7 @@ enum BackgroundPrefetch {
     // at once rather than waiting behind the first (a success, so iOS does
     // not back off).
     guard let walk = ICloudFolder.shared.reserveBackground() else {
-      log.notice("\(name, privacy: .public) task: a walk or a sync is already running")
+      log.notice("\(name, privacy: .public) task: a walk or a prepare is already running")
       task.setTaskCompleted(success: true)
       return
     }
