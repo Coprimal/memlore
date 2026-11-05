@@ -123,7 +123,7 @@ function CreateVault({ vault }: { vault: Vault }) {
         disabled={vault.busy}
         onPress={submit}
       />
-      {/* Joins the vault another device syncs to Google Drive (app/onboard.tsx). */}
+      {/* Joins the vault another device syncs through Google Drive or iCloud Drive (app/onboard.tsx). */}
       <Pressable
         testID="onboard-start"
         accessibilityRole="button"

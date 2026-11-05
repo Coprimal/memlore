@@ -169,6 +169,9 @@ pub enum SyncBlockedFfi {
     Fenced,
     /// Google Drive must be connected again.
     NeedsReconnect,
+    /// The iCloud Drive folder is gone or unreachable: choose it again.
+    /// Cleared by a later sync that finds it, or by a disconnect.
+    NeedsFolder,
 }
 
 /// The sync state Settings and the list show.
@@ -201,12 +204,14 @@ pub trait SyncObserver: Send + Sync {
 }
 
 /// The last sync's outcome, memory only. `blocked` is read from the DB
-/// (re-pair, reconnect), except `fenced`, which only the last cycle knows.
+/// (re-pair, reconnect), except `fenced`, which only the last cycle knows,
+/// and `needs_folder`, which only the last folder prepare knows.
 #[derive(Default)]
 struct SyncRun {
     phase: SyncPhaseFfi,
     error: Option<String>,
     fenced: bool,
+    needs_folder: bool,
 }
 
 /// The observer Swift set and the last sync's outcome.
@@ -228,17 +233,25 @@ impl SyncReport {
         f(&mut self.run.lock().unwrap_or_else(|p| p.into_inner()));
     }
 
+    /// Set or clear `NeedsFolder` (`icloud.rs`).
+    pub(crate) fn set_needs_folder(&self, needs_folder: bool) {
+        self.update(|run| run.needs_folder = needs_folder);
+    }
+
     /// The status as of now, read from `conn` and the memory outcome.
     fn status(&self, conn: &rusqlite::Connection, running: bool) -> Result<SyncStatusFfi, String> {
-        let (phase, error, fenced) = {
+        let (phase, error, fenced, needs_folder) = {
             let run = self.run.lock().unwrap_or_else(|p| p.into_inner());
-            (run.phase, run.error.clone(), run.fenced)
+            (run.phase, run.error.clone(), run.fenced, run.needs_folder)
         };
         let scope_upgrade = db::get_setting(conn, GDRIVE_SCOPE_UPGRADE_REQUIRED_KEY)
             .map_err(|e| e.to_string())?
             .as_deref()
             == Some("1");
+        // A missing folder comes first: nothing else (a re-pair included)
+        // can run until it is chosen again.
         let blocked = match get_force_re_pair_status_inner(conn)? {
+            _ if needs_folder => Some(SyncBlockedFfi::NeedsFolder),
             Some(reason) => Some(SyncBlockedFfi::NeedsRePair { reason }),
             None if scope_upgrade => Some(SyncBlockedFfi::NeedsReconnect),
             None => fenced.then_some(SyncBlockedFfi::Fenced),
@@ -620,19 +633,25 @@ impl MemloreEngine {
         self.spawn_sync_task(async move { engine.run_sync_task(trigger, record).await })
     }
 
-    /// The task body: the keyring reconcile owed since the last unlock
-    /// (which fails closed on an inconclusive check, as at desktop
-    /// startup), then one cycle, its final status and the backoff
-    /// bookkeeping of the desktop scheduler loop.
+    /// The task body: an iCloud folder's prepare (a folder that is gone
+    /// ends the sync before anything touches it), the keyring reconcile
+    /// owed since the last unlock (which fails closed on an inconclusive
+    /// check, as at desktop startup), then one cycle, its final status and
+    /// the backoff bookkeeping of the desktop scheduler loop.
     async fn run_sync_task(&self, trigger: SyncTrigger, record: bool) {
         let hooks = self.sync_hooks();
-        let reconcile = self.scheduler().reconcile_pending;
-        if reconcile {
-            startup_keyring_reconcile_if_needed(&self.state, &self.key_state, &hooks).await;
-            // Cleared only once done: a cancelled reconcile runs again.
-            self.scheduler().reconcile_pending = false;
-        }
-        let result = run_sync_cycle(&self.state, &self.key_state, trigger, &hooks).await;
+        let result = match self.prepare_folder_root_async().await {
+            Err(e) => Err(e.to_string()),
+            Ok(()) => {
+                let reconcile = self.scheduler().reconcile_pending;
+                if reconcile {
+                    startup_keyring_reconcile_if_needed(&self.state, &self.key_state, &hooks).await;
+                    // Cleared only once done: a cancelled reconcile runs again.
+                    self.scheduler().reconcile_pending = false;
+                }
+                run_sync_cycle(&self.state, &self.key_state, trigger, &hooks).await
+            }
+        };
         hooks.finish(&self.state, &result);
         if record {
             record_outcome(&mut self.scheduler().retry, &result);
@@ -1209,18 +1228,7 @@ pub(crate) mod test_support {
     ) -> Result<ConnectOutcomeFfi, MemloreError> {
         let guard = SyncInProgressGuard::try_acquire().expect("a sync holds the guard");
         let local_mode = engine.connect_mode()?;
-        let folder = || CloudProvider::Folder(LocalSyncProvider::new(root));
-        engine.finish_connect(
-            guard,
-            session_id,
-            local_mode,
-            folder(),
-            folder(),
-            PendingCloudSession::Folder {
-                kind: "local".to_string(),
-                root_path: root.to_string_lossy().into_owned(),
-            },
-        )
+        engine.connect_folder_kind(guard, session_id, local_mode, "local", root.to_path_buf())
     }
 
     /// The device id of the vault behind `state`.

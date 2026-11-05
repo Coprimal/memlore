@@ -229,7 +229,7 @@ main() {
       || die "could not resolve the Cargo target dir (is the SSD mounted?)"
   else
     # Absolute: cargo resolves a relative CARGO_TARGET_DIR against its own cwd.
-    # Pinned so ~/.cargo/config.toml's shared target dir cannot move the bundle.
+    # Pinned so an inherited CARGO_TARGET_DIR cannot move the bundle.
     export CARGO_TARGET_DIR="$REPO_ROOT/src-tauri/target"
     target_dir="$CARGO_TARGET_DIR"
   fi

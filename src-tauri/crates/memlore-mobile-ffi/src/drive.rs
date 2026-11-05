@@ -5,6 +5,7 @@
 //! callback URL comes back. Nothing here logs a URL, code, token, verifier
 //! or state.
 
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ use memlore_engine::vault::startup::StartupMode;
 use tokio::runtime::Runtime;
 use zeroize::Zeroizing;
 
+use crate::icloud::{folder_name, stored_root_path, ICLOUD};
 use crate::sync::MobileCredentialStore;
 use crate::{io, runtime, MemloreEngine, MemloreError};
 
@@ -90,6 +92,11 @@ pub struct DriveStatusFfi {
     pub pending_count: u64,
     /// Why sync is blocked until a re-pair with the phrase, if it is.
     pub blocked: Option<String>,
+    /// The connected provider (`gdrive`, `icloud`), while connected.
+    pub provider: Option<String>,
+    /// The last component of a folder provider's path (`icloud`), the only
+    /// part of it Settings shows.
+    pub folder_name: Option<String>,
 }
 
 /// The mobile [`CloudConnectHooks`]: no progress events (the sign-in sheet
@@ -213,7 +220,8 @@ impl MemloreEngine {
     }
 
     /// Drop an unfinished sign-in, and the onboarding session a connect
-    /// left for it.
+    /// left for it (Drive or iCloud: an iCloud one also forgets the
+    /// folder's bookmark).
     pub fn drive_connect_cancel(&self, session_id: String) {
         {
             let mut slot = self.oauth.lock().unwrap_or_else(|p| p.into_inner());
@@ -221,18 +229,29 @@ impl MemloreEngine {
                 *slot = None;
             }
         }
-        drop(pending_session::consume(&session_id));
+        if let Some(PendingCloudSession::Folder { kind, .. }) =
+            pending_session::consume(&session_id)
+        {
+            if kind == ICLOUD {
+                self.forget_folder();
+            }
+        }
     }
 
-    /// Disconnect Drive on this phone only: end a running sync, clear the
-    /// Drive settings, the Keychain token and the live session. Nothing is
-    /// revoked at Google (decision 3).
+    /// Disconnect the cloud (Drive or iCloud) on this phone only: end a
+    /// running sync, clear the sync settings, the Keychain token, the live
+    /// session and the iCloud folder's bookmark (forgotten even when the
+    /// clear fails: the stale settings then fail closed as `NeedsFolder`).
+    /// Nothing is revoked at Google (decision 3).
     pub fn drive_disconnect(&self) -> Result<(), MemloreError> {
         if !self.key_state.is_initialized().map_err(io)? {
             return Err(MemloreError::Locked);
         }
         drop(self.cancel_sync_and_wait());
-        apply_disconnect_clear(&self.state, &self.connect_hooks()).map_err(io)
+        let cleared = apply_disconnect_clear(&self.state, &self.connect_hooks());
+        self.forget_folder();
+        self.sync_report.set_needs_folder(false);
+        cleared.map_err(io)
     }
 
     /// The Drive connection as Settings > Sync shows it.
@@ -486,15 +505,22 @@ fn read_drive_status(conn: &rusqlite::Connection) -> Result<DriveStatusFfi, Stri
         .map_err(|e| e.to_string())?
         .as_deref()
         == Some("true");
-    let (email, last_sync_ms) = if connected {
+    let (email, last_sync_ms, provider) = if connected {
         (
             db::get_setting(conn, "gdrive_email").map_err(|e| e.to_string())?,
             db::get_last_sync_at(conn)
                 .map_err(|e| e.to_string())?
                 .map(|secs| secs.saturating_mul(1000)),
+            db::get_sync_provider(conn).map_err(|e| e.to_string())?,
         )
     } else {
-        (None, None)
+        (None, None, None)
+    };
+    let folder_name = match provider.as_deref() {
+        Some(ICLOUD | "local") => stored_root_path(conn)
+            .map_err(|e| e.to_string())?
+            .and_then(|root| folder_name(Path::new(&root))),
+        _ => None,
     };
     Ok(DriveStatusFfi {
         connected,
@@ -502,6 +528,8 @@ fn read_drive_status(conn: &rusqlite::Connection) -> Result<DriveStatusFfi, Stri
         last_sync_ms,
         pending_count: db::count_pending_entries(conn).map_err(|e| e.to_string())?,
         blocked: get_force_re_pair_status_inner(conn)?,
+        provider,
+        folder_name,
     })
 }
 
@@ -514,7 +542,7 @@ fn ios_redirect_uri(client_id: &str) -> Option<String> {
 }
 
 /// 128 random bits as hex, from the same `OsRng` source as content keys.
-fn random_hex() -> String {
+pub(crate) fn random_hex() -> String {
     hex::encode(&memlore_core::encryption::generate_content_key()[..16])
 }
 

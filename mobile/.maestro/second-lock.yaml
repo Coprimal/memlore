@@ -68,6 +68,7 @@ appId: app.memlore.mobile
     element:
       id: second-lock-set
     direction: DOWN
+    centerElement: true
 - tapOn:
     id: second-lock-set
 - extendedWaitUntil:
@@ -113,6 +114,7 @@ appId: app.memlore.mobile
     element:
       id: second-lock-lock-now
     direction: DOWN
+    centerElement: true
 - tapOn:
     id: second-lock-lock-now
 - extendedWaitUntil:
@@ -138,6 +140,7 @@ appId: app.memlore.mobile
     element:
       id: second-lock-existence-toggle
     direction: DOWN
+    centerElement: true
 - tapOn:
     id: second-lock-existence-toggle
 - extendedWaitUntil:
@@ -240,6 +243,7 @@ appId: app.memlore.mobile
     element:
       id: second-lock-disable
     direction: DOWN
+    centerElement: true
 - tapOn:
     id: second-lock-disable
 - extendedWaitUntil:

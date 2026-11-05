@@ -42,6 +42,7 @@ use crate::sync::{MobileCredentialStore, MobileScheduler, SyncReport};
 
 pub use drive::{ConnectOutcomeFfi, DriveConnectStartFfi, DriveStatusFfi};
 pub use entries::{EntryDetailFfi, EntryPageFfi, EntryRowFfi, TrashRowFfi};
+pub use icloud::{FolderAccess, FolderPrepareFfi};
 pub use locks::LockStateFfi;
 pub use organize::{JournalFfi, TagFfi};
 pub use search::{SearchFiltersFfi, SearchResultFfi};
@@ -51,6 +52,7 @@ pub use versions::VersionFfi;
 
 mod drive;
 mod entries;
+mod icloud;
 mod keystore;
 mod locks;
 mod onboard;
@@ -141,6 +143,15 @@ pub enum MemloreError {
     /// The recovery phrase does not open the cloud vault.
     #[error("wrong recovery phrase")]
     WrongPhrase,
+    /// The iCloud Drive folder is gone (deleted, moved to the Trash, no
+    /// longer reachable) or was never picked: choose it again. It is never
+    /// recreated.
+    #[error("the sync folder is not available; choose it again")]
+    FolderUnavailable,
+    /// The picked folder holds files but no Memlore sync folder: nothing
+    /// was written into it.
+    #[error("this folder is not a Memlore sync folder")]
+    NotASyncFolder,
 }
 
 fn io(msg: String) -> MemloreError {
@@ -296,6 +307,9 @@ pub struct MemloreEngine {
     sync_report: SyncReport,
     /// When the editor last saved: the on-save debounce clock.
     last_edit: LastEditState,
+    /// The picked iCloud Drive folder, set by Swift (`icloud.rs`). Called
+    /// only from a clone, never under this or the DB lock.
+    folder_access: Mutex<Option<Arc<dyn FolderAccess>>>,
 }
 
 #[uniffi::export]
@@ -471,7 +485,8 @@ impl MemloreEngine {
     /// changes nothing. Then the running sync ends, the vault locks, its
     /// files (DB, `-wal`, `-shm`, boot file, conversion leftovers) and the
     /// media folder go, and both Keychain items (os_kek, Drive token) are
-    /// wiped. The memory state of the deleted vault goes too (the lock drops
+    /// wiped, and the iCloud folder bookmark is forgotten. The memory state
+    /// of the deleted vault goes too (the lock drops
     /// the Drive session and sign-in; the last sync's outcome and the
     /// scheduler's state are reset). The vault folder itself stays: Swift
     /// set its data protection class and backup exclusion, and new files
@@ -489,6 +504,8 @@ impl MemloreEngine {
         let os_kek = self.hooks.keystore.remove();
         let token = self.credentials.tokens().remove();
         self.reset_sync_memory();
+        // The iCloud bookmark goes with the vault it served.
+        self.forget_folder();
         // Re-detect whatever is left, even after a failed removal, so the
         // engine never keeps answering for a vault that is half gone.
         let (conn, mode) = startup(
@@ -643,6 +660,7 @@ impl MemloreEngine {
             scheduler: Mutex::new(MobileScheduler::default()),
             sync_report: SyncReport::default(),
             last_edit: LastEditState::new(),
+            folder_access: Mutex::new(None),
         }))
     }
 

@@ -2,7 +2,6 @@ import ExpoModulesCore
 import Foundation
 import LocalAuthentication
 import UIKit
-import UniformTypeIdentifiers
 
 /// Every engine call runs on this serial background queue, so the lazy
 /// creation in `EngineHolder` never races and the JS thread never blocks.
@@ -136,6 +135,14 @@ private func toException(_ error: Error) -> Exception {
   case MemloreError.WrongPhrase:
     return Exception(
       name: "MemloreWrongPhrase", description: "Wrong recovery phrase", code: "ERR_WRONG_PHRASE")
+  case MemloreError.FolderUnavailable:
+    return Exception(
+      name: "MemloreFolderUnavailable", description: "The sync folder is not available",
+      code: "ERR_FOLDER_UNAVAILABLE")
+  case MemloreError.NotASyncFolder:
+    return Exception(
+      name: "MemloreNotASyncFolder", description: "This folder is not a Memlore sync folder",
+      code: "ERR_NOT_SYNC_FOLDER")
   default:
     return Exception(name: "MemloreIo", description: error.localizedDescription, code: "ERR_IO")
   }
@@ -604,6 +611,10 @@ struct DriveStatusRecord: Record {
   @Field var lastSyncMs: Double? = nil
   @Field var pendingCount: Int = 0
   @Field var blocked: String? = nil
+  /// `gdrive`, `icloud` or `local` while connected.
+  @Field var provider: String? = nil
+  /// Last path component of a folder provider's root.
+  @Field var folderName: String? = nil
 
   init() {}
 
@@ -613,6 +624,8 @@ struct DriveStatusRecord: Record {
     lastSyncMs = status.lastSyncMs.map { Double($0) }
     pendingCount = Int(clamping: status.pendingCount)
     blocked = status.blocked
+    provider = status.provider
+    folderName = status.folderName
   }
 }
 
@@ -632,6 +645,8 @@ struct SyncBlockedRecord: Record {
       kind = "fenced"
     case .needsReconnect:
       kind = "needs_reconnect"
+    case .needsFolder:
+      kind = "needs_folder"
     }
   }
 }
@@ -731,7 +746,12 @@ public class MemloreCoreModule: Module {
       let forwarder = SyncEventForwarder(module: self)
       engineQueue.async {
         do {
-          try withEngine { engine in engine.setSyncObserver(observer: forwarder) }
+          try withEngine { engine in
+            engine.setSyncObserver(observer: forwarder)
+            // Process-wide, like the engine: Rust calls it before every use
+            // of the iCloud folder.
+            engine.setFolderAccess(access: ICloudFolder.shared)
+          }
         } catch {
           NSLog("[MemloreCore] could not register the sync observer: \(error)")
         }
@@ -1146,57 +1166,6 @@ public class MemloreCoreModule: Module {
       }
     }.runOnQueue(engineQueue)
 
-    // Spike 17.1, dev route only (`app/(dev)/spike-icloud.tsx`); read-only,
-    // see ICloudSpike.swift. Rejects with code ERR_SPIKE.
-    // TODO(later): see docs/LATER.md (remove with the dev spike routes).
-    AsyncFunction("spikeICloudPickFolder") { (promise: Promise) in
-      let presenter = self.appContext?.utilities?.currentViewController()
-      MainActor.assumeIsolated {
-        guard let presenter else {
-          promise.reject(ICloudSpike.spikeError("No view controller to present the picker"))
-          return
-        }
-        let delegate = FolderPickerDelegate(promise: promise)
-        ICloudSpike.activePicker = delegate
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
-        picker.allowsMultipleSelection = false
-        picker.delegate = delegate
-        presenter.present(picker, animated: true)
-      }
-    }.runOnQueue(.main)
-
-    AsyncFunction("spikeICloudBookmarkStatus") { () -> [String: Any] in
-      ICloudSpike.bookmarkStatus()
-    }.runOnQueue(ICloudSpike.queue)
-
-    AsyncFunction("spikeICloudForgetBookmark") {
-      ICloudSpike.forgetBookmark()
-    }.runOnQueue(ICloudSpike.queue)
-
-    AsyncFunction("spikeICloudList") { () throws -> [String: Any] in
-      try ICloudSpike.list()
-    }.runOnQueue(ICloudSpike.queue)
-
-    AsyncFunction("spikeICloudStartDownloads") { () throws -> [String: Any] in
-      try ICloudSpike.startDownloads()
-    }.runOnQueue(ICloudSpike.queue)
-
-    AsyncFunction("spikeICloudContainerProbe") { () -> [String: Any] in
-      ICloudSpike.containerProbe()
-    }.runOnQueue(ICloudSpike.queue)
-
-    AsyncFunction("spikeICloudScheduleBackgroundTask") { () throws -> [String: Any] in
-      try ICloudSpike.scheduleBackgroundTask()
-    }.runOnQueue(ICloudSpike.queue)
-
-    AsyncFunction("spikeICloudListLaterInBackground") { (delaySeconds: Double) in
-      MainActor.assumeIsolated { ICloudSpike.listLaterInBackground(delay: delaySeconds) }
-    }.runOnQueue(.main)
-
-    AsyncFunction("spikeICloudBackgroundResult") { () -> String? in
-      ICloudSpike.backgroundResult()
-    }.runOnQueue(ICloudSpike.queue)
-
     // Google Drive and sync (ADR §13). The tokens, PKCE verifier and state
     // stay in Rust and the Keychain. Never log the callback URL, the phrase
     // or the passwords these take. A sync itself runs off `engineQueue` on
@@ -1211,6 +1180,19 @@ public class MemloreCoreModule: Module {
         try ConnectOutcomeRecord(
           engine.driveConnectComplete(sessionId: sessionId, callbackUrl: callbackUrl))
       }
+    }.runOnQueue(engineQueue)
+
+    // iCloud Drive (M2b): the picker stages the folder in `ICloudFolder`, the
+    // connect promotes it and has the same outcomes as Drive's.
+    AsyncFunction("icloudPickFolder") { (promise: Promise) in
+      let presenter = self.appContext?.utilities?.currentViewController()
+      MainActor.assumeIsolated {
+        ICloudFolder.shared.pick(from: presenter, promise: promise)
+      }
+    }.runOnQueue(.main)
+
+    AsyncFunction("icloudConnect") { () throws -> ConnectOutcomeRecord in
+      try withEngine { engine in try ConnectOutcomeRecord(engine.icloudConnect()) }
     }.runOnQueue(engineQueue)
 
     AsyncFunction("driveConnectCancel") { (sessionId: String) throws in

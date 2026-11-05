@@ -87,12 +87,9 @@ pnpm tauri build --no-sign        # current platform (see CONTRIBUTING.md)
 
 ### Cargo build cache
 
-A debug target on macOS grows past 10 GB. The `dev` profile in `src-tauri/Cargo.toml` keeps a fresh build small. To share that cache, `~/.cargo/config.toml` is created once per machine and stays outside git. Cargo does not expand `~`; the path below is `~/.cargo/shared-target`:
+A debug target on macOS grows past 10 GB. The `dev` profile in `src-tauri/Cargo.toml` keeps a fresh build small. `~/.cargo/config.toml` is created once per machine, stays outside git, and holds the same profile and no `target-dir`:
 
 ```toml
-[build]
-target-dir = ".cargo/shared-target"
-
 [profile.dev]
 opt-level = 1
 split-debuginfo = "off"
@@ -103,9 +100,9 @@ debug = "line-tables-only"
 incremental = false
 ```
 
-Keep that profile identical to `src-tauri/Cargo.toml`. After the config is in place, delete this repo's old `src-tauri/target` — `cargo clean` no longer sees it. `pnpm tauri dev` and `cargo test` use the shared directory. `pnpm tauri build` still writes `src-tauri/target`. Why these flags are set is in [CONTRIBUTING.md](CONTRIBUTING.md#cargo-build-cache).
+Keep that profile identical to `src-tauri/Cargo.toml`. Why these flags are set is in [CONTRIBUTING.md](CONTRIBUTING.md#cargo-build-cache).
 
-A checkout can instead build on an external SSD: copy `.cargo/config.toml.example` to `.cargo/config.toml` (gitignored) and set its folder. Every build, `pnpm tauri build` included, then goes there, and the bundle lands at `<target-dir>/release/bundle/macos/Memlore.app`. See [CONTRIBUTING.md](CONTRIBUTING.md#target-on-the-external-ssd-per-checkout-opt-in).
+Each checkout builds on an external SSD: copy `.cargo/config.toml.example` to `.cargo/config.toml` (gitignored) and set its folder. Every build, `pnpm tauri build` included, then goes there, and the bundle lands at `<target-dir>/release/bundle/macos/Memlore.app`. Without that file, builds use `src-tauri/target`. See [CONTRIBUTING.md](CONTRIBUTING.md#target-on-the-external-ssd-one-folder-per-checkout).
 
 Optional `.env` (copy `.env.example`): [Google Drive OAuth](docs/gdrive-oauth-setup.md) and [MapKit JS](docs/mapkit-js-setup.md).
 

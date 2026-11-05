@@ -21,6 +21,12 @@ export type StartupMode = 'first_launch' | 'password_locked' | 'boot_file_corrup
  * included), so it never joins another cloud vault: onboarding, and a Drive
  * connect that finds a different vault, are refused and change nothing.
  * ERR_WRONG_PHRASE: the recovery phrase does not open the cloud vault.
+ * ERR_FOLDER_UNAVAILABLE: the iCloud sync folder is missing, in the Trash, or
+ * iCloud is signed out (it is never recreated); pick it again.
+ * ERR_NOT_SYNC_FOLDER: the picked folder holds files but no Memlore vault.
+ * ERR_CANCELLED: the user closed the folder picker; nothing changed.
+ * ERR_NOT_ICLOUD_FOLDER: the picked folder is not in iCloud Drive (another
+ * Files location); the previous folder is kept.
  */
 export type MemloreErrorCode =
   | 'ERR_LOCKED'
@@ -34,7 +40,11 @@ export type MemloreErrorCode =
   | 'ERR_LAST_JOURNAL'
   | 'ERR_SECOND_LOCK_REQUIRED'
   | 'ERR_VAULT_NOT_EMPTY'
-  | 'ERR_WRONG_PHRASE';
+  | 'ERR_WRONG_PHRASE'
+  | 'ERR_FOLDER_UNAVAILABLE'
+  | 'ERR_NOT_SYNC_FOLDER'
+  | 'ERR_CANCELLED'
+  | 'ERR_NOT_ICLOUD_FOLDER';
 
 /** The device's biometric hardware. */
 export type BiometricKind = 'faceID' | 'touchID' | 'none';
@@ -171,43 +181,6 @@ export interface Template {
   sortOrder: number;
 }
 
-/** Spike 17.1: one file of the picked `MemloreSpike` folder. */
-export interface SpikeICloudItem {
-  name: string;
-  /** Listed under the legacy `.name.icloud` placeholder name. */
-  legacyPlaceholder: boolean;
-  ubiquitous: boolean;
-  /** `current` | `downloaded` | `notDownloaded` | `none` (not ubiquitous). */
-  status: string;
-  downloading: boolean;
-  size: number;
-  /** Bytes of a coordinated read; only for files already local. */
-  bytesRead?: number;
-}
-
-export interface SpikeICloudListing {
-  folder: string;
-  wasStale: boolean;
-  items: SpikeICloudItem[];
-  /** Entries that are neither metadata.json nor *.bin (names never reported). */
-  otherCount: number;
-}
-
-export interface SpikeICloudBookmarkStatus {
-  hasBookmark: boolean;
-  resolved?: boolean;
-  wasStale?: boolean;
-  accessGranted?: boolean;
-  folder?: string;
-  error?: string;
-}
-
-export interface SpikeICloudContainerProbe {
-  identityToken: boolean;
-  containerResolved: boolean;
-  containerLeaf: string | null;
-}
-
 /**
  * A Google sign-in started by `driveConnectBegin`. Open `authUrl` in an auth
  * session that returns to `redirectUri`'s scheme. The PKCE verifier and state
@@ -248,6 +221,10 @@ export interface DriveStatus {
   pendingCount: number;
   /** Why sync is blocked until a re-pair with the phrase, if it is. */
   blocked: string | null;
+  /** `gdrive`, `icloud` or `local` while connected. */
+  provider: string | null;
+  /** Last path component of a folder provider's root. */
+  folderName: string | null;
 }
 
 /** Lifecycle phase of the last sync. */
@@ -260,7 +237,9 @@ export type SyncBlocked =
   /** A recovery on another device moved the cloud ahead of this phone: nothing is pushed. */
   | { kind: 'fenced' }
   /** Google Drive must be connected again. */
-  | { kind: 'needs_reconnect' };
+  | { kind: 'needs_reconnect' }
+  /** The iCloud folder is gone (moved to the Trash, deleted, iCloud signed out): choose it again. */
+  | { kind: 'needs_folder' };
 
 export interface SyncStatus {
   phase: SyncPhase;
@@ -559,6 +538,21 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
    * changed), ERR_IO for a bad or expired callback or a sync in progress.
    */
   driveConnectComplete(sessionId: string, callbackUrl: string): Promise<ConnectOutcome>;
+  /**
+   * Presents the folder picker for the iCloud Drive sync folder and stages
+   * the pick in memory (lost on app kill) until `icloudConnect` promotes it;
+   * the live bookmark and access are untouched until then. ERR_CANCELLED when
+   * the user closes it, ERR_NOT_ICLOUD_FOLDER for a folder outside iCloud Drive.
+   */
+  icloudPickFolder(): Promise<{ name: string }>;
+  /**
+   * Connects the picked iCloud folder, with the outcomes of a Drive connect.
+   * ERR_FOLDER_UNAVAILABLE (no pick, or the folder is gone: never created),
+   * ERR_NOT_SYNC_FOLDER, ERR_VAULT_NOT_EMPTY, ERR_LOCKED, ERR_IO for a sync
+   * in progress. Except for a sync in progress or a locked vault, a failure or
+   * `no_cloud_vault` forgets the pick.
+   */
+  icloudConnect(): Promise<ConnectOutcome>;
   /** Drops an unfinished sign-in (the auth session was cancelled). */
   driveConnectCancel(sessionId: string): Promise<void>;
   /** Ends a running sync, then forgets this phone's tokens and Drive settings; never revokes at Google. */
@@ -607,21 +601,6 @@ declare class MemloreCoreModule extends NativeModule<MemloreCoreEvents> {
    * the vault could not be closed (it stays locked, every file kept).
    */
   deleteVault(password: string): Promise<void>;
-
-  // Spike 17.1 (dev route `app/(dev)/spike-icloud.tsx` only, read-only; see
-  // ios/ICloudSpike.swift). Reject with code ERR_SPIKE.
-  // TODO(later): see docs/LATER.md (remove with the dev spike routes).
-  /** Presents the folder picker; resolves with the folder name once bookmarked. */
-  spikeICloudPickFolder(): Promise<string>;
-  spikeICloudBookmarkStatus(): Promise<SpikeICloudBookmarkStatus>;
-  spikeICloudForgetBookmark(): Promise<void>;
-  spikeICloudList(): Promise<SpikeICloudListing>;
-  spikeICloudStartDownloads(): Promise<{ started: string[]; failed: string[] }>;
-  spikeICloudContainerProbe(): Promise<SpikeICloudContainerProbe>;
-  spikeICloudScheduleBackgroundTask(): Promise<{ submitted: string }>;
-  spikeICloudListLaterInBackground(delaySeconds: number): Promise<void>;
-  /** JSON of the last background listing, or null. */
-  spikeICloudBackgroundResult(): Promise<string | null>;
 }
 
 const MemloreCore = requireNativeModule<MemloreCoreModule>('MemloreCore');

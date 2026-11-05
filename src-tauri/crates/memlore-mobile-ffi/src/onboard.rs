@@ -3,6 +3,8 @@
 //! vault (or an empty phone vault joining one), and the re-pair recheck.
 //! The phrase and the password are zeroized on drop and never logged.
 
+use std::path::PathBuf;
+
 use memlore_engine::db;
 use memlore_engine::sync::cloud_config::configured_cloud_provider;
 use memlore_engine::sync::force_re_pair::{
@@ -21,6 +23,7 @@ use memlore_engine::vault::startup::StartupMode;
 use memlore_engine::vault::validate_password_length;
 use zeroize::Zeroizing;
 
+use crate::icloud::ICLOUD;
 use crate::{format_err, io, runtime, MemloreEngine, MemloreError, DEVICE_NAME};
 
 /// The engine's wrong-phrase text is a contract string: it maps to
@@ -203,7 +206,9 @@ impl MemloreEngine {
 
     /// The cloud to join, in the desktop's lookup order: the live Drive
     /// session, then the pending session of `session_id`, then the
-    /// configured provider.
+    /// configured provider. An iCloud folder is prepared first (pending:
+    /// at the path `prepare` hands out; configured: its stored path
+    /// follows a move), and one that is gone is `FolderUnavailable`.
     fn join_provider(&self, session_id: Option<&str>) -> Result<CloudProvider, MemloreError> {
         let live = self
             .live_session
@@ -220,17 +225,23 @@ impl MemloreEngine {
                 PendingCloudSession::GDrive { session, .. } => GDriveProvider::new_live(session)
                     .map(CloudProvider::GDrive)
                     .map_err(io),
-                PendingCloudSession::Folder { root_path, .. } => {
+                PendingCloudSession::Folder { kind, root_path } => {
+                    let root = if kind == ICLOUD {
+                        self.prepare_pending_root()?
+                    } else {
+                        PathBuf::from(root_path)
+                    };
                     let generation = {
                         let conn = self.state.lock().map_err(io)?;
                         db::get_sync_recovery_generation(&conn).map_err(|e| io(e.to_string()))?
                     };
                     Ok(CloudProvider::Folder(
-                        LocalSyncProvider::new(root_path).with_recovery_fence(generation, None),
+                        LocalSyncProvider::new(root).with_recovery_fence(generation, None),
                     ))
                 }
             };
         }
+        self.prepare_folder_root()?;
         let conn = self.state.lock().map_err(io)?;
         configured_cloud_provider(&conn, self.credentials.as_ref())
             .map_err(io)?

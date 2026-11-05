@@ -34,6 +34,8 @@ function coerceDriveStatus(raw: DriveStatus): DriveStatus {
     lastSyncMs: raw.lastSyncMs ?? null,
     pendingCount: raw.pendingCount,
     blocked: raw.blocked ?? null,
+    provider: raw.provider ?? null,
+    folderName: raw.folderName ?? null,
   };
 }
 
@@ -92,18 +94,26 @@ async function waitForSyncEnd(): Promise<void> {
 }
 
 /**
+ * Runs a connect call, and once more after a running sync ends when the
+ * engine refused it as busy (it refuses before it uses anything).
+ */
+async function retryOnceIfSyncBusy<T>(action: () => Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (e) {
+    if (!isSyncBusy(e)) throw e;
+    await waitForSyncEnd();
+    return action();
+  }
+}
+
+/**
  * Finishes a sign-in. A foreground tick may have started a sync as the auth
  * session returned: the engine then refuses before it uses the one-time
  * sign-in, so it is tried once more after that sync ends.
  */
-async function completeConnect(sessionId: string, callbackUrl: string): Promise<ConnectOutcome> {
-  try {
-    return await MemloreCore.driveConnectComplete(sessionId, callbackUrl);
-  } catch (e) {
-    if (!isSyncBusy(e)) throw e;
-    await waitForSyncEnd();
-    return MemloreCore.driveConnectComplete(sessionId, callbackUrl);
-  }
+function completeConnect(sessionId: string, callbackUrl: string): Promise<ConnectOutcome> {
+  return retryOnceIfSyncBusy(() => MemloreCore.driveConnectComplete(sessionId, callbackUrl));
 }
 
 // __DEV__ only: the first `onSyncStatus` body's shape (keys and value types,
@@ -285,6 +295,32 @@ function useSyncState() {
     }
   }
 
+  /**
+   * iCloud Drive: the user picks the sync folder, then it connects with the
+   * outcomes of `connect`. Resolves null when the picker was closed (or a
+   * connect is already running). A sync running at the pick is waited for
+   * and the connect tried once more, as for Drive.
+   */
+  async function connectICloud(): Promise<ConnectOutcome | null> {
+    if (connecting.current) return null;
+    connecting.current = true;
+    try {
+      return await call(async () => {
+        try {
+          await MemloreCore.icloudPickFolder();
+        } catch (e) {
+          if (errorCode(e) === 'ERR_CANCELLED') return null;
+          throw e;
+        }
+        const outcome = await retryOnceIfSyncBusy(() => MemloreCore.icloudConnect());
+        if (unlockedRef.current) void refresh();
+        return outcome;
+      });
+    } finally {
+      connecting.current = false;
+    }
+  }
+
   /** A manual sync ("Sync now", pull-to-refresh): false when one is already running. */
   const syncNow = () => call(() => MemloreCore.syncNow(true));
 
@@ -358,6 +394,7 @@ function useSyncState() {
     awaitingFirstSync,
     refresh,
     connect,
+    connectICloud,
     syncNow,
     disconnect,
     driveStatus,

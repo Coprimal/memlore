@@ -20,9 +20,9 @@ export default function RootLayout() {
 }
 
 /**
- * Only `vault` (and `onboard`) exists while the vault is not unlocked, and only the app (and
- * the dev spikes) while it is: a lock removes every protected screen, so the
- * swipe back cannot return to them. The explicit redirects keep the fallback
+ * Only `vault` (and `onboard`) exists while the vault is not unlocked, and only the app
+ * while it is: a lock removes every protected screen, so the swipe back cannot return to
+ * them. The explicit redirects keep the fallback
  * off the route sort order, which puts groups before `vault`.
  *
  * The lock and unlock swaps never animate. A guard swap is a native replace
@@ -44,8 +44,6 @@ function RootStack() {
           undeclared one outside both, where it stays reachable while locked. */}
       <Stack.Protected guard={unlocked} redirectTo="/vault">
         <Stack.Screen name="(app)" options={{ animation: 'none' }} />
-        {/* Dev-only iCloud spike stays behind the vault until M2b. */}
-        <Stack.Screen name="(dev)/spike-icloud" />
       </Stack.Protected>
       <Stack.Protected guard={!unlocked} redirectTo="/">
         <Stack.Screen name="vault" options={{ animation: 'none' }} />

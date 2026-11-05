@@ -1,8 +1,9 @@
-# Sync without Google (M2a phase 7.6): a new vault shows Settings > Sync
-# disconnected ("Connect Google Drive", no account); pull-to-refresh with no
-# Drive is harmless; deleting the phone vault with its password goes back to
-# the first-launch screen ("I already use Memlore on another device").
-# No Google sign-in: STOP 2 covers the connected states by hand.
+# Sync without a cloud (M2a phase 7.6, M2b): a new vault shows Settings > Sync
+# disconnected ("Connect Google Drive" and "Connect iCloud Drive", no account);
+# pull-to-refresh with no cloud is harmless; deleting the phone vault with its
+# password goes back to the first-launch screen, whose "I already use Memlore
+# on another device" asks Google Drive or iCloud Drive first.
+# No Google sign-in, no folder picker: STOP 2 covers the connected states by hand.
 #
 # Runs against the Release simulator build (see vault-create-unlock.yaml).
 appId: app.memlore.mobile
@@ -34,7 +35,7 @@ appId: app.memlore.mobile
       id: entry-count
     timeout: 15000
 
-# Settings > Sync: not connected, so "Connect Google Drive" and no account.
+# Settings > Sync: not connected, so both connect buttons and no account.
 - tapOn:
     id: settings-tab
 - scrollUntilVisible:
@@ -42,6 +43,13 @@ appId: app.memlore.mobile
       id: sync-connect
     direction: DOWN
     centerElement: true
+- scrollUntilVisible:
+    element:
+      id: sync-connect-icloud
+    direction: DOWN
+    centerElement: true
+- assertVisible:
+    id: sync-connect
 - assertVisible:
     id: sync-panel
 - assertNotVisible:
@@ -98,3 +106,22 @@ appId: app.memlore.mobile
     id: create-vault-button
 - assertNotVisible:
     id: settings-tab
+
+# "I already use Memlore": the provider choice first (nothing opens on its
+# own), then back to the create screen.
+- tapOn:
+    id: onboard-start
+- extendedWaitUntil:
+    visible:
+      id: onboard-provider-gdrive
+    timeout: 10000
+- assertVisible:
+    id: onboard-provider-icloud
+- tapOn:
+    id: onboard-back
+- extendedWaitUntil:
+    visible:
+      id: create-vault-button
+    timeout: 10000
+- assertNotVisible:
+    id: onboard-provider-gdrive

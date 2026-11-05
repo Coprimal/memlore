@@ -53,6 +53,10 @@ const KNOWN_CODES: Record<MemloreErrorCode, true> = {
   ERR_SECOND_LOCK_REQUIRED: true,
   ERR_VAULT_NOT_EMPTY: true,
   ERR_WRONG_PHRASE: true,
+  ERR_FOLDER_UNAVAILABLE: true,
+  ERR_NOT_SYNC_FOLDER: true,
+  ERR_CANCELLED: true,
+  ERR_NOT_ICLOUD_FOLDER: true,
 };
 const ERROR_CODES = Object.keys(KNOWN_CODES) as MemloreErrorCode[];
 
