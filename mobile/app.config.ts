@@ -3,26 +3,6 @@ import type { ExpoConfig } from 'expo/config';
 // The single app config (the template's app.json is folded in here).
 // Store compliance: docs/mobile/adr-0001-mobile-architecture.md, section 7.
 
-// Spike 17.1 (iCloud folder access, `app/(dev)/spike-icloud.tsx`) only in a
-// build made with MEMLORE_SPIKE_ICLOUD=1, on both `expo prebuild` and
-// `expo run:ios`: the iCloud entitlements and the background-processing task.
-// Without it the default and Release builds keep no iCloud signing requirement
-// and no extra background mode for App Review.
-const spikeICloud = process.env.MEMLORE_SPIKE_ICLOUD === '1';
-const spikeICloudIos = spikeICloud
-  ? {
-      entitlements: {
-        'com.apple.developer.icloud-container-identifiers': ['iCloud.app.memlore'],
-        'com.apple.developer.ubiquity-container-identifiers': ['iCloud.app.memlore'],
-        'com.apple.developer.icloud-services': ['CloudDocuments'],
-      },
-      infoPlist: {
-        UIBackgroundModes: ['processing'],
-        BGTaskSchedulerPermittedIdentifiers: ['app.memlore.mobile.spike-icloud'],
-      },
-    }
-  : {};
-
 // Google Drive sign-in (iOS OAuth client, PKCE, no client secret). The client
 // ID comes from MEMLORE_GOOGLE_IOS_CLIENT_ID in `mobile/.env.local` (gitignored)
 // and is never written in a tracked file. It lands in Info.plist as
@@ -80,12 +60,9 @@ const config: ExpoConfig = {
         },
       ],
     },
-    ...spikeICloudIos,
     // Purpose strings: each feature plan adds its own. English here; Vietnamese
-    // through `locales` below (vi.lproj/InfoPlist.strings). Merged after the
-    // spike spread, which carries its own infoPlist.
+    // through `locales` below (vi.lproj/InfoPlist.strings).
     infoPlist: {
-      ...('infoPlist' in spikeICloudIos ? spikeICloudIos.infoPlist : {}),
       NSFaceIDUsageDescription:
         'Memlore uses Face ID to unlock your journal. You can always use your password instead.',
       ...(googleIosClientId ? { MemloreGoogleIosClientId: googleIosClientId } : {}),

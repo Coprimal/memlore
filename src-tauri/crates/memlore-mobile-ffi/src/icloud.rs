@@ -6,8 +6,8 @@
 //! folder.
 //!
 //! Before every use of an iCloud folder (connect, each sync, the joins with
-//! the phrase) `prepare` runs first, never under the DB lock and never on
-//! an async runtime thread. The folder is never created here: a root that
+//! the phrase) `prepare` runs first (`prepare_connect` for the connect),
+//! never under the DB lock and never on an async runtime thread. The folder is never created here: a root that
 //! is gone fails with `FolderUnavailable` instead of being recreated
 //! empty by the engine's `create_dir_all`. Every path that drops the
 //! connection calls `forget`, so no bookmark (a standing grant) outlives
@@ -35,7 +35,7 @@ pub(crate) const ICLOUD: &str = "icloud";
 /// (`complete_cloud_connect`): a folder that holds something else.
 const NOT_A_SYNC_FOLDER: &str = "RECOVERY_CONTROL_MISSING_ON_NONEMPTY_CLOUD";
 
-/// What [`FolderAccess::prepare`] found.
+/// What [`FolderAccess::prepare`] (or `prepare_connect`) found.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum FolderPrepareFfi {
     /// The folder resolved and its scope is open: use `root_path` (it may
@@ -49,12 +49,23 @@ pub enum FolderPrepareFfi {
 /// The picked iCloud Drive folder, implemented in Swift. Called on an FFI
 /// caller's thread or a blocking runtime thread, never under the DB lock;
 /// an implementation must not call back into the engine. Infallible: a
-/// Swift failure is `Gone`.
+/// Swift failure is `Gone`. `forget` wins: `prepare`, `prepare_connect`
+/// and `forget` are serialized, and a `prepare` that finishes after a
+/// `forget` keeps no bookmark and no open scope.
+///
+/// A pick only stages a folder (in memory, never the live bookmark nor
+/// the open scope). `prepare_connect` promotes a staged pick; only
+/// `icloud_connect` calls it, under the sync guard, so the scope swap and
+/// the bookmark switch never happen under a running sync, and a sync never
+/// reaches a folder connect has not checked.
 #[uniffi::export(with_foreign)]
 pub trait FolderAccess: Send + Sync {
     /// Resolve the bookmark, keep its security scope open, refuse a folder
     /// that is gone and start downloading placeholders (without waiting).
     fn prepare(&self) -> FolderPrepareFfi;
+    /// Promote the staged pick, if one is current, to the bookmark, then the
+    /// same as [`Self::prepare`]. Without one it is [`Self::prepare`].
+    fn prepare_connect(&self) -> FolderPrepareFfi;
     /// Drop the bookmark and close its scope.
     fn forget(&self);
 }
@@ -82,15 +93,24 @@ impl MemloreEngine {
     /// than a sync folder is `NotASyncFolder`. Once the folder is prepared,
     /// the bookmark is forgotten whenever the connect does not leave a
     /// connection or an onboarding behind (`NoCloudVault`, any error). A
-    /// refusal before that (a running sync, `Locked`) keeps it, so a retry
-    /// can still connect. Needs first launch or an unlocked vault.
+    /// refusal before that (a running sync, `Locked`) keeps it, and keeps a
+    /// staged pick unpromoted, so a retry can still connect. The staged
+    /// pick is promoted here ([`FolderAccess::prepare_connect`]), under the
+    /// sync guard. A connection (or a join with the phrase) clears
+    /// `NeedsFolder`. Needs first launch or an unlocked vault.
     pub fn icloud_connect(&self) -> Result<ConnectOutcomeFfi, MemloreError> {
         let guard = SyncInProgressGuard::try_acquire()
             .ok_or_else(|| io(SYNC_IN_PROGRESS_ERR.to_string()))?;
         let local_mode = self.connect_mode()?;
         let result = self.icloud_connect_inner(guard, local_mode);
-        if matches!(result, Ok(ConnectOutcomeFfi::NoCloudVault) | Err(_)) {
-            self.forget_folder();
+        match &result {
+            // The folder is chosen again: "Choose the folder again" goes at
+            // once, not at the next sync.
+            Ok(ConnectOutcomeFfi::Connected | ConnectOutcomeFfi::JoinWithPhrase) => {
+                self.sync_report.set_needs_folder(false);
+            }
+            Ok(ConnectOutcomeFfi::NoCloudVault) | Err(_) => self.forget_folder(),
+            Ok(ConnectOutcomeFfi::NeedsOnboarding { .. }) => {}
         }
         result
     }
@@ -102,7 +122,7 @@ impl MemloreEngine {
         guard: SyncInProgressGuard,
         local_mode: db::EncryptionMode,
     ) -> Result<ConnectOutcomeFfi, MemloreError> {
-        let root = checked_root(self.folder_access().map(|access| access.prepare()))?;
+        let root = checked_root(self.folder_access().map(|access| access.prepare_connect()))?;
         self.connect_folder_kind(guard, &random_hex(), local_mode, ICLOUD, root)
             .map_err(|e| match e {
                 MemloreError::Io { msg } if msg == NOT_A_SYNC_FOLDER => {
@@ -271,16 +291,21 @@ mod tests {
     /// A [`FolderAccess`] that answers what the test set and counts calls.
     struct FolderStub {
         prepares: AtomicUsize,
+        prepare_connects: AtomicUsize,
         forgets: AtomicUsize,
         next: Mutex<FolderPrepareFfi>,
+        /// A staged pick: `prepare_connect` promotes it into `next`.
+        connect_next: Mutex<Option<FolderPrepareFfi>>,
     }
 
     impl FolderStub {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 prepares: AtomicUsize::new(0),
+                prepare_connects: AtomicUsize::new(0),
                 forgets: AtomicUsize::new(0),
                 next: Mutex::new(FolderPrepareFfi::Gone),
+                connect_next: Mutex::new(None),
             })
         }
 
@@ -288,8 +313,20 @@ mod tests {
             *self.next.lock().unwrap() = answer;
         }
 
+        fn stage(&self, answer: FolderPrepareFfi) {
+            *self.connect_next.lock().unwrap() = Some(answer);
+        }
+
         fn forgets(&self) -> usize {
             self.forgets.load(Ordering::SeqCst)
+        }
+
+        fn prepares(&self) -> usize {
+            self.prepares.load(Ordering::SeqCst)
+        }
+
+        fn prepare_connects(&self) -> usize {
+            self.prepare_connects.load(Ordering::SeqCst)
         }
     }
 
@@ -297,6 +334,16 @@ mod tests {
         fn prepare(&self) -> FolderPrepareFfi {
             self.prepares.fetch_add(1, Ordering::SeqCst);
             self.next.lock().unwrap().clone()
+        }
+
+        fn prepare_connect(&self) -> FolderPrepareFfi {
+            self.prepare_connects.fetch_add(1, Ordering::SeqCst);
+            // Like Swift: a staged pick becomes the folder `prepare` answers.
+            let mut next = self.next.lock().unwrap();
+            if let Some(staged) = self.connect_next.lock().unwrap().take() {
+                *next = staged;
+            }
+            next.clone()
         }
 
         fn forget(&self) {
@@ -471,7 +518,8 @@ mod tests {
     /// Risk 4 at sync time: a folder that moved is followed (the stored
     /// path is rewritten and the cycle pushes there); a folder that is gone
     /// ends the sync in `NeedsFolder` without recreating it, whether Swift
-    /// says `Gone` or still hands out the old path. Disconnect clears it.
+    /// says `Gone` or still hands out the old path. Choosing a folder again
+    /// (a successful connect) clears it at once, and so does disconnect.
     #[test]
     fn a_sync_whose_folder_is_gone_fails_with_needs_folder_and_recreates_nothing() {
         let _serial = serial();
@@ -521,7 +569,81 @@ mod tests {
                 "{answer:?}: the sync recreated the folder"
             );
         }
+
+        // Choosing the folder again clears "Choose the folder again" at
+        // once, before any sync runs.
+        let repicked = cloud.path().join("Repicked");
+        std::fs::create_dir(&repicked).unwrap();
+        access.answer(ready(&repicked));
+        assert_eq!(
+            phone.icloud_connect().unwrap(),
+            ConnectOutcomeFfi::Connected
+        );
+        assert_eq!(
+            phone.sync_status().unwrap().blocked,
+            None,
+            "the re-pick kept NeedsFolder"
+        );
+
+        std::fs::remove_dir_all(&repicked).unwrap();
+        access.answer(FolderPrepareFfi::Gone);
+        assert_eq!(
+            sync_and_wait(&phone).blocked,
+            Some(SyncBlockedFfi::NeedsFolder)
+        );
         phone.drive_disconnect().unwrap();
         assert_eq!(phone.sync_status().unwrap().blocked, None);
+    }
+
+    /// A pick only stages a folder: a sync keeps the connected one (it
+    /// never promotes the pick, so it cannot retarget the vault past
+    /// connect's checks or swap the scope under a running cycle); only
+    /// `icloud_connect` promotes it, under the sync guard.
+    #[test]
+    fn a_staged_pick_is_promoted_only_by_icloud_connect_never_by_a_sync() {
+        let _serial = serial();
+        let cloud = tempfile::TempDir::new().unwrap();
+        let connected = cloud.path().join("Memlore");
+        let picked = cloud.path().join("Picked");
+        std::fs::create_dir(&connected).unwrap();
+        std::fs::create_dir(&picked).unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+        let (phone, access) = phone_at(phone_dir.path());
+        phone.create_entry("Before".to_string(), None).unwrap();
+        access.answer(ready(&connected));
+        assert_eq!(
+            phone.icloud_connect().unwrap(),
+            ConnectOutcomeFfi::Connected
+        );
+        let connects = access.prepare_connects();
+
+        access.stage(ready(&picked));
+        assert_eq!(sync_and_wait(&phone).phase, SyncPhaseFfi::Synced);
+        assert_eq!(
+            access.prepare_connects(),
+            connects,
+            "a sync promoted the staged pick"
+        );
+        assert_eq!(
+            stored_root(&phone).as_deref(),
+            Some(connected.to_string_lossy().as_ref()),
+            "a sync retargeted the vault to an unconnected pick"
+        );
+        assert!(
+            std::fs::read_dir(&picked).unwrap().next().is_none(),
+            "a sync wrote into the unconnected pick"
+        );
+
+        let prepares = access.prepares();
+        assert_eq!(
+            phone.icloud_connect().unwrap(),
+            ConnectOutcomeFfi::Connected
+        );
+        assert_eq!(access.prepare_connects(), connects + 1);
+        assert_eq!(access.prepares(), prepares, "the connect used prepare");
+        assert_eq!(
+            stored_root(&phone).as_deref(),
+            Some(picked.to_string_lossy().as_ref())
+        );
     }
 }
