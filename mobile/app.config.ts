@@ -65,6 +65,12 @@ const config: ExpoConfig = {
     infoPlist: {
       NSFaceIDUsageDescription:
         'Memlore uses Face ID to unlock your journal. You can always use your password instead.',
+      // M2c iCloud background prefetch (docs/plans/2026-11-05-mobile-m2c-background-prefetch/); removing both keys turns it off.
+      UIBackgroundModes: ['fetch', 'processing'],
+      BGTaskSchedulerPermittedIdentifiers: [
+        'app.memlore.mobile.sync-refresh',
+        'app.memlore.mobile.sync-processing',
+      ],
       ...(googleIosClientId ? { MemloreGoogleIosClientId: googleIosClientId } : {}),
     },
     ...(googleIosScheme ? { scheme: [googleIosScheme] } : {}),
