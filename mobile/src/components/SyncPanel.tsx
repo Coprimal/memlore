@@ -19,27 +19,50 @@ const SPINNER_DELAY_MS = 150;
 /** How often "Last sync: 5 minutes ago" is recomputed. */
 const CLOCK_TICK_MS = 30_000;
 
-/** The product name, never translated. */
-const PROVIDER = 'Google Drive';
+/** The cloud services this phone can connect (one at a time). */
+export type SyncProvider = 'gdrive' | 'icloud';
 
-type Action = 'connect' | 'disconnect' | 'sync';
+/** The product name, never translated. */
+export function providerName(provider: SyncProvider): string {
+  return provider === 'icloud' ? 'iCloud Drive' : 'Google Drive';
+}
+
+/** The connected provider; anything but iCloud is Google Drive on this phone. */
+function connectedProvider(drive: DriveStatus): SyncProvider {
+  return drive.provider === 'icloud' ? 'icloud' : 'gdrive';
+}
+
+type Action = 'connect' | 'connect_icloud' | 'disconnect' | 'sync';
 
 /**
- * The message for a failed Google sign-in or connect (Settings and
- * onboarding). The refusal (ERR_VAULT_NOT_EMPTY) says what to do instead.
+ * The message for a failed connect (Google sign-in or iCloud folder, Settings
+ * and onboarding). The refusal (ERR_VAULT_NOT_EMPTY) says what to do instead;
+ * an iCloud folder that cannot be used says which folder to choose.
  */
-export function connectErrorMessage(e: unknown): string {
-  if (errorCode(e) === 'ERR_VAULT_NOT_EMPTY') return t('mobile.sync.vault_not_empty');
-  if (isDriveNotConfigured(e)) return t('mobile.sync.not_configured');
+export function connectErrorMessage(e: unknown, provider: SyncProvider): string {
+  switch (errorCode(e)) {
+    case 'ERR_VAULT_NOT_EMPTY':
+      return provider === 'icloud'
+        ? t('mobile.sync.icloud_vault_not_empty')
+        : t('mobile.sync.vault_not_empty');
+    case 'ERR_NOT_ICLOUD_FOLDER':
+      return t('mobile.sync.icloud_not_icloud_folder');
+    case 'ERR_NOT_SYNC_FOLDER':
+      return t('mobile.sync.icloud_not_sync_folder');
+    case 'ERR_FOLDER_UNAVAILABLE':
+      return t('mobile.sync.icloud_folder_unavailable');
+  }
+  if (provider === 'gdrive' && isDriveNotConfigured(e)) return t('mobile.sync.not_configured');
   if (isSyncBusy(e)) return t('nav:sync.busy');
-  return t('onboarding.drive.error_generic', { provider: PROVIDER });
+  return t('onboarding.drive.error_generic', { provider: providerName(provider) });
 }
 
 /**
- * Settings > Sync: connect Google Drive, then the account, last sync,
- * pending entries and progress, "Sync now", Disconnect and the link to
- * remove Memlore's access at Google; a blocked sync says why (re-pair with
- * the phrase, restored elsewhere, reconnect). Rendered in the Settings tab,
+ * Settings > Sync: connect Google Drive or iCloud Drive, then the account
+ * (or the iCloud folder), last sync, pending entries and progress, "Sync
+ * now", Disconnect and, for Google, the link to remove Memlore's access; a
+ * blocked sync says why (re-pair with the phrase, restored elsewhere,
+ * reconnect, choose the iCloud folder again). Rendered in the Settings tab,
  * behind the unlocked guard.
  */
 export function SyncPanel() {
@@ -49,7 +72,7 @@ export function SyncPanel() {
   const [action, setAction] = useState<Action | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [rePairOpen, setRePairOpen] = useState(false);
-  const spinner = useDelayed(action === 'connect' || action === 'disconnect', SPINNER_DELAY_MS);
+  const spinner = useDelayed(action !== null && action !== 'sync', SPINNER_DELAY_MS);
   const now = useNow(CLOCK_TICK_MS);
   const running = sync.status?.running ?? false;
 
@@ -75,12 +98,13 @@ export function SyncPanel() {
     wasRunning.current = running;
   }, [running]);
 
-  async function connect() {
+  async function connect(provider: SyncProvider) {
     if (action !== null) return;
-    setAction('connect');
+    setAction(provider === 'icloud' ? 'connect_icloud' : 'connect');
     setError(null);
     try {
-      const outcome = await sync.connect();
+      // iCloud: the folder picker first; null when it was closed.
+      const outcome = provider === 'icloud' ? await sync.connectICloud() : await sync.connect();
       if (outcome?.kind === 'connected') {
         void sync.syncNow().catch(() => {});
       } else if (outcome?.kind === 'join_with_phrase') {
@@ -93,17 +117,17 @@ export function SyncPanel() {
         setError(t('mobile.error'));
       }
     } catch (e) {
-      if (errorCode(e) !== 'ERR_LOCKED') setError(connectErrorMessage(e));
+      if (errorCode(e) !== 'ERR_LOCKED') setError(connectErrorMessage(e, provider));
     } finally {
       setAction(null);
       void readDrive();
     }
   }
 
-  function confirmDisconnect() {
+  function confirmDisconnect(provider: SyncProvider) {
     Alert.alert(
-      t('settings:gdrive.disconnect_modal.title', { provider: PROVIDER }),
-      t('mobile.sync.disconnect_body'),
+      t('settings:gdrive.disconnect_modal.title', { provider: providerName(provider) }),
+      provider === 'icloud' ? t('mobile.sync.icloud_disconnect_body') : t('mobile.sync.disconnect_body'),
       [
         { text: t('common:confirm_dialog.cancel'), style: 'cancel' },
         {
@@ -186,38 +210,62 @@ export function SyncPanel() {
   const lastSyncMs = sync.status?.lastSyncMs ?? drive.lastSyncMs;
   const pendingCount = drive.pendingCount;
   const failed = !running && sync.status?.phase === 'error';
-  // A reconnect notice brings its own button.
-  const showConnect = !drive.connected && blocked?.kind !== 'needs_reconnect';
+  // A reconnect or choose-the-folder notice brings its own button.
+  const showConnect =
+    !drive.connected && blocked?.kind !== 'needs_reconnect' && blocked?.kind !== 'needs_folder';
+  const provider = connectedProvider(drive);
 
   return (
     <View testID="sync-panel" style={styles.section}>
       {header}
       {showConnect ? (
-        <ActionButton
-          testID="sync-connect"
-          label={
-            action === 'connect'
-              ? t('settings:gdrive.connecting')
-              : t('settings:cloud.connect_with', { provider: PROVIDER })
-          }
-          disabled={action !== null}
-          onPress={() => void connect()}
-        />
+        <>
+          <ActionButton
+            testID="sync-connect"
+            label={
+              action === 'connect'
+                ? t('settings:gdrive.connecting')
+                : t('settings:cloud.connect_with', { provider: providerName('gdrive') })
+            }
+            disabled={action !== null}
+            onPress={() => void connect('gdrive')}
+          />
+          <ActionButton
+            testID="sync-connect-icloud"
+            label={
+              action === 'connect_icloud'
+                ? t('settings:gdrive.connecting')
+                : t('settings:cloud.connect_with', { provider: providerName('icloud') })
+            }
+            disabled={action !== null}
+            onPress={() => void connect('icloud')}
+          />
+        </>
       ) : null}
       {blocked !== null ? (
         <BlockedNotice
           blocked={blocked}
           busy={action !== null}
           onRePair={() => setRePairOpen(true)}
-          onReconnect={() => void connect()}
+          onReconnect={() => void connect('gdrive')}
+          // Picking the same vault again reconnects and clears the notice.
+          onChooseFolder={() => void connect('icloud')}
         />
       ) : null}
       {drive.connected ? (
         <>
           <View testID="sync-account" style={styles.row}>
-            <Text style={styles.rowLabel}>{t('settings:gdrive.signed_in_as')}</Text>
+            <Text style={styles.rowLabel}>
+              {provider === 'icloud'
+                ? t('settings:cloud.folder_path_label')
+                : t('settings:gdrive.signed_in_as')}
+            </Text>
             <Text style={styles.rowValue} numberOfLines={1}>
-              {drive.email ?? PROVIDER}
+              {provider === 'icloud'
+                ? drive.folderName === null
+                  ? providerName('icloud')
+                  : `${providerName('icloud')} › ${drive.folderName}`
+                : (drive.email ?? providerName('gdrive'))}
             </Text>
           </View>
           <View testID="sync-status" style={styles.card}>
@@ -255,7 +303,7 @@ export function SyncPanel() {
             testID="sync-disconnect"
             accessibilityRole="button"
             disabled={action !== null}
-            onPress={confirmDisconnect}
+            onPress={() => confirmDisconnect(provider)}
             style={styles.dangerButton}
           >
             <Text style={styles.dangerLabel}>
@@ -264,14 +312,17 @@ export function SyncPanel() {
                 : t('settings:gdrive.disconnect')}
             </Text>
           </Pressable>
-          <Pressable
-            testID="sync-remove-access"
-            accessibilityRole="button"
-            onPress={confirmRemoveAccess}
-            style={styles.linkButton}
-          >
-            <Text style={styles.linkLabel}>{t('mobile.sync.remove_access')}</Text>
-          </Pressable>
+          {/* Google only: an iCloud folder has no app access to remove. */}
+          {provider === 'gdrive' ? (
+            <Pressable
+              testID="sync-remove-access"
+              accessibilityRole="button"
+              onPress={confirmRemoveAccess}
+              style={styles.linkButton}
+            >
+              <Text style={styles.linkLabel}>{t('mobile.sync.remove_access')}</Text>
+            </Pressable>
+          ) : null}
         </>
       ) : null}
       <ErrorText message={error} />
@@ -285,6 +336,7 @@ function BlockedNotice(props: {
   busy: boolean;
   onRePair: () => void;
   onReconnect: () => void;
+  onChooseFolder: () => void;
 }) {
   const { blocked } = props;
   switch (blocked.kind) {
@@ -319,6 +371,18 @@ function BlockedNotice(props: {
             label={t('settings:gdrive.token_revoked.cta')}
             disabled={props.busy}
             onPress={props.onReconnect}
+          />
+        </View>
+      );
+    case 'needs_folder':
+      return (
+        <View testID="sync-blocked" style={styles.notice}>
+          <Text style={styles.warning}>{t('mobile.sync.icloud_folder_gone')}</Text>
+          <ActionButton
+            testID="sync-choose-folder"
+            label={t('mobile.sync.icloud_choose_folder')}
+            disabled={props.busy}
+            onPress={props.onChooseFolder}
           />
         </View>
       );
