@@ -7,7 +7,7 @@ Thanks for helping. Memlore is a local-first, privacy-first journal: no telemetr
 Prerequisites: Rust 1.88+, Node.js 20+, pnpm 9+, and [Tauri's native deps](https://tauri.app/start/prerequisites/).
 
 ```bash
-git clone https://github.com/MemloreApp/memlore.git
+git clone https://github.com/Coprimal/memlore.git
 cd memlore
 pnpm install
 pnpm tauri dev
@@ -134,6 +134,27 @@ cd src-tauri && cargo test golden_
 ## Releasing
 
 Maintainers ship with `/cf-ship --mac` (desktop, `v*` tags) or `/cf-ship --web` (web companion, `web-v*` tags). The web is deployed only from a `web-v*` tag. See [`.coding-friend/skills/cf-ship-custom/README.md`](.coding-friend/skills/cf-ship-custom/README.md).
+
+## Repository home
+
+The repository lives at [`Coprimal/memlore`](https://github.com/Coprimal/memlore) since 2026-11-19. It was `MemloreApp/memlore` before that, and `dinhanhthi/memlore` before v0.2.3. The website stays at `memlore.app` (GitHub Pages custom domain on this repo).
+
+Installed desktop builds keep the update URL they shipped with: `github.com/MemloreApp/memlore/releases/latest/download/latest.json` (v0.2.3 to v0.2.7) or the `dinhanhthi/memlore` one (older). Builds up to v0.2.5 with the beta setting also read `api.github.com/repos/<old owner>/memlore/releases?per_page=1`. All of them reach this repo **only through GitHub's redirect**, so:
+
+- Never create a repository named `memlore` under `MemloreApp` or `dinhanhthi`. It replaces the redirect, and those builds stop updating (or read someone else's `latest.json`).
+- Never delete or rename the `MemloreApp` organization or the `dinhanhthi` account. A freed name can be claimed by anyone.
+- Never rotate the updater `pubkey` in `src-tauri/tauri.conf.json`, or installed builds can no longer verify updates.
+- Deploy `workers/stats` (`dl.memlore.app`) only from a commit whose `REPO` names the current owner, and only after a transfer has happened.
+- After any repository move, check that the CLA Assistant still points at this repository.
+
+Check that the old update URLs still resolve (each prints `200`):
+
+```bash
+for o in MemloreApp dinhanhthi; do
+  curl -sL -o /dev/null -w "$o %{http_code}\n" "https://github.com/$o/memlore/releases/latest/download/latest.json"
+  curl -sL -o /dev/null -w "$o api %{http_code}\n" "https://api.github.com/repos/$o/memlore/releases?per_page=1"
+done
+```
 
 ## How we work
 
