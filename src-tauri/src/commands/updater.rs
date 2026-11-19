@@ -35,7 +35,7 @@ const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// `web-v*` release: those are always created with `make_latest: false`, so it
 /// stays on the desktop release.
 const UPDATE_ENDPOINT: &str =
-    "https://github.com/MemloreApp/memlore/releases/latest/download/latest.json";
+    "https://github.com/Coprimal/memlore/releases/latest/download/latest.json";
 
 /// What the frontend gets back. A plain serde struct so `src/` never imports
 /// the updater plugin's JS API (the Vite `tauriAliasGuard` would reject it).

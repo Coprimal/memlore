@@ -1,8 +1,8 @@
 ---
-sourceHash: e19569dfe7f3
+sourceHash: 7729e1289d08
 title: Memlore — 隐私政策
 description: Memlore 如何对待你的日记：它留在你的设备上，没有 Memlore 服务器，没有遥测，云同步和 AI 都是可选的，并由你掌控。
-updated: 2026年10月11日
+updated: 2026年11月19日
 ---
 
 # 隐私政策
@@ -13,7 +13,7 @@ Memlore 是一本私人日记。本页面说明本应用和本网站如何处理
 
 ## 我们是谁
 
-Memlore 由 [Anh-Thi Dinh](https://dinhanhthi.com) 打造，是一款开源日记应用。如有疑问：[contact@memlore.app](mailto:contact@memlore.app)。
+Memlore 由 [Coprimal](https://coprimal.dev) 打造，是一款开源日记应用。如有疑问：[contact@memlore.app](mailto:contact@memlore.app)。
 
 ## 我们不收集的内容
 

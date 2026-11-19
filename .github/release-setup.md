@@ -174,7 +174,7 @@ These GitHub secrets are only read by the `/cf-ship --cloud` path
 the fallback; the local materials above mirror them.
 
 Set at
-<https://github.com/MemloreApp/memlore/settings/secrets/actions>.
+<https://github.com/Coprimal/memlore/settings/secrets/actions>.
 
 ### Code signing
 

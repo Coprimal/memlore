@@ -1,8 +1,8 @@
 ---
-sourceHash: e19569dfe7f3
+sourceHash: 7729e1289d08
 title: Memlore — Politique de confidentialité
 description: Comment Memlore traite votre journal : il reste sur votre appareil, sans serveur Memlore ni télémétrie, avec un cloud et une IA facultatifs que vous contrôlez.
-updated: 11 octobre 2026
+updated: 19 novembre 2026
 ---
 
 # Politique de confidentialité
@@ -13,7 +13,7 @@ Memlore est un journal intime. Cette page explique ce que l’application et ce 
 
 ## Qui nous sommes
 
-Memlore est fait par [Anh-Thi Dinh](https://dinhanhthi.com). C’est une application de journal open source. Questions : [contact@memlore.app](mailto:contact@memlore.app).
+Memlore est fait par [Coprimal](https://coprimal.dev). C’est une application de journal open source. Questions : [contact@memlore.app](mailto:contact@memlore.app).
 
 ## Ce que nous ne collectons pas
 

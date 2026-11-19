@@ -109,12 +109,12 @@ pub fn run() {
                     // macOS About ignores authors/website/license; they live in credits.
                     credits: Some(
                         [
-                            "Author: Anh-Thi DINH",
+                            "Author: Coprimal",
                             "Website: https://memlore.app",
                             "Email: contact@memlore.app",
                             "",
                             "Open source under the AGPL-3.0 license",
-                            "github.com/MemloreApp/memlore",
+                            "github.com/Coprimal/memlore",
                         ]
                         .join("\n"),
                     ),

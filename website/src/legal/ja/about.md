@@ -1,8 +1,8 @@
 ---
-sourceHash: c7ee4e8c640b
+sourceHash: c81548bf514b
 title: Memlore — 概要
 description: Memlore が存在する理由、つくっている人、そしてここで日記をつけるすべての人への約束。
-updated: 2026年9月18日
+updated: 2026年11月19日
 ---
 
 # 概要
@@ -17,7 +17,7 @@ Memlore は、覚えておきたい日のための、そしてどこかに置い
 
 ## つくっている人
 
-Memlore は [Thi](https://dinhanhthi.com) が ❤️ を込めてつくり、[GitHub](https://github.com/MemloreApp/memlore) でオープンに開発しています。ライセンスは AGPL-3.0 なので、あなたの日記がどう守られ、データがどう扱われているかを正確に読むことができます。
+Memlore は [Coprimal](https://coprimal.dev) が ❤️ を込めてつくり、[GitHub](https://github.com/Coprimal/memlore) でオープンに開発しています。ライセンスは AGPL-3.0 なので、あなたの日記がどう守られ、データがどう扱われているかを正確に読むことができます。
 
 ## 約束すること
 
@@ -28,4 +28,4 @@ Memlore は [Thi](https://dinhanhthi.com) が ❤️ を込めてつくり、[Gi
 
 ## お問い合わせ
 
-バグの報告、アイデア、質問は [GitHub](https://github.com/MemloreApp/memlore) または [contact@memlore.app](mailto:contact@memlore.app) までお気軽にどうぞ。
+バグの報告、アイデア、質問は [GitHub](https://github.com/Coprimal/memlore) または [contact@memlore.app](mailto:contact@memlore.app) までお気軽にどうぞ。

@@ -1,8 +1,8 @@
 ---
-sourceHash: c7ee4e8c640b
+sourceHash: c81548bf514b
 title: Memlore — 关于
 description: Memlore 为什么存在、由谁打造，以及它对每一位用它写日记的人做出的承诺。
-updated: 2026年9月18日
+updated: 2026年11月19日
 ---
 
 # 关于
@@ -17,7 +17,7 @@ Memlore 是一本私人日记，留给你想记住的日子，也留给那些需
 
 ## 由谁打造
 
-Memlore 由 [Thi](https://dinhanhthi.com) 用 ❤️ 打造，并在 [GitHub](https://github.com/MemloreApp/memlore) 上公开开发。它采用 AGPL-3.0 许可证，因此你可以清楚地看到你的日记如何被保护、你的数据如何被处理。
+Memlore 由 [Coprimal](https://coprimal.dev) 用 ❤️ 打造，并在 [GitHub](https://github.com/Coprimal/memlore) 上公开开发。它采用 AGPL-3.0 许可证，因此你可以清楚地看到你的日记如何被保护、你的数据如何被处理。
 
 ## 我们的承诺
 
@@ -28,4 +28,4 @@ Memlore 由 [Thi](https://dinhanhthi.com) 用 ❤️ 打造，并在 [GitHub](ht
 
 ## 联系我们
 
-欢迎在 [GitHub](https://github.com/MemloreApp/memlore) 上反馈问题、提出想法和疑问，也可以发邮件至 [contact@memlore.app](mailto:contact@memlore.app)。
+欢迎在 [GitHub](https://github.com/Coprimal/memlore) 上反馈问题、提出想法和疑问，也可以发邮件至 [contact@memlore.app](mailto:contact@memlore.app)。

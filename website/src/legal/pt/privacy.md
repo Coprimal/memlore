@@ -1,8 +1,8 @@
 ---
-sourceHash: e19569dfe7f3
+sourceHash: 7729e1289d08
 title: Memlore — Política de Privacidade
 description: Como o Memlore trata o seu diário: ele fica no seu dispositivo, sem servidor do Memlore, sem telemetria, e com nuvem e IA opcionais sob o seu controle.
-updated: 11 de outubro de 2026
+updated: 19 de novembro de 2026
 ---
 
 # Política de Privacidade
@@ -13,7 +13,7 @@ O Memlore é um diário privado. Esta página explica o que o app e este site fa
 
 ## Quem somos
 
-O Memlore é feito por [Anh-Thi Dinh](https://dinhanhthi.com). É um app de diário de código aberto. Dúvidas: [contact@memlore.app](mailto:contact@memlore.app).
+O Memlore é feito por [Coprimal](https://coprimal.dev). É um app de diário de código aberto. Dúvidas: [contact@memlore.app](mailto:contact@memlore.app).
 
 ## O que não coletamos
 

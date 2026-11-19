@@ -146,13 +146,13 @@ There are **two audiences**. Update both.
 **Every entry ends with its commit link.** `bump-info.sh` prints each commit with the link already built, so copy it rather than constructing one:
 
 ```
-  | d81b365 fix(updater): install in the background   ->   [#d81b365](https://github.com/MemloreApp/memlore/commit/d81b365)
+  | d81b365 fix(updater): install in the background   ->   [#d81b365](https://github.com/Coprimal/memlore/commit/d81b365)
 ```
 
 So an entry looks like:
 
 ```markdown
-- **Update installs in the background.** The app no longer freezes or quits on its own; a card asks before restarting. [#d81b365](https://github.com/MemloreApp/memlore/commit/d81b365) [#a1b2c3d](https://github.com/MemloreApp/memlore/commit/a1b2c3d)
+- **Update installs in the background.** The app no longer freezes or quits on its own; a card asks before restarting. [#d81b365](https://github.com/Coprimal/memlore/commit/d81b365) [#a1b2c3d](https://github.com/Coprimal/memlore/commit/a1b2c3d)
 ```
 
 **One line per entry and per paragraph — never hard-wrap.** GitHub renders every newline in a release body as a line break, so a wrapped entry shows up broken mid-sentence. Write each bullet (and each prose paragraph) as a single line, with all its commit links at the end of that same line, separated by spaces, never on their own lines.
@@ -344,10 +344,10 @@ One block per shipped platform (and a line for each platform `--all` skipped, wi
 ```
 Released:
   mac  Memlore v<version> → tag v<version> pushed → release-mac-local.sh → signed + notarized .dmg
-       Release: https://github.com/MemloreApp/memlore/releases/tag/v<version>
+       Release: https://github.com/Coprimal/memlore/releases/tag/v<version>
   web  Memlore Web <version> → tag web-v<version> pushed → deploy-web-local.sh → web.memlore.app
        Worker: redeployed         (or: unchanged, not deployed)
-       Release: https://github.com/MemloreApp/memlore/releases/tag/web-v<version>   (or: skipped, with the reason)
+       Release: https://github.com/Coprimal/memlore/releases/tag/web-v<version>   (or: skipped, with the reason)
 ```
 
 With `--cloud`, name the workflow instead of the script (`release.yml` / `deploy-web.yml`) and add the run URL.

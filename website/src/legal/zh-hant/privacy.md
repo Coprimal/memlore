@@ -1,8 +1,8 @@
 ---
-sourceHash: e19569dfe7f3
+sourceHash: 7729e1289d08
 title: Memlore — 隱私權政策
 description: Memlore 如何對待你的日記：它留在你的裝置上，沒有 Memlore 伺服器、沒有遙測，雲端與 AI 皆為選用且由你掌控。
-updated: 2026年10月11日
+updated: 2026年11月19日
 ---
 
 # 隱私權政策
@@ -13,7 +13,7 @@ Memlore 是一本私人日記。本頁說明 App 與本網站如何處理資訊 
 
 ## 我們是誰
 
-Memlore 由 [Anh-Thi Dinh](https://dinhanhthi.com) 打造，是一款開放原始碼的日記 App。如有問題：[contact@memlore.app](mailto:contact@memlore.app)。
+Memlore 由 [Coprimal](https://coprimal.dev) 打造，是一款開放原始碼的日記 App。如有問題：[contact@memlore.app](mailto:contact@memlore.app)。
 
 ## 我們不會收集的資料
 

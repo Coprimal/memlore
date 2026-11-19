@@ -1,5 +1,5 @@
 ---
-sourceHash: 7c643f0865bc
+sourceHash: daa5ce372f72
 title: Memlore — Termos de Serviço
 description: Os termos de uso do Memlore, um diário sob licença AGPL ainda em desenvolvimento, em que o que você escreve continua sendo seu.
 updated: 17 de setembro de 2026

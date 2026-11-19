@@ -14,7 +14,7 @@ Please read this Agreement carefully before you accept it. You accept it as desc
 
 - **"Maintainer"** means Anh-Thi DINH and any successors and assigns (including any person or entity to which the Memlore project is transferred).
 - **"You"** (or **"Your"**) means the individual who accepts this Agreement and makes Contributions to the Maintainer.
-- **"Work"** means Memlore: the software, documentation and other material owned or managed by the Maintainer, including the source code repository at <https://github.com/MemloreApp/memlore> and the apps built from it.
+- **"Work"** means Memlore: the software, documentation and other material owned or managed by the Maintainer, including the source code repository at <https://github.com/Coprimal/memlore> and the apps built from it.
 - **"Contribution"** means any original work of authorship, including any modification of or addition to an existing work, that You intentionally Submit to the Maintainer for inclusion in, or documentation of, the Work.
 - **"Submit"** means any form of electronic, verbal or written communication sent to the Maintainer or its representatives, including pull requests, patches, issues, comments and messages on the source code repositories, issue trackers, mailing lists and other channels managed by or on behalf of the Maintainer for discussing and improving the Work. It does not include any communication that You conspicuously mark, or otherwise designate in writing, as "Not a Contribution".
 

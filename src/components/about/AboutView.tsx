@@ -16,13 +16,13 @@ import { IconCustom } from '../common/IconCustom'
 
 const AUTHOR_WEBSITE_URL = 'https://memlore.app'
 const AUTHOR_EMAIL = 'contact@memlore.app'
-const REPO_URL = 'https://github.com/MemloreApp/memlore'
-const ISSUES_URL = 'https://github.com/MemloreApp/memlore/issues'
+const REPO_URL = 'https://github.com/Coprimal/memlore'
+const ISSUES_URL = 'https://github.com/Coprimal/memlore/issues'
 const DESKTOP_DOWNLOAD_URL = 'https://memlore.app'
 const PRIVACY_URL = 'https://memlore.app/privacy'
 const TERMS_URL = 'https://memlore.app/terms'
 const ADDITIONAL_PERMISSION_URL =
-  'https://github.com/MemloreApp/memlore/blob/main/LICENSE-ADDITIONAL-PERMISSION.md'
+  'https://github.com/Coprimal/memlore/blob/main/LICENSE-ADDITIONAL-PERMISSION.md'
 
 function ExternalLinkRow({ href, icon, label }: { href: string; icon: ReactNode; label: string }) {
   function handleClick(e: React.MouseEvent<HTMLAnchorElement>) {

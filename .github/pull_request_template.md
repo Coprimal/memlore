@@ -14,4 +14,4 @@
 
 ## Contributor License Agreement
 
-- [ ] I have read and agree to the Memlore CLA ([legal/CLA.md](https://github.com/MemloreApp/memlore/blob/main/legal/CLA.md))
+- [ ] I have read and agree to the Memlore CLA ([legal/CLA.md](https://github.com/Coprimal/memlore/blob/main/legal/CLA.md))

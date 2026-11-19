@@ -1,8 +1,8 @@
 ---
-sourceHash: c7ee4e8c640b
+sourceHash: c81548bf514b
 title: Memlore — Acerca de
 description: Por qué existe Memlore, quién lo desarrolla y qué promete a quienes llevan su diario en él.
-updated: 18 de septiembre de 2026
+updated: 19 de noviembre de 2026
 ---
 
 # Acerca de
@@ -17,7 +17,7 @@ La sincronización es opcional y pasa por una carpeta en la nube que ya tienes. 
 
 ## Quién lo hace
 
-Memlore está hecho con ❤️ por [Thi](https://dinhanhthi.com) y se desarrolla en abierto en [GitHub](https://github.com/MemloreApp/memlore). Tiene licencia AGPL-3.0, así que puedes leer exactamente cómo se protege tu diario y cómo se tratan tus datos.
+Memlore está hecho con ❤️ por [Coprimal](https://coprimal.dev) y se desarrolla en abierto en [GitHub](https://github.com/Coprimal/memlore). Tiene licencia AGPL-3.0, así que puedes leer exactamente cómo se protege tu diario y cómo se tratan tus datos.
 
 ## Lo que promete
 
@@ -28,4 +28,4 @@ Memlore está hecho con ❤️ por [Thi](https://dinhanhthi.com) y se desarrolla
 
 ## Contacto
 
-Los errores, las ideas y las preguntas son bienvenidos en [GitHub](https://github.com/MemloreApp/memlore) o en [contact@memlore.app](mailto:contact@memlore.app).
+Los errores, las ideas y las preguntas son bienvenidos en [GitHub](https://github.com/Coprimal/memlore) o en [contact@memlore.app](mailto:contact@memlore.app).

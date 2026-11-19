@@ -1,8 +1,8 @@
 ---
-sourceHash: e19569dfe7f3
+sourceHash: 7729e1289d08
 title: Memlore — Chính sách quyền riêng tư
 description: Cách Memlore đối xử với nhật ký của bạn: nó ở lại trên thiết bị của bạn, không có máy chủ Memlore, không thu thập dữ liệu sử dụng, cùng đám mây và AI tùy chọn do bạn kiểm soát.
-updated: 11 tháng 10, 2026
+updated: 19 tháng 11, 2026
 ---
 
 # Chính sách quyền riêng tư
@@ -13,7 +13,7 @@ Memlore là app nhật ký riêng tư. Trang này giải thích ứng dụng và
 
 ## Chúng tôi là ai
 
-Memlore được làm ra bởi [Anh-Thi Dinh](https://dinhanhthi.com). Đây là một ứng dụng nhật ký mã nguồn mở. Câu hỏi: [contact@memlore.app](mailto:contact@memlore.app).
+Memlore được làm ra bởi [Coprimal](https://coprimal.dev). Đây là một ứng dụng nhật ký mã nguồn mở. Câu hỏi: [contact@memlore.app](mailto:contact@memlore.app).
 
 ## Những gì chúng tôi không thu thập
 

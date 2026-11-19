@@ -1,5 +1,5 @@
 ---
-sourceHash: 7c643f0865bc
+sourceHash: daa5ce372f72
 title: Memlore — 利用規約
 description: Memlore の利用規約。AGPL ライセンスで開発中の日記アプリであり、あなたの書いたものはあなたのものです。
 updated: 2026年9月17日

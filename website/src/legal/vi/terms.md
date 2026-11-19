@@ -1,5 +1,5 @@
 ---
-sourceHash: 7c643f0865bc
+sourceHash: daa5ce372f72
 title: Memlore — Điều khoản dịch vụ
 description: Các điều khoản sử dụng Memlore: một ứng dụng nhật ký cấp phép AGPL vẫn đang phát triển, và những gì bạn viết vẫn thuộc về bạn.
 updated: 17 tháng 9, 2026

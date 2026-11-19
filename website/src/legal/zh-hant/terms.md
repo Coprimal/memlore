@@ -1,5 +1,5 @@
 ---
-sourceHash: 7c643f0865bc
+sourceHash: daa5ce372f72
 title: Memlore — 服務條款
 description: 使用 Memlore 的條款：一款仍在開發中、採用 AGPL 授權的日記 App，你寫下的內容始終屬於你。
 updated: 2026年9月17日

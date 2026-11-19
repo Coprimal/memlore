@@ -18,9 +18,9 @@ Memlore is actively developed. Features may be added, changed or removed in new 
 
 ## Open-source software
 
-Memlore is free and open-source software. You may use, study, share and change it under the GNU Affero General Public License, version 3 or (at your option) any later version (AGPL-3.0-or-later), with an [additional permission](https://github.com/MemloreApp/memlore/blob/main/LICENSE-ADDITIONAL-PERMISSION.md) that allows distribution through app stores. These terms do not limit any right that licence gives you.
+Memlore is free and open-source software. You may use, study, share and change it under the GNU Affero General Public License, version 3 or (at your option) any later version (AGPL-3.0-or-later), with an [additional permission](https://github.com/Coprimal/memlore/blob/main/LICENSE-ADDITIONAL-PERMISSION.md) that allows distribution through app stores. These terms do not limit any right that licence gives you.
 
-- **Source code:** the complete source code is at [github.com/MemloreApp/memlore](https://github.com/MemloreApp/memlore), together with the full licence text in its `LICENSE` file.
+- **Source code:** the complete source code is at [github.com/Coprimal/memlore](https://github.com/Coprimal/memlore), together with the full licence text in its `LICENSE` file.
 - **Memlore Web:** if you use Memlore Web over the internet, the AGPL gives you the right to get its source code. Memlore Web links to that repository from its welcome and unlock screens, before you sign in, and from its About page. Memlore Web releases are tagged `web-v<version>` in the repository.
 - **Third-party components:** Memlore includes open-source components by other authors, each under its own licence. Their licence notices are in the app (About → Open-source licenses) and in the `THIRD_PARTY_NOTICES.md` file in the source repository.
 

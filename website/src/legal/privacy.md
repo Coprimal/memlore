@@ -1,7 +1,7 @@
 ---
 title: Memlore — Privacy Policy
 description: How Memlore treats your journal: it stays on your device, with no Memlore server, no telemetry, and optional cloud and AI that you control.
-updated: 22 October 2026
+updated: 19 November 2026
 ---
 
 # Privacy Policy
@@ -10,7 +10,7 @@ Memlore is a private journal. This page explains what the app and this website d
 
 ## Who we are
 
-Memlore is made by [Anh-Thi Dinh](https://dinhanhthi.com). It is an open-source journal app. Questions: [contact@memlore.app](mailto:contact@memlore.app).
+Memlore is made by [Coprimal](https://coprimal.dev). It is an open-source journal app. Questions: [contact@memlore.app](mailto:contact@memlore.app).
 
 ## What we do not collect
 

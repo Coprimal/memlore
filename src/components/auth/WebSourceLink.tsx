@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next'
 import { isWeb } from '../../lib/platform'
 
-const REPO_URL = 'https://github.com/MemloreApp/memlore'
+const REPO_URL = 'https://github.com/Coprimal/memlore'
 
 /**
  * AGPL-3.0 §13: a user interacting with the web app over a network must be

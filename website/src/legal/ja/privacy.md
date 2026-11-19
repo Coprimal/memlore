@@ -1,8 +1,8 @@
 ---
-sourceHash: e19569dfe7f3
+sourceHash: 7729e1289d08
 title: Memlore — プライバシーポリシー
 description: Memlore があなたの日記をどう扱うか。日記はあなたのデバイスにとどまり、Memlore のサーバーもテレメトリーもなく、クラウドと AI はあなたが管理するオプションです。
-updated: 2026年10月11日
+updated: 2026年11月19日
 ---
 
 # プライバシーポリシー
@@ -13,7 +13,7 @@ Memlore はプライベートな日記です。このページでは、アプリ
 
 ## 私たちについて
 
-Memlore は [Anh-Thi Dinh](https://dinhanhthi.com) がつくっています。オープンソースの日記アプリです。お問い合わせ：[contact@memlore.app](mailto:contact@memlore.app)。
+Memlore は [Coprimal](https://coprimal.dev) がつくっています。オープンソースの日記アプリです。お問い合わせ：[contact@memlore.app](mailto:contact@memlore.app)。
 
 ## 収集しないもの
 

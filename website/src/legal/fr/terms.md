@@ -1,5 +1,5 @@
 ---
-sourceHash: 7c643f0865bc
+sourceHash: daa5ce372f72
 title: Memlore — Conditions d’utilisation
 description: Les conditions d’utilisation de Memlore : un journal sous licence AGPL encore en développement, dont les écrits restent les vôtres.
 updated: 17 septembre 2026

@@ -1,8 +1,8 @@
 ---
-sourceHash: e19569dfe7f3
+sourceHash: 7729e1289d08
 title: Memlore — Datenschutzerklärung
 description: Wie Memlore mit deinem Tagebuch umgeht: Es bleibt auf deinem Gerät, ohne Memlore-Server, ohne Telemetrie, mit optionaler Cloud und KI unter deiner Kontrolle.
-updated: 11. Oktober 2026
+updated: 19. November 2026
 ---
 
 # Datenschutzerklärung
@@ -13,7 +13,7 @@ Memlore ist ein privates Tagebuch. Diese Seite erklärt, was die App und diese W
 
 ## Wer wir sind
 
-Memlore wird von [Anh-Thi Dinh](https://dinhanhthi.com) entwickelt. Es ist eine Open-Source-Tagebuch-App. Fragen: [contact@memlore.app](mailto:contact@memlore.app).
+Memlore wird von [Coprimal](https://coprimal.dev) entwickelt. Es ist eine Open-Source-Tagebuch-App. Fragen: [contact@memlore.app](mailto:contact@memlore.app).
 
 ## Was wir nicht erheben
 

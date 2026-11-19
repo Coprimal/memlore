@@ -9,7 +9,7 @@ use crate::utils::secrets::redact_secret;
 
 fn user_agent() -> String {
     format!(
-        "Memlore/{} (https://github.com/MemloreApp/memlore)",
+        "Memlore/{} (https://github.com/Coprimal/memlore)",
         crate::ops::app_info::app_version()
     )
 }

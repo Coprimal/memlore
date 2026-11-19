@@ -1,5 +1,5 @@
 ---
-sourceHash: 7c643f0865bc
+sourceHash: daa5ce372f72
 title: Memlore — 服务条款
 description: 使用 Memlore 的条款：一款采用 AGPL 许可证、仍在开发中的日记应用，你写下的内容始终属于你。
 updated: 2026年9月17日

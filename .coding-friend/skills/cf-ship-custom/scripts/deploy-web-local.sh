@@ -241,7 +241,7 @@ main() {
     bash "$REPO_ROOT/scripts/release-notes.sh" "$tag" \
       | gh release create "$tag" --verify-tag --latest=false \
         --title "Memlore Web $version" --notes-file -
-    echo "ok: https://github.com/MemloreApp/memlore/releases/tag/$tag"
+    echo "ok: https://github.com/Coprimal/memlore/releases/tag/$tag"
   fi
 
   echo ""
